@@ -1,0 +1,197 @@
+.. _version_6.2.0:
+
+=============
+Version 6.2.0
+=============
+
+Released on 2026-01-13.
+
+.. WARNING::
+
+    Do not use this version when upgrading from any previous version
+    containing tables created before :ref:`version_5.5.0` as this may result
+    in data loss!
+
+    If the cluster contains tables created before :ref:`version_5.5.0`, after
+    upgrading to :ref:`version_6.2.0` certain actions on such tables like
+    deleting partitions, changing settings, rename, swap, etc. can lead to
+    corrupted table which causes all the data of the columns created
+    in versions before :ref:`version_5.5.0` to be shown as ``NULL``. The bug
+    has been fixed in :ref:`version_6.2.6`, so we highly recommend to avoid
+    upgrading to any earlier 6.2.x version.
+
+    Once already affected by the bug, existing data may be lost forever, while
+    new data (via ``INSERT`` or ``UPDATE``) can be retrieved normally.
+
+.. NOTE::
+
+    If you are upgrading a cluster, you must be running CrateDB 5.0.0 or higher
+    before you upgrade to 6.2.0.
+
+    We recommend that you upgrade to the latest 6.1 release before moving to
+    6.2.0.
+
+    A rolling upgrade from >= 6.1.2 to 6.2.0 is supported. Doing a rolling
+    upgrade from an earlier version than 6.1.2 can cause runtime errors when
+    executing statements relying on implicit casts.
+
+    Before upgrading, you should `back up your data`_.
+
+.. WARNING::
+
+    Tables that were created before CrateDB 5.x will not function with 6.x
+    and must be recreated before moving to 6.x.x.
+
+    You can recreate tables using ``COPY TO`` and ``COPY FROM`` or by
+    `inserting the data into a new table`_.
+
+.. _back up your data: https://cratedb.com/docs/crate/reference/en/latest/admin/snapshots.html
+.. _inserting the data into a new table: https://cratedb.com/docs/crate/reference/en/latest/admin/system-information.html#tables-need-to-be-recreated
+
+.. rubric:: Table of contents
+
+.. contents::
+   :local:
+
+.. _version_6.2.0_breaking_changes:
+
+Breaking Changes
+================
+
+- Changed ``SHOW <parameter_name>`` to use the ``parameter_name`` as column name
+  in the result set instead of using a fixed ``setting`` column name to match
+  the behavior of PostgreSQL.
+
+- Changed the detailed :ref:`http error code <http-error-codes>` for the
+  ``Duplicate Object`` error from ``4100`` to ``40910`` as it is a conflict.
+
+- Changed the detailed :ref:`http error code <http-error-codes>` for the
+  ``Query killed`` error from ``5030`` to ``5005`` as it is an internal server
+  error.
+
+Changes
+=======
+
+SQL Statements
+--------------
+
+- Added support for the :ref:`ref-create-schema` and :ref:`ref-drop-schema`
+  statements.
+
+SQL Standard and PostgreSQL Compatibility
+-----------------------------------------
+
+- Added a ``client_encoding`` session setting. The only supported value is
+  ``UTF8``. Other values are not supported and will continue to result in INFO
+  log message that the SET SESSION statement is ignored.
+
+- Columns names prefixed with an underscore are now accepted, although their use
+  is still discouraged to avoid conflicts in case future CrateDB versions
+  introduce additional system columns.
+
+  As a side effect of this change, using the existing system columns in write
+  operations now causes an error instead of silently discarding the values.
+
+  For example, in earlier versions the behavior was as follows::
+
+      cr> create table tbl (x int);
+      cr> insert into tbl (x, _id, _version, _seq_no) values (1, 100, 200, 300);
+      cr> refresh table tbl;
+      cr> select *, _id, _version, _seq_no from tbl;
+      +---+----------------------+----------+---------+
+      | x | _id                  | _version | _seq_no |
+      +---+----------------------+----------+---------+
+      | 1 | Szu9JZoBFWbuMAwIJry8 |        1 |       0 |
+      +---+----------------------+----------+---------+
+
+  In 6.2.0 the ``INSERT INTO`` statement results in an error::
+
+      cr> insert into tbl (x, _id, _version, _seq_no) values (1, 100, 200, 300);
+      InvalidColumnNameException["_id" Cannot write to system column]
+
+- Added support for selecting more than one column within a subquery used in a
+  ``EXISTS`` clause.
+
+- Implemented protocol version negotiation support in the PostgresSQL wire
+  protocol, adding support for clients initially requesting higher minor
+  versions than the server supports. The client is expected to downgrade it's
+  used minor version in such cases.
+
+
+Data Types
+----------
+
+- Added support for the :ref:`UUID type <type-uuid>`.
+
+
+Scalar and Aggregation Functions
+--------------------------------
+
+None
+
+Performance and Resilience Improvements
+---------------------------------------
+
+- Added heuristics to clear the SQL parsers internal cache on memory pressure.
+  This should help on clusters where users run hundreds of thousands of unique
+  SQL statements, leading to the parser cache taking up a significant amount of
+  memory.
+
+- Added an optimization rule to push down query predicates in cases where the
+  child relation is using scalar sub-queries.
+
+  For example, given the following setup::
+
+    CREATE TABLE t1 (x int, y int);
+    CREATE TABLE t2 (a int, b int);
+    CREATE VIEW v1 AS SELECT * FROM t1 where x in (select a from t2)
+
+  A query on the view is now pushed down to ``t1`` to utilize its indices::
+
+    SELECT * from v1 where y = 10
+
+- Reduced the memory footprint of the internal state used in the
+  :ref:`hyperloglog_distinct <aggregation-hyperloglog-distinct>` aggregation.
+  This should help if using the aggregation together with a GROUP BY with many
+  unique keys.
+
+Administration and Operations
+-----------------------------
+
+- Added a ``WITH`` clause with a ``timeout`` property to
+  :ref:`ALTER TABLE .. SET <sql-alter-table>`.
+
+- Enabled TCP fallback for SRV DNS queries used when
+  :ref:`Node Discovery via DNS <conf_dns_discovery>` is enabled.
+
+- Added a ``primary`` flag to :ref:`ShardInfo <node_info_mxbean_shardinfo>` to
+  expose whether the shard is primary or replica.
+
+- Added columns ``is_master``, and ``roles`` to :ref:`sys.nodes <sys-nodes>`,
+  which expose which is the current ``master`` node of the cluster, and what are
+  the roles of the node in the cluster (``master_eligible`` and/or ``data``).
+  Additionally, exposed this info is through :ref:`NodeInfo <node_info_mxbean>`.
+  To export them to a Prometheus format, you must use the latest version
+  ``1.2.3`` of the
+  `jmx_exporter <https://repo1.maven.org/maven2/io/crate/crate-jmx-exporter/1.2.3>`_.
+
+- Added the column ``column_details['oid']`` to the
+  :ref:`information_schema.columns <information_schema_columns>` view. A
+  column's ``oid`` is an internal identifier for each column of a table.
+  It's unique inside a table and used in some rather internal column
+  representation. Some exceptions or information like an ``ANALYZE`` output
+  exposing this identifier instead of a column name. Using this new column
+  helps to lookup the column name by its ``oid`` in such situations.
+
+- Added the ``refresh_stats`` and ``merge_stats`` columns to the
+  :ref:`sys.shards <sys-shards>` table.
+
+- Added ``total_affected_row_count`` to the `QueryStats` JMX MBean and the
+  `sys.jobs_metrics` table, grouped by query type.
+
+Client interfaces
+-----------------
+
+- Added more detailed errors and their corresponding
+  :ref:`http error codes <http-error-codes>` for some of which were previously
+  mapped to generic error.

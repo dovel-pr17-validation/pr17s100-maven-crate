@@ -1,0 +1,121 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.execution.dml;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.function.Consumer;
+
+import org.apache.lucene.document.BinaryDocValuesField;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.document.FieldType;
+import org.apache.lucene.document.KnnFloatVectorField;
+import org.apache.lucene.document.StoredField;
+import org.apache.lucene.index.IndexOptions;
+import org.apache.lucene.index.IndexableField;
+import org.apache.lucene.index.VectorEncoding;
+import org.apache.lucene.util.BytesRef;
+
+import io.crate.metadata.IndexType;
+import io.crate.metadata.Reference;
+import io.crate.metadata.doc.SysColumns;
+import io.crate.types.FloatVectorType;
+
+public class FloatVectorIndexer implements ValueIndexer<float[]> {
+
+    public static final FieldType FIELD_TYPE = new FieldType();
+
+    static {
+        FIELD_TYPE.setIndexOptions(IndexOptions.NONE);
+        FIELD_TYPE.setStored(false);
+        FIELD_TYPE.freeze();
+    }
+
+    final FieldType fieldType;
+    private final String name;
+    private final Reference ref;
+
+    public FloatVectorIndexer(Reference ref) {
+        this.fieldType = new FieldType(FIELD_TYPE);
+        this.fieldType.setVectorAttributes(
+            ref.valueType().characterMaximumLength(),
+            VectorEncoding.FLOAT32,
+            FloatVectorType.SIMILARITY_FUNC
+        );
+        this.ref = ref;
+        this.name = ref.storageIdent();
+    }
+
+    @Override
+    public void indexValue(float[] values, IndexDocumentBuilder docBuilder) throws IOException {
+        createFields(
+            name,
+            fieldType,
+            ref.indexType() != IndexType.NONE,
+            ref.hasDocValues(),
+            ref.hasDocValues() == false && docBuilder.maybeAddStoredField(),
+            values,
+            docBuilder::addField
+        );
+        if (fieldType.stored()) {
+            throw new UnsupportedOperationException("Cannot store float_vector as stored field");
+        }
+        docBuilder.translogWriter().writeValue(values);
+    }
+
+    public static void createFields(String fqn,
+                                    FieldType fieldType,
+                                    boolean indexed,
+                                    boolean hasDocValues,
+                                    boolean hasStoredField,
+                                    float[] values,
+                                    Consumer<? super IndexableField> addField) {
+        if (indexed) {
+            addField.accept(new KnnFloatVectorField(fqn, values, fieldType));
+        }
+
+        BytesRef byteRepresentation = null;
+        if (hasDocValues || hasStoredField) {
+            byte[] bytes = new byte[Float.BYTES * values.length];
+            ByteBuffer.wrap(bytes).asFloatBuffer().put(values);
+            byteRepresentation = new BytesRef(bytes);
+        }
+
+        if (hasDocValues) {
+            var field = new BinaryDocValuesField(fqn, byteRepresentation);
+            addField.accept(field);
+        } else {
+            if (hasStoredField) {
+                addField.accept(new StoredField(fqn, byteRepresentation));
+            }
+            addField.accept(new Field(
+                SysColumns.FieldNames.NAME,
+                fqn,
+                SysColumns.FieldNames.FIELD_TYPE));
+        }
+    }
+
+    @Override
+    public String storageIdentLeafName() {
+        return ref.storageIdentLeafName();
+    }
+}

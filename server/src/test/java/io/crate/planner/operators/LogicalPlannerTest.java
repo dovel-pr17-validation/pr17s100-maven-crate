@@ -1,0 +1,1093 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional informatiON regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, VersiON 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed ON an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.planner.operators;
+
+import static io.crate.testing.Asserts.assertThat;
+import static io.crate.testing.MemoryLimits.assertMaxBytesAllocated;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import org.elasticsearch.common.breaker.CircuitBreaker;
+import org.elasticsearch.common.breaker.CircuitBreakingException;
+import org.elasticsearch.common.unit.ByteSizeUnit;
+import org.elasticsearch.indices.IndicesService;
+import org.junit.Before;
+import org.junit.Test;
+import org.mockito.Mockito;
+
+import io.crate.analyze.TableDefinitions;
+import io.crate.data.Row1;
+import io.crate.data.RowConsumer;
+import io.crate.execution.dsl.projection.FetchProjection;
+import io.crate.execution.dsl.projection.LimitDistinctProjection;
+import io.crate.execution.dsl.projection.Projection;
+import io.crate.execution.dsl.projection.ProjectionType;
+import io.crate.execution.engine.JobLauncher;
+import io.crate.execution.engine.PhasesTaskFactory;
+import io.crate.execution.jobs.JobSetup;
+import io.crate.execution.jobs.TasksService;
+import io.crate.expression.symbol.FetchReference;
+import io.crate.metadata.ColumnIdent;
+import io.crate.metadata.RelationName;
+import io.crate.metadata.RowGranularity;
+import io.crate.metadata.TableInfo;
+import io.crate.metadata.TransactionContext;
+import io.crate.planner.DependencyCarrier;
+import io.crate.planner.Plan;
+import io.crate.planner.node.dql.QueryThenFetch;
+import io.crate.planner.optimizer.rule.EquiJoinToLookupJoin;
+import io.crate.statistics.ColumnStats;
+import io.crate.statistics.MostCommonValues;
+import io.crate.statistics.Stats;
+import io.crate.test.integration.CrateDummyClusterServiceUnitTest;
+import io.crate.testing.SQLExecutor;
+import io.crate.testing.T3;
+import io.crate.types.DataTypes;
+
+public class LogicalPlannerTest extends CrateDummyClusterServiceUnitTest {
+
+    private static final AtomicBoolean WARM = new AtomicBoolean(false);
+
+    private SQLExecutor sqlExecutor;
+
+    @Before
+    public void prepare() throws IOException {
+        sqlExecutor = SQLExecutor.of(clusterService)
+            .addTable(TableDefinitions.USER_TABLE_DEFINITION)
+            .addTable(T3.T1_DEFINITION)
+            .addTable(T3.T2_DEFINITION)
+            .addTable(T3.T3_DEFINITION)
+            .addView(new RelationName("doc", "v2"), "SELECT a, x FROM doc.t1")
+            .addView(new RelationName("doc", "v3"), "SELECT a, x FROM doc.t1");
+        if (WARM.compareAndSet(false, true)) {
+            // Fills up ANTLR caches and triggers other lazy initialization.
+            // Run this here to exclude those allocations later for assertMaxBytesAllocated
+            sqlExecutor.logicalPlan("SELECT sum(x) FROM t1");
+        }
+    }
+
+    private LogicalPlan plan(String statement) {
+        return assertMaxBytesAllocated(ByteSizeUnit.MB.toBytes(28), () -> sqlExecutor.logicalPlan(statement));
+    }
+
+    @Test
+    public void test_collect_derives_estimated_size_per_row_from_stats_and_types() {
+        LogicalPlan plan = plan("SELECT x FROM t1");
+        assertThat(sqlExecutor.getStats(plan).sizeInBytes())
+            .as("No stats available")
+            .isEqualTo(-1L);
+
+        TableInfo t1 = sqlExecutor.resolveTableInfo("t1");
+        ColumnStats<Integer> columnStats = new ColumnStats<>(
+            0.0, 50L, 2, DataTypes.INTEGER, MostCommonValues.empty(), List.of());
+        sqlExecutor.updateTableStats(Map.of(t1.ident(), new Stats(2L, 100L, Map.of(ColumnIdent.of("x"), columnStats))));
+
+        // stats present -> size derived FROM them (although bogus fake stats in this case)
+        plan = plan("SELECT x FROM t1");
+        assertThat(sqlExecutor.getStats(plan).sizeInBytes()).isEqualTo(100L);
+    }
+
+    @Test
+    public void testAvgWindowFunction() {
+        LogicalPlan plan = plan("SELECT avg(x) OVER() FROM t1");
+        assertThat(plan).isEqualTo(
+            """
+            Eval[avg(x) OVER ()]
+              └ WindowAgg[x] | [avg(x) OVER ()]
+                └ Collect[doc.t1 | [x] | true]
+            """
+        );
+    }
+
+    @Test
+    public void testAggregationOnTableFunction() throws Exception {
+        LogicalPlan plan = plan("SELECT max(unnest) FROM unnest([1, 2, 3])");
+        assertThat(plan).isEqualTo(
+            """
+            HashAggregate[max(unnest)]
+              └ TableFunction[unnest | [unnest] | true]
+            """
+        );
+    }
+
+    @Test
+    public void testQTFWithOrderBy() throws Exception {
+        LogicalPlan plan = plan("SELECT a, x FROM t1 ORDER BY a");
+        assertThat(plan).isEqualTo(
+            """
+            Fetch[a, x]
+              └ OrderBy[a ASC]
+                └ Collect[doc.t1 | [_fetchid, a] | true]
+            """
+        );
+    }
+
+    @Test
+    public void testQTFWithOrderByAndAlias() throws Exception {
+        LogicalPlan plan = plan("SELECT a, x FROM t1 as t ORDER BY a");
+        assertThat(plan).isEqualTo(
+            """
+            Fetch[a, x]
+              └ Rename[t._fetchid, a] AS t
+                └ OrderBy[a ASC]
+                  └ Collect[doc.t1 | [_fetchid, a] | true]
+            """
+        );
+    }
+
+    @Test
+    public void testQTFWithoutOrderBy() throws Exception {
+        LogicalPlan plan = plan("SELECT a, x FROM t1");
+        assertThat(plan).isEqualTo("Collect[doc.t1 | [a, x] | true]");
+    }
+
+    @Test
+    public void testSimpleSelectQAFAndLimit() throws Exception {
+        LogicalPlan plan = plan("SELECT a FROM t1 ORDER BY a LIMIT 10 offset 5");
+        assertThat(plan).isEqualTo(
+            """
+            Limit[10;5]
+              └ OrderBy[a ASC]
+                └ Collect[doc.t1 | [a] | true]
+            """
+        );
+    }
+
+    @Test
+    public void testSelectOnVirtualTableWithOrderBy() throws Exception {
+        LogicalPlan plan = plan(
+            """
+            SELECT a, x FROM (
+              SELECT a, x FROM t1 ORDER BY a LIMIT 3) tt
+            ORDER BY x DESC LIMIT 1
+            """
+        );
+        assertThat(plan).isEqualTo(
+            """
+            Rename[a, x] AS tt
+              └ Limit[1;0]
+                └ OrderBy[x DESC]
+                  └ Fetch[a, x]
+                    └ Limit[3;0]
+                      └ OrderBy[a ASC]
+                        └ Collect[doc.t1 | [_fetchid, a] | true]
+            """);
+    }
+
+    @Test
+    public void testIntermediateFetch() throws Exception {
+        LogicalPlan plan = plan("SELECT sum(x) FROM (SELECT x FROM t1 LIMIT 10) tt");
+        assertThat(plan).isEqualTo(
+            """
+            HashAggregate[sum(x)]
+              └ Rename[x] AS tt
+                └ Fetch[x]
+                  └ Limit[10;0]
+                    └ Collect[doc.t1 | [_fetchid] | true]
+            """);
+    }
+
+    @Test
+    public void testHavingGlobalAggregation() throws Exception {
+        LogicalPlan plan = plan("SELECT min(a), min(x) FROM t1 HAVING min(x) < 33 and max(x) > 100");
+        assertThat(plan).isEqualTo(
+            """
+            Eval[min(a), min(x)]
+              └ Filter[((min(x) < 33) AND (max(x) > 100))]
+                └ HashAggregate[min(a), min(x), max(x)]
+                  └ Collect[doc.t1 | [a, x] | true]
+            """
+        );
+    }
+
+    @Test
+    public void testHavingGlobalAggregationAndRelationAlias() throws Exception {
+        LogicalPlan plan = plan("SELECT min(a), min(x) FROM t1 as tt HAVING min(tt.x) < 33 and max(tt.x) > 100");
+        assertThat(plan).isEqualTo(
+            """
+            Eval[min(a), min(x)]
+              └ Filter[((min(x) < 33) AND (max(x) > 100))]
+                └ HashAggregate[min(a), min(x), max(x)]
+                  └ Rename[a, x] AS tt
+                    └ Collect[doc.t1 | [a, x] | true]
+            """);
+    }
+
+    @Test
+    public void testSelectCountStarIsOptimized() throws Exception {
+        LogicalPlan plan = plan("SELECT count(*) FROM t1 WHERE x > 10");
+        assertThat(plan).isEqualTo("Count[doc.t1 | (x > 10)]");
+    }
+
+    @Test
+    public void test_select_count_star_on_aliased_table_is_optimized() throws Exception {
+        LogicalPlan plan = plan("SELECT count(*) FROM t1 as t");
+        assertThat(plan).isEqualTo("Count[doc.t1 | true]");
+    }
+
+    @Test
+    public void test_count_distinct_on_non_nullable_column_counts_distinct_values_not_rows() {
+        // `id` is a primary key and therefore not nullable. Counting a non-nullable column is the same
+        // as counting rows, which `MergeAggregateAndCollectToCount` uses to collapse the query into a
+        // `Count` operator. That shortcut does not apply to `count(distinct id)`, which counts distinct
+        // values, so the plan has to deduplicate them first.
+        LogicalPlan plan = plan("SELECT count(distinct id) FROM users");
+        assertThat(plan).hasOperators(
+            "HashAggregate[count(DISTINCT id)]",
+            "  └ Collect[doc.users | [id] | true]"
+        );
+    }
+
+    @Test
+    public void test_count_on_non_nullable_column_is_optimized_to_row_count() {
+        LogicalPlan plan = plan("SELECT count(id) FROM users");
+        assertThat(plan).isEqualTo("Count[doc.users | true]");
+    }
+
+    @Test
+    public void test_select_count_star_is_optimized_if_there_is_a_single_agg_in_select_list() {
+        LogicalPlan plan = plan("SELECT COUNT(*), COUNT(x) FROM t1 WHERE x > 10");
+        assertThat(plan).isEqualTo(
+            """
+            HashAggregate[count(*), count(x)]
+              └ Collect[doc.t1 | [x] | (x > 10)]
+            """
+        );
+    }
+
+    @Test
+    public void testSelectCountStarIsOptimizedOnNestedSubqueries() throws Exception {
+        LogicalPlan plan = plan("SELECT * FROM t1 WHERE x > (SELECT 1 FROM t1 WHERE x > (SELECT count(*) FROM t2 LIMIT 1)::integer)");
+        // instead of a Collect plan, this must result in a CountPlan through optimization
+        assertThat(plan).hasOperators(
+            "MultiPhase",
+            "  └ Collect[doc.t1 | [a, x, i] | (x > (SELECT 1 FROM (doc.t1)))]",
+            "  └ Limit[2;0]",
+            "    └ MultiPhase",
+            "      └ Collect[doc.t1 | [1] | (x > cast((SELECT count(*) FROM (doc.t2)) AS INTEGER))]",
+            "      └ Limit[2;0]",
+            "        └ Limit[1;0]",
+            "          └ Count[doc.t2 | true]"
+        );
+    }
+
+    @Test
+    public void testSelectCountStarIsOptimizedInsideRelations() {
+        LogicalPlan plan = plan(
+            """
+            SELECT t2.i, cnt FROM
+              (SELECT count(*) as cnt FROM t1) t1
+            JOIN
+              (SELECT i FROM t2 LIMIT 1) t2
+            ON t1.cnt = t2.i::long
+            """
+        );
+        assertThat(plan).isEqualTo(
+            """
+            Eval[i, cnt]
+              └ HashJoin[INNER | (cnt = cast(i AS BIGINT))]
+                ├ Rename[cnt] AS t1
+                │  └ Eval[count(*) AS cnt]
+                │    └ Count[doc.t1 | true]
+                └ Rename[i] AS t2
+                  └ Fetch[i]
+                    └ Limit[1;0]
+                      └ Collect[doc.t2 | [_fetchid] | true]
+            """);
+    }
+
+    @Test
+    public void testJoinTwoTables() {
+        LogicalPlan plan = plan(
+            """
+            SELECT t1.x, t1.a, t2.y
+            FROM t1
+            INNER JOIN t2 ON t1.x = t2.y
+            ORDER BY t1.x
+            LIMIT 10
+             """);
+        assertThat(plan).isEqualTo(
+            """
+            Fetch[x, a, y]
+              └ Limit[10;0]
+                └ OrderBy[x ASC]
+                  └ HashJoin[INNER | (x = y)]
+                    ├ Collect[doc.t1 | [_fetchid, x] | true]
+                    └ Collect[doc.t2 | [y] | true]
+            """);
+    }
+
+    @Test
+    public void testScoreColumnIsCollectedNotFetched() throws Exception {
+        LogicalPlan plan = plan("SELECT x, _score FROM t1");
+        assertThat(plan).isEqualTo("Collect[doc.t1 | [x, _score] | true]");
+    }
+
+    @Test
+    public void testInWithSubqueryOrderImplicitlyApplied() {
+        LogicalPlan plan = plan("SELECT x FROM t1 WHERE x in (SELECT x FROM t1)");
+        assertThat(plan.dependencies().entrySet()).hasSize(1);
+        LogicalPlan subPlan = plan.dependencies().keySet().iterator().next();
+        assertThat(subPlan).isEqualTo(
+            """
+            OrderBy[x ASC]
+              └ Collect[doc.t1 | [x] | true]
+            """);
+    }
+
+    @Test
+    public void testInWithSubqueryOrderImplicitlyAppliedWithExistingOrderBy() {
+        LogicalPlan plan = plan("SELECT x FROM t1 WHERE x in (SELECT x FROM t1 ORDER BY 1 DESC LIMIT 10)");
+        assertThat(plan.dependencies().entrySet()).hasSize(1);
+        LogicalPlan subPlan = plan.dependencies().keySet().iterator().next();
+        assertThat(subPlan).isEqualTo(
+            """
+            Limit[10;0]
+              └ OrderBy[x DESC]
+                └ Collect[doc.t1 | [x] | true]
+            """);
+    }
+
+    @Test
+    public void testInWithSubqueryOrderImplicitlyAppliedWithExistingOrderByOnDifferentField() {
+        LogicalPlan plan = plan("SELECT x FROM t1 WHERE x in (SELECT x FROM t1 ORDER BY a DESC LIMIT 10)");
+        assertThat(plan.dependencies().entrySet()).hasSize(1);
+        LogicalPlan subPlan = plan.dependencies().keySet().iterator().next();
+        assertThat(subPlan).hasOperators(
+            "Eval[x]",
+            "  └ OrderBy[x ASC]",
+            "    └ Fetch[x, a]",
+            "      └ Limit[10;0]",
+            "        └ OrderBy[a DESC]",
+            "          └ Collect[doc.t1 | [_fetchid, a] | true]"
+        );
+    }
+
+    @Test
+    public void test_optimize_for_in_subquery_only_operates_on_primitive_types() {
+        LogicalPlan plan = plan("SELECT array(SELECT {a = x} FROM t1)");
+        assertThat(plan.dependencies().entrySet()).hasSize(1);
+        LogicalPlan subPlan = plan.dependencies().keySet().iterator().next();
+        assertThat(subPlan).isEqualTo("Collect[doc.t1 | [{a = x}] | true]");
+    }
+
+    @Test
+    public void testParentQueryIsPushedDownAndMergedIntoSubRelationWhereClause() {
+        LogicalPlan plan = plan("SELECT * FROM " +
+                                " (SELECT a, i FROM t1 ORDER BY a LIMIT 5) t1 " +
+                                "INNER JOIN" +
+                                " (SELECT b, i FROM t2 WHERE b > '10') t2 " +
+                                "ON t1.i = t2.i WHERE t1.a > '50' and t2.b > '100' " +
+                                "LIMIT 10");
+        assertThat(plan).isEqualTo(
+            """
+            Fetch[a, i, b, i]
+              └ Limit[10;0]
+                └ HashJoin[INNER | (i = i)]
+                  ├ Rename[a, i] AS t1
+                  │  └ Filter[(a > '50')]
+                  │    └ Fetch[a, i]
+                  │      └ Limit[5;0]
+                  │        └ OrderBy[a ASC]
+                  │          └ Collect[doc.t1 | [_fetchid, a] | true]
+                  └ Rename[t2._fetchid, i] AS t2
+                    └ Collect[doc.t2 | [_fetchid, i] | ((b > '100') AND (b > '10'))]
+            """);
+    }
+
+    @Test
+    public void test_lookup_join_under_limit_can_be_fetch_optimized() {
+        sqlExecutor.getSessionSettings().excludedOptimizerRules().remove(EquiJoinToLookupJoin.class);
+        TableInfo t1 = sqlExecutor.resolveTableInfo("t1");
+        TableInfo t2 = sqlExecutor.resolveTableInfo("t2");
+        sqlExecutor.updateTableStats(Map.of(
+            t1.ident(), new Stats(10_000, 0, Map.of()),
+            t2.ident(), new Stats(100, 0, Map.of())
+        ));
+
+        LogicalPlan plan = plan(
+            """
+            SELECT t1.i, t1.a, t2.i
+            FROM t1
+            JOIN t2 ON t1.i = t2.i
+            LIMIT 5
+            """
+        );
+
+        assertThat(plan).isEqualTo(
+            """
+            Fetch[i, a, i]
+              └ Limit[5;0]
+                └ HashJoin[INNER | (i = i)]
+                  ├ MultiPhase
+                  │  └ Collect[doc.t1 | [_fetchid, i] | (i = ANY((doc.t2)))]
+                  │  └ Collect[doc.t2 | [i] | true]
+                  └ Collect[doc.t2 | [i] | true]
+            """
+        );
+    }
+
+    @Test
+    public void test_lookup_join_under_filter_and_limit_can_be_fetch_optimized() {
+        sqlExecutor.getSessionSettings().excludedOptimizerRules().remove(EquiJoinToLookupJoin.class);
+        TableInfo t1 = sqlExecutor.resolveTableInfo("t1");
+        TableInfo t2 = sqlExecutor.resolveTableInfo("t2");
+        sqlExecutor.updateTableStats(Map.of(
+            t1.ident(), new Stats(10_000, 0, Map.of()),
+            t2.ident(), new Stats(100, 0, Map.of())
+        ));
+
+        LogicalPlan plan = plan(
+            """
+            SELECT t1.i, t1.a, t2.i
+            FROM t1
+            JOIN t2 ON t1.i = t2.i
+            WHERE t1.x > t2.y
+            LIMIT 5
+            """
+        );
+
+        assertThat(plan).isEqualTo(
+            """
+            Eval[i, a, i]
+              └ Fetch[i, a, x, i, y]
+                └ Limit[5;0]
+                  └ Filter[(x > y)]
+                    └ HashJoin[INNER | (i = i)]
+                      ├ MultiPhase
+                      │  └ Collect[doc.t1 | [_fetchid, i, x] | (i = ANY((doc.t2)))]
+                      │  └ Collect[doc.t2 | [i] | true]
+                      └ Collect[doc.t2 | [i, y] | true]
+            """
+        );
+    }
+
+    @Test
+    public void testPlanOfJoinedViewsHasBoundaryWithViewOutputs() {
+        LogicalPlan plan = plan(
+            """
+            SELECT v2.x, v2.a, v3.x, v3.a
+            FROM v2
+            INNER JOIN v3
+            ON v2.x= v3.x
+            """);
+        assertThat(plan).isEqualTo(
+            """
+            Eval[x, a, x, a]
+              └ HashJoin[INNER | (x = x)]
+                ├ Rename[a, x] AS doc.v2
+                │  └ Collect[doc.t1 | [a, x] | true]
+                └ Rename[a, x] AS doc.v3
+                  └ Collect[doc.t1 | [a, x] | true]
+            """);
+    }
+
+    @Test
+    public void testAliasedPrimaryKeyLookupHasGetPlan() {
+        LogicalPlan plan = plan("SELECT name FROM users u WHERE id = 1");
+        assertThat(plan).isEqualTo(
+            "Rename[name] AS u\n" +
+            "  └ Get[doc.users | name | DocKeys{1} | (id = 1)]");
+    }
+
+    @Test
+    public void test_limit_distinct_limits_outputs_to_the_group_keys_if_source_has_more_outputs() {
+        String statement = """
+                            SELECT name, other_id
+                            FROM (SELECT name, awesome, other_id FROM users) u
+                            GROUP BY name, other_id LIMIT 20
+                           """;
+        LogicalPlan plan = plan(statement);
+        assertThat(plan).isEqualTo(
+            """
+            LimitDistinct[20;0 | [name, other_id]]
+              └ Rename[name, other_id] AS u
+                └ Collect[doc.users | [name, other_id] | true]
+            """
+        );
+        io.crate.planner.node.dql.Collect collect = sqlExecutor.plan(statement);
+        List<Projection> projections = collect.collectPhase().projections();
+        assertThat(projections).satisfiesExactly(
+            p -> assertThat(p).isExactlyInstanceOf(LimitDistinctProjection.class),
+            p -> assertThat(p).isExactlyInstanceOf(LimitDistinctProjection.class)
+        );
+        assertThat(projections.get(0).requiredGranularity()).isEqualTo(RowGranularity.SHARD);
+        assertThat(projections.get(1).requiredGranularity()).isEqualTo(RowGranularity.CLUSTER);
+    }
+
+    @Test
+    public void test_limit_on_join_is_rewritten_to_query_then_fetch() {
+        LogicalPlan plan = plan("SELECT * FROM t1, t2 LIMIT 3");
+        assertThat(plan).isEqualTo(
+            """
+            Fetch[a, x, i, b, y, i]
+              └ Limit[3;0]
+                └ NestedLoopJoin[CROSS]
+                  ├ Collect[doc.t1 | [_fetchid] | true]
+                  └ Collect[doc.t2 | [_fetchid] | true]
+            """
+        );
+    }
+
+    @Test
+    public void test_limit_on_hash_join_is_rewritten_to_query_then_fetch() {
+        LogicalPlan plan = plan("SELECT * FROM t1 INNER JOIN t2 ON t1.a = t2.b LIMIT 3");
+        assertThat(plan).isEqualTo(
+            """
+            Fetch[a, x, i, b, y, i]
+              └ Limit[3;0]
+                └ HashJoin[INNER | (a = b)]
+                  ├ Collect[doc.t1 | [_fetchid, a] | true]
+                  └ Collect[doc.t2 | [_fetchid, b] | true]
+            """
+        );
+    }
+
+    @Test
+    public void test_unused_table_function_in_subquery_is_not_pruned() {
+        LogicalPlan plan = plan("SELECT name FROM (SELECT name, unnest(counters), text FROM users) u");
+        assertThat(plan).isEqualTo(
+            """
+            Rename[name] AS u
+              └ Eval[name]
+                └ ProjectSet[unnest(counters), name]
+                  └ Collect[doc.users | [counters, name] | true]
+            """
+        );
+    }
+
+    @Test
+    public void test_group_by_with_alias_and_limit_distinct_rewrite_creates_valid_plan() {
+        TableInfo t1 = sqlExecutor.resolveTableInfo("t1");
+        sqlExecutor.updateTableStats(Map.of(t1.ident(), new Stats(100L, 100L, Map.of())));
+        LogicalPlan plan = plan("SELECT a as b FROM doc.t1 GROUP BY a LIMIT 10");
+        assertThat(plan).isEqualTo(
+            """
+            Eval[a AS b]
+              └ LimitDistinct[10;0 | [a]]
+                └ Collect[doc.t1 | [a] | true]
+            """
+        );
+    }
+
+    @Test
+    public void test_query_uses_fetch_if_there_is_a_nested_loop_join_where_only_one_side_can_utilize_fetch() throws Exception {
+        // (uses like to force NL instead of hashjoin)
+        LogicalPlan plan = plan("""
+            SELECT * FROM (SELECT distinct name FROM users) u
+            INNER JOIN t1 ON t1.a like u.name
+            LIMIT 10
+            """);
+        assertThat(plan).isEqualTo(
+            """
+            Fetch[name, a, x, i]
+              └ Limit[10;0]
+                └ NestedLoopJoin[INNER | (a LIKE name)]
+                  ├ Rename[name] AS u
+                  │  └ GroupHashAggregate[name]
+                  │    └ Collect[doc.users | [name] | true]
+                  └ Collect[doc.t1 | [_fetchid, a] | true]
+            """
+        );
+    }
+
+    @Test
+    public void test_query_uses_fetch_if_there_is_a_hash_join_where_only_one_side_can_utilize_fetch() throws Exception {
+        LogicalPlan plan = plan("""
+            SELECT * FROM (SELECT distinct name FROM users) u
+            INNER JOIN t1 ON t1.a = u.name
+            LIMIT 10
+            """);
+        assertThat(plan).isEqualTo(
+            """
+            Fetch[name, a, x, i]
+              └ Limit[10;0]
+                └ HashJoin[INNER | (a = name)]
+                  ├ Rename[name] AS u
+                  │  └ GroupHashAggregate[name]
+                  │    └ Collect[doc.users | [name] | true]
+                  └ Collect[doc.t1 | [_fetchid, a] | true]
+            """
+        );
+    }
+
+    @Test
+    public void test_orderBy_not_optimized_for_array_subquery_expression() {
+        LogicalPlan plan = plan("SELECT array(SELECT x FROM t1 ORDER BY a DESC LIMIT 10)");
+        assertThat(plan.dependencies().entrySet()).hasSize(1);
+        LogicalPlan subPlan = plan.dependencies().keySet().iterator().next();
+        assertThat(subPlan).hasOperators(
+            "Eval[x]",
+            "  └ Fetch[x, a]",
+            "    └ Limit[10;0]",
+            "      └ OrderBy[a DESC]",
+            "        └ Collect[doc.t1 | [_fetchid, a] | true]"
+        );
+    }
+
+    @Test
+    public void test_eval_qtf_doesnt_unwrap_non_fetchable_aliases() {
+        // To reproduce https://github.com/crate/crate/issues/13414  we need:
+        // 1. SELECT at least one fetchable column (t1.i) to really kick in Query-Then-Fetch execution, just LIMIT is not enough.
+        // 2. SELECT used in join aliased column
+        // 3. use virtual table (view or subselect)
+        // 4. use LIMIT ON the whole query
+        LogicalPlan plan = plan(
+            """
+            SELECT * FROM generate_series(1, 2)
+            CROSS JOIN
+            (SELECT t1.i, t2.y AS aliased FROM t1 INNER JOIN t2 ON t1.x = t2.y) v
+            LIMIT 10
+            """
+        );
+
+        assertThat(plan).isEqualTo(
+            """
+            Fetch[generate_series, i, aliased]
+              └ Limit[10;0]
+                └ NestedLoopJoin[CROSS]
+                  ├ TableFunction[generate_series | [generate_series] | true]
+                  └ Rename[v._fetchid, aliased] AS v
+                    └ Eval[_fetchid, y AS aliased]
+                      └ HashJoin[INNER | (x = y)]
+                        ├ Collect[doc.t1 | [_fetchid, x] | true]
+                        └ Collect[doc.t2 | [y] | true]
+            """
+        );
+    }
+
+    // tracks a bug: https://github.com/crate/crate/issues/13779
+    @Test
+    public void test_prune_outputs_on_group_hash_aggregate() {
+        LogicalPlan plan = sqlExecutor.logicalPlan("""
+            SELECT a::int ai, avg(x), i::long FROM t1 WHERE a='1' GROUP BY 1,3
+            UNION
+            SELECT a::int ai, avg(x), i::long FROM t1 WHERE a='2' GROUP BY 1,3
+            UNION
+            SELECT a::int ai, avg(x), i::long FROM t1 WHERE a='3' GROUP BY 1,3
+            """);
+        assertThat(plan).hasOperators(
+            "GroupHashAggregate[ai, \"avg(x)\", \"cast(i AS BIGINT)\"]",
+            "  └ Union[ai, \"avg(x)\", \"cast(i AS BIGINT)\"]",
+            "    ├ GroupHashAggregate[ai, \"avg(x)\", \"cast(i AS BIGINT)\"]",
+            "    │  └ Union[ai, \"avg(x)\", \"cast(i AS BIGINT)\"]",
+            "    │    ├ Eval[cast(a AS INTEGER) AS ai, avg(x), cast(i AS BIGINT)]",
+            "    │    │  └ GroupHashAggregate[cast(a AS INTEGER) AS ai, cast(i AS BIGINT) | avg(x)]",
+            "    │    │    └ Collect[doc.t1 | [x, cast(a AS INTEGER) AS ai, cast(i AS BIGINT)] | (a = '1')]",
+            "    │    └ Eval[cast(a AS INTEGER) AS ai, avg(x), cast(i AS BIGINT)]",
+            "    │      └ GroupHashAggregate[cast(a AS INTEGER) AS ai, cast(i AS BIGINT) | avg(x)]",
+            "    │        └ Collect[doc.t1 | [x, cast(a AS INTEGER) AS ai, cast(i AS BIGINT)] | (a = '2')]",
+            "    └ Eval[cast(a AS INTEGER) AS ai, avg(x), cast(i AS BIGINT)]",
+            "      └ GroupHashAggregate[cast(a AS INTEGER) AS ai, cast(i AS BIGINT) | avg(x)]",
+            "        └ Collect[doc.t1 | [x, cast(a AS INTEGER) AS ai, cast(i AS BIGINT)] | (a = '3')]"
+        );
+    }
+
+    // tracks a bug: https://github.com/crate/crate/issues/14330
+    @Test
+    public void test_prune_outputs_on_group_hash_aggregate_with_limit() {
+        LogicalPlan plan = sqlExecutor.logicalPlan("""
+            SELECT a::int ai, avg(x), i::long FROM t1 WHERE a='1' GROUP BY 1,3
+            UNION
+            SELECT a::int ai, avg(x), i::long FROM t1 WHERE a='2' GROUP BY 1,3
+            UNION
+            SELECT a::int ai, avg(x), i::long FROM t1 WHERE a='3' GROUP BY 1,3
+            LIMIT 10
+            """);
+        assertThat(plan).hasOperators(
+            "LimitDistinct[10;0 | [ai, \"avg(x)\", \"cast(i AS BIGINT)\"]]",
+            "  └ Union[ai, \"avg(x)\", \"cast(i AS BIGINT)\"]",
+            "    ├ GroupHashAggregate[ai, \"avg(x)\", \"cast(i AS BIGINT)\"]",
+            "    │  └ Union[ai, \"avg(x)\", \"cast(i AS BIGINT)\"]",
+            "    │    ├ Eval[cast(a AS INTEGER) AS ai, avg(x), cast(i AS BIGINT)]",
+            "    │    │  └ GroupHashAggregate[cast(a AS INTEGER) AS ai, cast(i AS BIGINT) | avg(x)]",
+            "    │    │    └ Collect[doc.t1 | [x, cast(a AS INTEGER) AS ai, cast(i AS BIGINT)] | (a = '1')]",
+            "    │    └ Eval[cast(a AS INTEGER) AS ai, avg(x), cast(i AS BIGINT)]",
+            "    │      └ GroupHashAggregate[cast(a AS INTEGER) AS ai, cast(i AS BIGINT) | avg(x)]",
+            "    │        └ Collect[doc.t1 | [x, cast(a AS INTEGER) AS ai, cast(i AS BIGINT)] | (a = '2')]",
+            "    └ Eval[cast(a AS INTEGER) AS ai, avg(x), cast(i AS BIGINT)]",
+            "      └ GroupHashAggregate[cast(a AS INTEGER) AS ai, cast(i AS BIGINT) | avg(x)]",
+            "        └ Collect[doc.t1 | [x, cast(a AS INTEGER) AS ai, cast(i AS BIGINT)] | (a = '3')]"
+        );
+    }
+
+    @Test
+    public void test_prune_outputs_on_window_functions() {
+        LogicalPlan plan = sqlExecutor.logicalPlan("""
+            SELECT i, avgx FROM (SELECT a, avg(x) OVER(ORDER BY i) as avgx, i FROM t1) as vt
+            """);
+        // x comes first in the plan because window functions picked up first in SplitPointsBuilder.
+        // Then last Eval is added to re-order as user wants.
+        assertThat(plan).hasOperators(
+            "Eval[i, avgx]",
+            "  └ Rename[avgx, i] AS vt",
+            "    └ Eval[avg(x) OVER (ORDER BY i ASC) AS avgx, i]",
+            "      └ WindowAgg[x, i] | [avg(x) OVER (ORDER BY i ASC)]",
+            "        └ Collect[doc.t1 | [x, i] | true]"
+        );
+    }
+
+    @Test
+    public void test_prune_outputs_on_table_functions() {
+        LogicalPlan plan = sqlExecutor.logicalPlan("""
+            SELECT sumx, umaxx, minx, uavgx FROM(
+               SELECT min(x) as minx, unnest([min(x)]) as uminx, max(x) as maxx, unnest([max(x)]) as umaxx,
+                      avg(x) as avgx, unnest([avg(x)]) as uavgx, sum(x) as sumx, unnest([sum(x)]) as usumx from t1) as vt
+            """);
+        assertThat(plan).isEqualTo(
+            """
+                Eval[sumx, umaxx, minx, uavgx]
+                  └ Rename[minx, umaxx, uavgx, sumx] AS vt
+                    └ Eval[min(x) AS minx, unnest([max(x)]) AS umaxx, unnest([avg(x)]) AS uavgx, sum(x) AS sumx]
+                      └ ProjectSet[unnest([min(x)]), unnest([max(x)]), unnest([avg(x)]), unnest([sum(x)]), min(x), max(x), avg(x), sum(x)]
+                        └ HashAggregate[min(x), max(x), avg(x), sum(x)]
+                          └ Collect[doc.t1 | [x] | true]""");
+    }
+
+    @Test
+    public void test_column_pruning_is_applied_to_subqueries() throws Exception {
+        var plan = sqlExecutor.logicalPlan(
+            "select name from users where id in (select a from t1 where x > 10)");
+        assertThat(plan)
+            .as("Must not collect `x`")
+            .hasOperators(
+                "MultiPhase",
+                "  └ Collect[doc.users | [name] | (id = ANY((SELECT a FROM (doc.t1))))]",
+                "  └ OrderBy[a ASC]",
+                "    └ Collect[doc.t1 | [a] | (x > 10)]"
+            );
+    }
+
+    @Test
+    public void test_rename_gets_scalar_outputs_from_collect() {
+        var plan = sqlExecutor.logicalPlan("""
+          SELECT
+            TRY_CAST(x AS BIGINT) AS val
+          FROM t1 as t
+          WHERE x < 123
+          ORDER BY val ASC
+            """);
+        assertThat(plan)
+            .hasOperators(
+                "Eval[try_cast(x AS BIGINT) AS val]",
+                "  └ Rename[try_cast(x AS BIGINT) AS val, try_cast(x AS BIGINT)] AS t",
+                "    └ OrderBy[try_cast(x AS BIGINT) ASC]",
+                "      └ Collect[doc.t1 | [try_cast(x AS BIGINT) AS val, try_cast(x AS BIGINT)] | (x < 123)]"
+            );
+    }
+
+    @Test
+    public void test_scalar_uses_table_function_and_column_not_used_in_select_and_table_function() {
+        LogicalPlan plan = sqlExecutor.logicalPlan("""
+            SELECT
+              CASE
+                WHEN regexp_matches(name, '^a') != []
+                    THEN 'found'
+                WHEN text LIKE '%xyz%'
+                    THEN 'special case'
+                ELSE 'default'
+              END
+            FROM users;
+            """);
+        // Column "text" is not in SELECT targets and not used in regexp_matches.
+        // It's used to be not collected and not included into outputs
+        // which lead to failure of constructing an execution plan
+        assertThat(plan).isEqualTo(
+            """
+                Eval[CASE WHEN (NOT (regexp_matches(name, '^a') = [])) THEN 'found' WHEN (text LIKE '%xyz%') THEN 'special case' ELSE 'default' END]
+                  └ ProjectSet[regexp_matches(name, '^a'), name, text]
+                    └ Collect[doc.users | [name, text] | true]
+                """
+        );
+    }
+
+    /**
+     * Tracks a bug https://github.com/crate/crate/issues/17016
+     */
+    @Test
+    public void test_can_create_execution_plan_from_correlated_join_with_reordered_hash_join() {
+        // Provoke re-ordering by making a table on the right side bigger.
+        Map<RelationName, Stats> rowCountByTable = new HashMap<>();
+        rowCountByTable.put(T3.T1, new Stats(10, 0, Map.of()));
+        rowCountByTable.put(T3.T2, new Stats(100, 0, Map.of()));
+        sqlExecutor.updateTableStats(rowCountByTable);
+
+        LogicalPlan plan = sqlExecutor.logicalPlan("""
+            WITH cte_1 AS (
+                SELECT g.x
+                FROM t1 g
+                WHERE g.i = 1
+            )
+            SELECT (
+                    SELECT true
+                    FROM t1 s
+                    WHERE c.x = s.x
+                   )
+            FROM cte_1 c
+            JOIN t2 p ON c.x = p.y"""
+        );
+
+        // Eval under CorrelatedJoin used to incorrectly have (SELECT true FROM (s)) Symbol as a result of outputs prunning.
+        assertThat(plan).isEqualTo("""
+            Eval[(SELECT true FROM (s))]
+              └ CorrelatedJoin[x, (SELECT true FROM (s))]
+                └ Eval[x]
+                  └ HashJoin[INNER | (x = y)]
+                    ├ Rename[y] AS p
+                    │  └ Collect[doc.t2 | [y] | true]
+                    └ Rename[x] AS c
+                      └ Rename[x] AS cte_1
+                        └ Rename[x] AS g
+                          └ Collect[doc.t1 | [x] | (i = 1)]
+                └ SubPlan
+                  └ Rename[true] AS s
+                    └ Limit[2;0]
+                      └ Collect[doc.t1 | [true] | (x = x)]"""
+        );
+    }
+
+    @Test
+    public void test_select_expression_with_a_non_fetchable_column_and_parameter() {
+        QueryThenFetch queryThenFetch = sqlExecutor.plan(
+            "select name, ints + ? as sum from doc.users order by sum limit 10", UUID.randomUUID(), 0, new Row1(1));
+        var collect = (io.crate.planner.node.dql.Collect) queryThenFetch.subPlan();
+        FetchProjection fetchProjection = (FetchProjection) collect
+            .collectPhase()
+            .projections()
+            .stream()
+            .filter(projection -> projection.projectionType() == ProjectionType.FETCH)
+            .findFirst()
+            .get();
+
+        // There can be _doc['ints'] refs in FetchReference-s but regular Reference-s must not be in the FetchProjection outputs.
+        assertThat(fetchProjection.outputSymbols()).satisfiesExactly(
+            x -> assertThat(x).isExactlyInstanceOf(FetchReference.class),
+            x -> assertThat(x).isFunction("add",
+                arg -> assertThat(arg).isExactlyInstanceOf(FetchReference.class),
+                arg -> assertThat(arg).isLiteral(1)
+            ),
+            x -> assertThat(x).isInputColumn(1)
+        );
+    }
+
+    @Test
+    public void test_ram_accounting_released_on_multi_phase_execution_failure() throws Exception {
+        var plan = sqlExecutor.logicalPlan(
+            "select name from users where id in (select a from t1 where x > 10)");
+
+        DependencyCarrier dependencies = sqlExecutor.dependencyMock;
+        CircuitBreaker circuitBreaker = mock(CircuitBreaker.class);
+        when(dependencies.circuitBreaker(CircuitBreaker.QUERY)).thenReturn(circuitBreaker);
+
+        // Setup CircuitBreakingException for a sub-plan.
+        PhasesTaskFactory phasesTaskFactory = mock(PhasesTaskFactory.class);
+        when(dependencies.phasesTaskFactory()).thenReturn(phasesTaskFactory);
+        JobLauncher jobLauncher = new JobLauncher(
+            UUID.randomUUID(),
+            clusterService,
+            Mockito.mock(JobSetup.class),
+            Mockito.mock(TasksService.class),
+            Mockito.mock(IndicesService.class),
+            null,
+            null,
+            List.of(),
+            false
+        ) {
+            @Override
+            public void execute(RowConsumer consumer, TransactionContext txnCtx) {
+                consumer.accept(null, new CircuitBreakingException("dummy"));
+            }
+        };
+        when(phasesTaskFactory.create(any(), any(), anyBoolean())).thenReturn(jobLauncher);
+        var consumer = sqlExecutor.execute(plan);
+        assertThat(consumer.completionFuture().isDone()).isTrue();
+
+        // addWithoutBreaking is used in ConcurrentRamAccounting to release bytes;
+        // Before 5.10.13, circuit breaker memory was not released
+        // if multiphased execution failed on sub-query and addWithoutBreaking() was never called.
+        verify(circuitBreaker, times(1)).addWithoutBreaking(anyLong());
+    }
+
+    @Test
+    public void test_declare_forwards_query_failure_to_consumer_and_closes_cursor() throws Exception {
+        Plan declarePlan = sqlExecutor.plan(
+            "declare c1 no scroll cursor with hold for select * from generate_series(1, 10)");
+
+        // Setup some dummy failure for a query in DECLARE.
+        DependencyCarrier dependencies = sqlExecutor.dependencyMock;
+        PhasesTaskFactory phasesTaskFactory = mock(PhasesTaskFactory.class);
+        when(dependencies.phasesTaskFactory()).thenReturn(phasesTaskFactory);
+        JobLauncher jobLauncher = new JobLauncher(
+            UUID.randomUUID(),
+            clusterService,
+            Mockito.mock(JobSetup.class),
+            Mockito.mock(TasksService.class),
+            Mockito.mock(IndicesService.class),
+            null,
+            null,
+            List.of(),
+            false
+        ) {
+            @Override
+            public void execute(RowConsumer consumer, TransactionContext txnCtx) {
+                consumer.accept(null, new RuntimeException("dummy"));
+            }
+        };
+        when(phasesTaskFactory.create(any(), any(), anyBoolean())).thenReturn(jobLauncher);
+        var consumer = sqlExecutor.execute(declarePlan);
+        assertThat(consumer.completionFuture().isDone()).isTrue();
+
+        var plannerContext = sqlExecutor.getPlannerContext();
+        assertThat(plannerContext.cursors()).isEmpty();
+
+
+    }
+
+    /**
+     * Verifies a fix for a regression
+     * introduced with <a href="https://github.com/crate/crate/commit/1ece4b40e51ea2b95af0ac8894318cba5359bbda">...</a>
+     * Tests scenario from <a href="https://github.com/crate/crate/issues/18860">...</a>.
+     */
+    @Test
+    public void test_do_not_apply_eliminate_cross_join_for_non_equi_join() throws Exception {
+        LogicalPlan plan = sqlExecutor.logicalPlan("""
+            SELECT t1.*, users.awesome FROM t1, users
+            INNER JOIN (SELECT 1 AS col0) AS sub0
+            ON (CASE sub0.col0 WHEN sub0.col0 THEN users.awesome ELSE false END)
+            """
+        );
+        // An INNER JOIN of users and subquery table is done first (on CASE expression).
+        // A CROSS JOIN of t1 and users used to be done first due to incorrect EliminateCrossJoin rule application.
+        assertThat(plan)
+            .as("Must first do an INNER JOIN of users and subquery table")
+            .hasOperators(
+                "Eval[a, x, i, awesome]",
+                "  └ NestedLoopJoin[CROSS]",
+                "    ├ Collect[doc.t1 | [a, x, i] | true]",
+                "    └ NestedLoopJoin[INNER | CASE WHEN (col0 = col0) THEN awesome ELSE false END]",
+                "      ├ Collect[doc.users | [awesome] | true]",
+                "      └ Rename[col0] AS sub0",
+                "        └ Eval[1 AS col0]",
+                "          └ TableFunction[empty_row | [] | true]"
+            );
+    }
+
+    /**
+     * Related to https://github.com/crate/crate/issues/20120
+     */
+    @Test
+    public void test_correlated_subquery_in_select_with_group_by_applied_after_group_by() throws Exception {
+        LogicalPlan plan = sqlExecutor.logicalPlan("""
+            SELECT o.x, (SELECT i.x FROM t1 AS i WHERE i.x > o.x ORDER BY i.x LIMIT 1) AS next_x FROM t1 AS o
+            GROUP BY o.x
+            """
+        );
+
+        assertThat(plan).isEqualTo(
+            """
+            Eval[x, (SELECT x FROM (i)) AS next_x]
+              └ CorrelatedJoin[x, (SELECT x FROM (i))]
+                └ GroupHashAggregate[x]
+                  └ Rename[x] AS o
+                    └ Collect[doc.t1 | [x] | true]
+                └ SubPlan
+                  └ Rename[x] AS i
+                    └ Limit[2;0]
+                      └ Limit[1;0]
+                        └ OrderBy[x ASC]
+                          └ Collect[doc.t1 | [x] | (x > x)]
+            """
+        );
+    }
+
+    @Test
+    public void test_correlated_subquery_in_where_applied_before_group_by() throws Exception {
+        LogicalPlan plan = sqlExecutor.logicalPlan("""
+            SELECT o.x
+            FROM t1 AS o
+            WHERE o.x = (SELECT MIN(t.x) FROM t1 AS t WHERE t.x > o.x)
+            GROUP BY o.x
+            """
+        );
+
+        assertThat(plan).isEqualTo(
+            """
+           GroupHashAggregate[x]
+             └ Filter[(x = (SELECT min(x) FROM (t)))]
+               └ CorrelatedJoin[x, (SELECT min(x) FROM (t))]
+                 └ Rename[x] AS o
+                   └ Collect[doc.t1 | [x] | true]
+                 └ SubPlan
+                   └ Limit[2;0]
+                     └ HashAggregate[min(x)]
+                       └ Rename[x] AS t
+                         └ Collect[doc.t1 | [x] | (x > x)]
+            """
+        );
+    }
+
+    @Test
+    public void test_correlated_subqueries_in_where_and_in_select_with_group_by() throws Exception {
+        LogicalPlan plan = sqlExecutor.logicalPlan("""
+            SELECT o.x, (SELECT i.x FROM t1 AS i WHERE i.x > o.x ORDER BY i.x LIMIT 1) AS next_x
+            FROM t1 AS o
+            WHERE o.x = (SELECT MIN(t.x) FROM t1 AS t WHERE t.x = o.x)
+            GROUP BY o.x
+            """
+        );
+
+        assertThat(plan).isEqualTo(
+            """
+            Eval[x, (SELECT x FROM (i)) AS next_x]
+              └ CorrelatedJoin[x, (SELECT x FROM (i))]
+                └ GroupHashAggregate[x]
+                  └ Filter[(x = (SELECT min(x) FROM (t)))]
+                    └ CorrelatedJoin[x, (SELECT min(x) FROM (t))]
+                      └ Rename[x] AS o
+                        └ Collect[doc.t1 | [x] | true]
+                      └ SubPlan
+                        └ Limit[2;0]
+                          └ HashAggregate[min(x)]
+                            └ Rename[x] AS t
+                              └ Collect[doc.t1 | [x] | (x = x)]
+                └ SubPlan
+                  └ Rename[x] AS i
+                    └ Limit[2;0]
+                      └ Limit[1;0]
+                        └ OrderBy[x ASC]
+                          └ Collect[doc.t1 | [x] | (x > x)]
+            """
+        );
+    }
+}

@@ -1,0 +1,104 @@
+.. _version_6.4.5:
+
+=============
+Version 6.4.5
+=============
+
+Released on 2026-09-16.
+
+.. NOTE::
+
+    If you are upgrading a cluster, you must be running CrateDB 5.0.0 or higher
+    before you upgrade to 6.4.5.
+
+    We recommend that you upgrade to the latest 6.3 release before moving to
+    6.4.5.
+
+    A rolling upgrade from >= 6.3.0 to 6.4.5 is supported.
+    Before upgrading, you should `back up your data`_.
+
+.. WARNING::
+
+    Tables that were created before CrateDB 5.x will not function with 6.x
+    and must be recreated before moving to 6.x.x.
+
+    You can recreate tables using ``COPY TO`` and ``COPY FROM`` or by
+    `inserting the data into a new table`_.
+
+.. _back up your data: https://cratedb.com/docs/crate/reference/en/latest/admin/snapshots.html
+.. _inserting the data into a new table: https://cratedb.com/docs/crate/reference/en/latest/admin/system-information.html#tables-need-to-be-recreated
+
+.. rubric:: Table of contents
+
+.. contents::
+   :local:
+
+
+See the :ref:`version_6.4.0` release notes for a full list of changes in the 6.4
+series.
+
+Fixes
+=====
+
+- HTTP clients sending an invalid JWT token in the Authentication header now
+  receive a ``401`` error instead of ``500``.
+
+- Fixed an issue that could cause statements including a cross join with two
+  other relations to apply an incorrect filter if one of the join conditions
+  included an equijoin where one relation appeared multiple times on one side of
+  the equal condition. An example query::
+
+      SELECT * FROM t1 CROSS JOIN t2 INNER JOIN t3 ON (t1.x + t1.x) = t3.z AND t3.z = t2.y
+
+- Fixed an issue that could cause statements including a cross join and an outer
+  join plus any other join to drop the outer join condition, leading to
+  incorrect results.
+
+- Fixed an issue that caused casting string values to a longer ``bit`` string to
+  fail with an ``StringIndexOutOfBoundsException`` instead of filling up the gap
+  with ``0``.
+
+- Fixed an issue that caused casting ``null`` to the ``bit`` type to fail.
+
+- Fixed an issue that caused CrateDB to choose the wrong relation if a parent
+  relation alias clashed with a local scoped relation name.
+
+- Fixed decoding of ``interval`` values sent from PostgreSQL wire protocol
+  clients using text format in the ``x hours y minutes ...`` style.
+
+- Fixed an issue that could lead to out of memory errors if using the
+  ``percentile`` aggregation.
+
+- Fixed an issue causing cache to retain some heavy structures, potentially
+  leading to an ``OutOfMemoryError``.
+
+- Fixed an issue where a select statement containing a correlated subquery and
+  a group by would lose the subquery and result in an error, e.g.::
+
+    SELECT o.c1,
+       (SELECT i.c1
+        FROM source_symbols_t AS i
+        WHERE i.c1 > o.c1
+        ORDER BY i.c1
+        LIMIT 1) AS next_c1
+    FROM source_symbols_t AS o
+    GROUP BY o.c1
+    ORDER BY o.c1;
+
+    > Couldn't create execution plan from logical plan because of:
+    Couldn't find (SELECT c1 FROM (i)) in SourceSymbols
+
+- Fixed performance regression introduced in :ref:`version_6.3.0` that caused
+  ``CREATE SNAPSHOT`` to run slower if repository was created with
+  :ref:`Azure storage <sql-create-repo-azure>`.
+
+- Fixed an issue that could cause an error message to reference a wrong relation
+  if a column used in a query could not be resolved and multiple relations are
+  involved. This could also lead to privileges being checked on the wrong
+  relation while generating the error.
+
+- Fixed a regression introduced in :ref:`version_6.4.0` which caused a join,
+  executed with the hash join implementation, to not match rows when the join
+  condition used :ref:`CHAR(n) <data-type-character>` join keys of different
+  length but same value, because of the blank padding, which is applied to match
+  the defined ``n`` length.

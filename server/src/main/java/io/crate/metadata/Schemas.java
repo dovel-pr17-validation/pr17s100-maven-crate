@@ -1,0 +1,543 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.metadata;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.apache.lucene.search.spell.LevenshteinDistance;
+import org.elasticsearch.cluster.ClusterChangedEvent;
+import org.elasticsearch.cluster.ClusterStateListener;
+import org.elasticsearch.cluster.metadata.Metadata;
+import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.component.AbstractLifecycleComponent;
+import org.elasticsearch.index.Index;
+import org.elasticsearch.index.IndexNotFoundException;
+import org.jspecify.annotations.Nullable;
+
+import io.crate.common.annotations.VisibleForTesting;
+import io.crate.common.collections.Sets;
+import io.crate.exceptions.OperationOnInaccessibleRelationException;
+import io.crate.exceptions.RelationUnknown;
+import io.crate.exceptions.SchemaUnknownException;
+import io.crate.expression.udf.UserDefinedFunctionMetadata;
+import io.crate.expression.udf.UserDefinedFunctionsMetadata;
+import io.crate.metadata.blob.BlobSchemaInfo;
+import io.crate.metadata.doc.DocSchemaInfo;
+import io.crate.metadata.doc.DocSchemaInfoFactory;
+import io.crate.metadata.information.InformationSchemaInfo;
+import io.crate.metadata.pgcatalog.OidHash;
+import io.crate.metadata.pgcatalog.PgCatalogSchemaInfo;
+import io.crate.metadata.sys.SysSchemaInfo;
+import io.crate.metadata.table.Operation;
+import io.crate.metadata.table.SchemaInfo;
+import io.crate.role.Role;
+import io.crate.role.Roles;
+import io.crate.role.Securable;
+import io.crate.sql.tree.QualifiedName;
+
+
+public class Schemas extends AbstractLifecycleComponent implements Iterable<SchemaInfo>, ClusterStateListener, RelationLookup {
+
+    private static final Logger LOGGER = LogManager.getLogger(Schemas.class);
+
+    public static final Set<String> READ_ONLY_SYSTEM_SCHEMAS = Set.of(
+        SysSchemaInfo.NAME,
+        InformationSchemaInfo.NAME,
+        PgCatalogSchemaInfo.NAME
+    );
+
+    public static final Set<String> RESERVED_SCHEMAS = Sets.concat(
+        READ_ONLY_SYSTEM_SCHEMAS,
+        BlobSchemaInfo.NAME,
+        DocSchemaInfo.NAME
+    );
+
+    private final ClusterService clusterService;
+    private final DocSchemaInfoFactory docSchemaInfoFactory;
+    private final Roles roles;
+    private final Map<String, SchemaInfo> schemas = new ConcurrentHashMap<>();
+    private final Map<String, SchemaInfo> builtInSchemas;
+
+    public Schemas(Map<String, SchemaInfo> builtInSchemas,
+                   ClusterService clusterService,
+                   DocSchemaInfoFactory docSchemaInfoFactory,
+                   Roles roles) {
+        this.clusterService = clusterService;
+        this.docSchemaInfoFactory = docSchemaInfoFactory;
+        this.roles = roles;
+        schemas.putAll(builtInSchemas);
+        this.builtInSchemas = builtInSchemas;
+    }
+
+    private List<String> getSimilarTables(Role user, String tableName, Iterable<TableInfo> tables) {
+        LevenshteinDistance levenshteinDistance = new LevenshteinDistance();
+        ArrayList<Candidate> candidates = new ArrayList<>();
+        String lTableName = tableName.toLowerCase(Locale.ENGLISH);
+        for (TableInfo table : tables) {
+            if (roles.hasAnyPrivilege(user, Securable.TABLE, table.ident().fqn())) {
+                String candidate = table.ident().name();
+                float score = levenshteinDistance.getDistance(lTableName, candidate.toLowerCase(Locale.ENGLISH));
+                if (score > 0.7f) {
+                    candidates.add(new Candidate(score, candidate));
+                }
+            }
+        }
+        candidates.sort(Comparator.comparing((Candidate x) -> x.score).reversed());
+        return candidates.stream()
+            .limit(5)
+            .map(x -> x.name)
+            .toList();
+    }
+
+    private List<String> getSimilarSchemas(Role user, String schema) {
+        LevenshteinDistance levenshteinDistance = new LevenshteinDistance();
+        ArrayList<Candidate> candidates = new ArrayList<>();
+        String lSchema = schema.toLowerCase(Locale.ENGLISH);
+        for (String availableSchema : schemas.keySet()) {
+            if (roles.hasAnyPrivilege(user, Securable.SCHEMA, availableSchema)) {
+                float score = levenshteinDistance.getDistance(lSchema, availableSchema.toLowerCase(Locale.ENGLISH));
+                if (score > 0.7f) {
+                    candidates.add(new Candidate(score, availableSchema));
+                }
+            }
+        }
+        candidates.sort(Comparator.comparing((Candidate x) -> x.score).reversed());
+        return candidates.stream()
+            .limit(5)
+            .map(x -> x.name)
+            .toList();
+    }
+
+    record Candidate(double score, String name) {
+    }
+
+    /**
+     * <p>
+     * Finds a relation matching the given qualified name.
+     * </p>
+     *
+     * <p>
+     * If the qualified name includes a schema it must be an exact match, otherwise
+     * it traverses through the search path and returns the first match on table
+     * name..
+     * </p>
+     *
+     * <p>
+     * The result type is generic and can be upcast to concrete instances like
+     * {@link DocTableInfo} if it is expected to be safe due to the
+     * {@link Operation} constraint.
+     * If the cast fails, this throws a {@link OperationOnInaccessibleRelationException}.
+     * </p>
+     *
+     * @param qName relation name in {@code <schema>.<tableName>} or {@code <tableName>} format.
+     * @throws RelationUnknown
+     * @throws SchemaUnknownException
+     * @throws OperationOnInaccessibleRelationException
+     **/
+    @SuppressWarnings("unchecked")
+    public <T extends RelationInfo> T findRelation(QualifiedName qName,
+                                                   Operation operation,
+                                                   Role user,
+                                                   SearchPath searchPath) {
+
+        RelationName relName = RelationName.of(qName, null);
+        String schemaName = relName.schema();
+        String tableName = relName.name();
+
+        RelationInfo relationInfo = null;
+        if (schemaName == null) {
+            for (String schema : searchPath) {
+                SchemaInfo schemaInfo = schemas.get(schema);
+                if (schemaInfo == null) {
+                    continue;
+                }
+
+                relationInfo = schemaInfo.getForeignTableInfo(tableName);
+                if (relationInfo != null) {
+                    break;
+                }
+                relationInfo = schemaInfo.getViewInfo(tableName);
+                if (relationInfo != null) {
+                    break;
+                }
+                relationInfo = schemaInfo.getTableInfo(tableName);
+                if (relationInfo != null) {
+                    break;
+                }
+            }
+            if (relationInfo == null) {
+                SchemaInfo currentSchema = schemas.get(searchPath.currentSchema());
+                if (currentSchema == null) {
+                    throw new RelationUnknown(tableName);
+                } else {
+                    throw RelationUnknown.of(
+                        tableName,
+                        getSimilarTables(user, tableName, currentSchema.getTables()));
+                }
+            }
+        } else {
+            SchemaInfo schemaInfo = schemas.get(schemaName);
+            if (schemaInfo == null) {
+                throw SchemaUnknownException.of(schemaName, getSimilarSchemas(user, schemaName));
+            }
+            relationInfo = schemaInfo.getForeignTableInfo(tableName);
+            if (relationInfo == null) {
+                relationInfo = schemaInfo.getViewInfo(tableName);
+                if (relationInfo == null) {
+                    relationInfo = schemaInfo.getTableInfo(tableName);
+                    if (relationInfo == null) {
+                        throw RelationUnknown.of(schemaName + "." + tableName,
+                            getSimilarTables(user, tableName, schemaInfo.getTables()));
+                    }
+                }
+            }
+        }
+        Operation.blockedRaiseException(relationInfo, operation);
+        try {
+            return (T) relationInfo;
+        } catch (ClassCastException e) {
+            throw new OperationOnInaccessibleRelationException(
+                relationInfo.ident(),
+                "The relation " + relationInfo.ident().sqlFqn() + " doesn't support " + operation + " operations");
+        }
+    }
+
+    /// @throws [IndexNotFoundException]
+    /// @throws [RelationUnknown]
+    public DocTableInfo getTableInfo(Index index) {
+        Metadata metadata = clusterService.state().metadata();
+        RelationMetadata relation = metadata.getRelation(index.uuid());
+        if (relation instanceof RelationMetadata.Table table) {
+            if (table.oid() == Metadata.OID_UNASSIGNED) {
+                return getTableInfo(table.name());
+            }
+            return getRelationInfo(table.oid());
+        }
+        throw new IndexNotFoundException(index);
+    }
+
+    /**
+     * Get a {@link TableInfo} instance for the given relation.
+     *
+     * <p>
+     * Used to re-retrieve a {@link TableInfo} after having used
+     * {@link #findRelation(QualifiedName, Operation, Role, SearchPath)} before.
+     * E.g. in the execution layer where only a {@link RelationName} gets streamed.
+     * </p>
+     *
+     * <p>
+     * If you use this without having made a
+     * {@link #findRelation(QualifiedName, Operation, Role, SearchPath)} call, make
+     * sure to call {@link Operation#blockedRaiseException(RelationInfo, Operation)}
+     * to ensure the operation is supported for the given relation.
+     * </p>
+     *
+     * @return {@link TableInfo}. Can be upcast to {@link DocTableInfo} or
+     *         {@link RelationMetadata.ForeignTable}
+     * @throws io.crate.exceptions.SchemaUnknownException if schema given in
+     *                                                    <code>ident</code>
+     *                                                    does not exist
+     *
+     * @throws RelationUnknown                            if table given in
+     *                                                    <code>ident</code> does
+     *                                                    not exist in the given
+     *                                                    schema.
+     *
+     * @throws OperationOnInaccessibleRelationException   if cast to more concrete
+     *                                                    {@link TableInfo} instance
+     *                                                    fails
+     */
+    @SuppressWarnings("unchecked")
+    public <T extends TableInfo> T getTableInfo(RelationName ident) {
+        String schemaName = ident.schema();
+        SchemaInfo schemaInfo = schemas.get(schemaName);
+        if (schemaInfo == null) {
+            throw new SchemaUnknownException(schemaName);
+        }
+        String name = ident.name();
+        TableInfo info = schemaInfo.getForeignTableInfo(name);
+        if (info == null) {
+            info = schemaInfo.getTableInfo(name);
+            if (info == null) {
+                throw new RelationUnknown(ident);
+            }
+        }
+        try {
+            return (T) info;
+        } catch (ClassCastException e) {
+            throw new OperationOnInaccessibleRelationException(
+                info.ident(),
+                "The relation " + info.ident().sqlFqn() + " doesn't support the operation");
+        }
+    }
+
+    public SchemaInfo getOrCreateSchemaInfo(String schemaName) {
+        SchemaInfo schemaInfo = schemas.get(schemaName);
+        if (schemaInfo == null) {
+            schemaInfo = getCustomSchemaInfo(schemaName);
+        }
+        return schemaInfo;
+    }
+
+    @Nullable
+    public SchemaInfo getSchemaInfo(String schemaName) {
+        return schemas.get(schemaName);
+    }
+
+    public SchemaInfo getSystemSchema(String name) {
+        SchemaInfo schemaInfo = builtInSchemas.get(name);
+        if (schemaInfo == null) {
+            throw new SchemaUnknownException(name);
+        }
+        return schemaInfo;
+    }
+
+    public Iterator<SchemaInfo> iterator() {
+        return schemas.values().iterator();
+    }
+
+    @Override
+    public void clusterChanged(ClusterChangedEvent event) {
+        if (!event.metadataChanged()) {
+            return;
+        }
+
+        Set<String> newCurrentSchemas = getNewCurrentSchemas(event.state().metadata());
+        synchronized (schemas) {
+            Set<String> nonBuiltInSchemas = Sets.difference(schemas.keySet(), builtInSchemas.keySet());
+            Set<String> deleted = Sets.difference(nonBuiltInSchemas, newCurrentSchemas);
+            Set<String> added = Sets.difference(newCurrentSchemas, schemas.keySet());
+
+            for (String deletedSchema : deleted) {
+                try {
+                    schemas.remove(deletedSchema).close();
+                } catch (Exception e) {
+                    LOGGER.error(e.getMessage(), e);
+                }
+            }
+
+            for (String addedSchema : added) {
+                schemas.put(addedSchema, getCustomSchemaInfo(addedSchema));
+            }
+
+            // update all existing schemas
+            for (SchemaInfo schemaInfo : this) {
+                schemaInfo.update(event);
+            }
+        }
+    }
+
+    @VisibleForTesting
+    static Set<String> getNewCurrentSchemas(Metadata metadata) {
+        Set<String> schemas = new HashSet<>();
+        // 'doc' schema is always available and has the special property that its indices
+        // don't have to be prefixed with the schema name
+        schemas.add(DocSchemaInfo.NAME);
+
+        UserDefinedFunctionsMetadata udfMetadata = metadata.custom(UserDefinedFunctionsMetadata.TYPE);
+        if (udfMetadata != null) {
+            udfMetadata.functionsMetadata()
+                .stream()
+                .map(UserDefinedFunctionMetadata::schema)
+                .forEach(schemas::add);
+        }
+        schemas.addAll(metadata.schemas().keySet());
+        return schemas;
+    }
+
+    /**
+     * Create a custom schema info.
+     *
+     * @param name The schema name
+     * @return an instance of SchemaInfo for the given name
+     */
+    private SchemaInfo getCustomSchemaInfo(String name) {
+        return docSchemaInfoFactory.create(name, clusterService);
+    }
+
+    /**
+     * Checks if a given schema name string is a user defined schema or the default one.
+     *
+     * @param schemaName The schema name as a string.
+     */
+    public static boolean isDefaultOrCustomSchema(@Nullable String schemaName) {
+        if (schemaName == null) {
+            return true;
+        }
+        return !schemaName.equals(InformationSchemaInfo.NAME)
+               && !schemaName.equals(SysSchemaInfo.NAME)
+               && !schemaName.equals(BlobSchemaInfo.NAME)
+               && !schemaName.equals(PgCatalogSchemaInfo.NAME);
+    }
+
+    public boolean tableExists(RelationName relationName) {
+        SchemaInfo schemaInfo = schemas.get(relationName.schema());
+        if (schemaInfo == null) {
+            return false;
+        }
+        TableInfo tableInfo = schemaInfo.getTableInfo(relationName.name());
+        return tableInfo != null;
+    }
+
+    @Override
+    protected void doStart() {
+        // add listener here to avoid guice proxy errors if the ClusterService could not be build
+        clusterService.addListener(this);
+    }
+
+    @Override
+    protected void doStop() {
+        clusterService.removeListener(this);
+    }
+
+    @Override
+    protected void doClose() {
+    }
+
+    /**
+     * @throws RelationUnknown if the view cannot be resolved against the search path.
+     */
+    public ViewInfo findView(QualifiedName ident, SearchPath searchPath) {
+        RelationName relName = RelationName.of(ident, null);
+        String identSchema = relName.schema();
+        String viewName = relName.name();
+        ViewInfo viewInfo = null;
+        if (identSchema == null) {
+            for (String pathSchema : searchPath) {
+                SchemaInfo schemaInfo = schemas.get(pathSchema);
+                if (schemaInfo != null) {
+                    viewInfo = schemaInfo.getViewInfo(viewName);
+                    if (viewInfo != null) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            SchemaInfo schemaInfo = schemas.get(identSchema);
+            if (schemaInfo != null) {
+                viewInfo = schemaInfo.getViewInfo(viewName);
+            }
+        }
+        if (viewInfo == null) {
+            throw new RelationUnknown(new RelationName(identSchema, viewName));
+        }
+        return viewInfo;
+    }
+
+    /**
+     * Returns the RelationName for the given display OID.
+     * <p>
+     * For relations whose persisted OID is OID_UNASSIGNED, the display OID is derived from OidHash.
+     * This is needed for tables created before 6.3.
+     */
+    @Nullable
+    public RelationName getRelationName(int displayOid) {
+        for (SchemaInfo schema : this) {
+            for (RelationInfo relation : schema.getTables()) {
+                if (displayOid == displayOid(relation)) {
+                    return relation.ident();
+                }
+            }
+            for (ViewInfo view : schema.getViews()) {
+                if (displayOid == displayOid(view)) {
+                    return view.ident();
+                }
+            }
+            for (RelationMetadata.ForeignTable foreignTable : schema.getForeignTables()) {
+                if (displayOid == displayOid(foreignTable)) {
+                    return foreignTable.ident();
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Returns the RelationInfo for the given persisted OID.
+     * <p>
+     * Persisted relation OIDs were introduced in 6.3. Callers must handle
+     * relations created before 6.3 separately.
+     */
+    @SuppressWarnings("unchecked")
+    public <T extends RelationInfo> T getRelationInfo(int persistedOid) {
+        assert persistedOid > Metadata.OID_UNASSIGNED && persistedOid <= clusterService.state().metadata().currentMaxTableOid() :
+            "persisted table OID must be > OID_UNASSIGNED and <= currentMaxTableOid";
+        for (SchemaInfo schema : this) {
+            for (RelationInfo relation : schema.getTables()) {
+                if (persistedOid == relation.oid()) {
+                    return (T) relation;
+                }
+            }
+            for (ViewInfo view : schema.getViews()) {
+                if (persistedOid == view.oid()) {
+                    return (T) view;
+                }
+            }
+            for (RelationMetadata.ForeignTable foreignTable : schema.getForeignTables()) {
+                if (persistedOid == foreignTable.oid()) {
+                    return (T) foreignTable;
+                }
+            }
+        }
+        throw new RelationUnknown(String.format(Locale.ENGLISH, "Relation not found for oid=%s", persistedOid));
+    }
+
+    /**
+     * Returns the OID assigned to the given relation.
+     *
+     * WARNING: All tables created before 6.3 are assigned OID_UNASSIGNED internally, meaning that all execution paths
+     * must be aware of and properly handle duplicate assignments of OID_UNASSIGNED. When exposing OIDs, we must expose
+     * OidHash-based OIDs for backward compatibility.
+     */
+    public int getDisplayRelationOid(RelationName relationName) {
+        SchemaInfo schemaInfo = this.getSchemaInfo(relationName.schema());
+        if (schemaInfo != null) {
+            String name = relationName.name();
+            RelationInfo relationInfo = schemaInfo.getViewInfo(name);
+            if (relationInfo == null) {
+                relationInfo = schemaInfo.getForeignTableInfo(name);
+                if (relationInfo == null) {
+                    relationInfo = schemaInfo.getTableInfo(name);
+                }
+            }
+            if (relationInfo != null) {
+                return displayOid(relationInfo);
+            }
+        }
+        return OidHash.relationOid(OidHash.Type.TABLE, relationName);
+    }
+
+    private static int displayOid(RelationInfo relationInfo) {
+        int oid = relationInfo.oid();
+        return oid == Metadata.OID_UNASSIGNED ? OidHash.relationOid(relationInfo) : oid;
+    }
+}

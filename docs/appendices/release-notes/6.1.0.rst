@@ -1,0 +1,118 @@
+.. _version_6.1.0:
+
+=============
+Version 6.1.0
+=============
+
+Released on 2025-10-20.
+
+.. WARNING::
+
+    Do not use this version when upgrading from any previous version
+    containing tables created before :ref:`version_5.5.0` as this may result
+    in data loss!
+
+    If the cluster contains tables created before :ref:`version_5.5.0`, after
+    upgrading to :ref:`version_6.1.0` certain actions on such tables like
+    deleting partitions, changing settings, rename, swap, etc. can lead to
+    corrupted table which causes all the data of the columns created
+    in versions before :ref:`version_5.5.0` to be shown as ``NULL``. The bug
+    has been fixed in :ref:`version_6.1.4`, so we highly recommend to avoid
+    upgrading to any earlier 6.1.x version.
+
+    Once already affected by the bug, existing data may be lost forever, while
+    new data (via ``INSERT`` or ``UPDATE``) can be retrieved normally.
+
+.. NOTE::
+
+    If you are upgrading a cluster, you must be running CrateDB 5.0.0 or higher
+    before you upgrade to 6.1.0.
+
+    We recommend that you upgrade to the latest 6.0 release before moving to
+    6.1.0.
+
+    A rolling upgrade from >= 6.0.2 to 6.1.0 is supported.
+    Before upgrading, you should `back up your data`_.
+
+.. WARNING::
+
+    Tables that were created before CrateDB 5.x will not function with 6.x
+    and must be recreated before moving to 6.x.x.
+
+    You can recreate tables using ``COPY TO`` and ``COPY FROM`` or by
+    `inserting the data into a new table`_.
+
+.. _back up your data: https://cratedb.com/docs/crate/reference/en/latest/admin/snapshots.html
+.. _inserting the data into a new table: https://cratedb.com/docs/crate/reference/en/latest/admin/system-information.html#tables-need-to-be-recreated
+
+.. rubric:: Table of contents
+
+.. contents::
+   :local:
+
+.. _version_6.1.0_breaking_changes:
+
+
+General
+=======
+
+The 6.1.0 release was mostly focused on internal changes preparing for future
+feature additions. Because of that, the list of changes is smaller than usual
+but there have been many small optimizations which should overall help reduce
+memory pressure and improve performance.
+
+
+Breaking Changes
+================
+
+- Changed the datatype and values returned from ``is_nullable`` column of
+  :ref:`information_schema.columns <information_schema_columns>` table.
+  Previously, it was returning ``BOOLEAN`` values, and now it returns ``'YES'``
+  or ``'NO'``, in order to be compatible with the SQL specification.
+
+- Changed behavior of relative paths defined for :ref:`path.conf <path.conf>`,
+  :ref:`path.data <path.data>`, :ref:`path.repo <path.repo>` and
+  :ref:`path.logs <path.logs>`, to use the value of
+  :ref:`CRATE_HOME <conf-env-crate-home>` as the basis directory, against which
+  the relative paths are resolved, thus conforming to the behavior already
+  described in the :ref:`documentation <conf-node-settings_paths>`.
+
+- Increased the ``FORCE_MERGE`` default thread pool size from ``1`` to ``1/8``
+  of the available processors, improving the performance of the :ref:`optimize`
+  operation on machines with more than ``15`` cores.
+
+- Lucene 10.2 opens files with the ``MADV_RANDOM`` advice by default on Linux
+  and Mac OS. If you experience an increase in IOPS and degraded performance,
+  especially slow recovery times on node restarts,
+  set ``CRATE_JAVA_OPTS=-Dorg.apache.lucene.store.defaultReadAdvice=NORMAL``
+  to restore previous behavior.
+
+Deprecations
+============
+
+None
+
+
+Changes
+=======
+
+
+SQL Standard and PostgreSQL Compatibility
+-----------------------------------------
+
+- Added the :ref:`pg_catalog.pg_auth_members table <postgres-pg_catalog>`
+
+Performance and Resilience Improvements
+---------------------------------------
+
+- Improved the performance of the :ref:`percentile aggregation
+  <aggregation-percentile>`.
+
+Administration and Operations
+-----------------------------
+
+- Added persistence for the :ref:`pg_catalog.pg_stats <pg_stats>` table. After
+  running ``ANALYZE``, table statistics are now written to disk and remain
+  available after a cluster restart.
+
+- Added ``last_job_id`` column to the :ref:`sys.sessions <sys-sessions>` table.

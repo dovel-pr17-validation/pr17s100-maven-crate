@@ -1,0 +1,198 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.planner.node.ddl;
+
+import java.util.HashSet;
+import java.util.List;
+import java.util.function.Function;
+
+import org.elasticsearch.action.admin.cluster.snapshots.restore.RestoreSnapshotRequest;
+import org.elasticsearch.action.admin.cluster.snapshots.restore.TableOrPartition;
+import org.elasticsearch.action.admin.cluster.snapshots.restore.TransportRestoreSnapshot;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.snapshots.SnapshotRestoreException;
+
+import io.crate.analyze.AnalyzedRestoreSnapshot;
+import io.crate.analyze.BoundRestoreSnapshot;
+import io.crate.analyze.SnapshotSettings;
+import io.crate.analyze.SymbolEvaluator;
+import io.crate.common.annotations.VisibleForTesting;
+import io.crate.common.collections.Lists;
+import io.crate.data.Row;
+import io.crate.data.Row1;
+import io.crate.data.RowConsumer;
+import io.crate.exceptions.RelationUnknown;
+import io.crate.exceptions.SchemaUnknownException;
+import io.crate.execution.support.OneRowActionListener;
+import io.crate.expression.symbol.Symbol;
+import io.crate.metadata.CoordinatorTxnCtx;
+import io.crate.metadata.DocTableInfo;
+import io.crate.metadata.NodeContext;
+import io.crate.metadata.PartitionName;
+import io.crate.metadata.RelationInfo;
+import io.crate.metadata.RelationName;
+import io.crate.metadata.Schemas;
+import io.crate.metadata.table.Operation;
+import io.crate.planner.DependencyCarrier;
+import io.crate.planner.Plan;
+import io.crate.planner.PlannerContext;
+import io.crate.planner.operators.SubQueryResults;
+import io.crate.sql.tree.Assignment;
+import io.crate.sql.tree.GenericProperties;
+import io.crate.sql.tree.Table;
+
+public class RestoreSnapshotPlan implements Plan {
+
+    private final AnalyzedRestoreSnapshot restoreSnapshot;
+
+    public RestoreSnapshotPlan(AnalyzedRestoreSnapshot restoreSnapshot) {
+        this.restoreSnapshot = restoreSnapshot;
+    }
+
+    @Override
+    public StatementType type() {
+        return StatementType.DDL;
+    }
+
+    @Override
+    public void executeOrFail(DependencyCarrier dependencies,
+                              PlannerContext plannerContext,
+                              RowConsumer consumer,
+                              Row parameters,
+                              SubQueryResults subQueryResults) {
+        BoundRestoreSnapshot stmt = bind(
+            restoreSnapshot,
+            plannerContext.transactionContext(),
+            dependencies.nodeContext(),
+            parameters,
+            subQueryResults,
+            dependencies.schemas()
+        );
+        var settings = stmt.settings();
+        boolean includeTables = stmt.includeTables();
+        boolean includeViews = stmt.includeViews();
+
+        List<TableOrPartition> tablesToRestore = stmt.restoreTables().stream()
+            .map(restoreTableInfo -> {
+                String partitionIdent = null;
+                if (restoreTableInfo.partitionName() != null) {
+                    partitionIdent = restoreTableInfo.partitionName().ident();
+                }
+                return new TableOrPartition(restoreTableInfo.tableIdent(), partitionIdent);
+            })
+            .toList();
+
+        RestoreSnapshotRequest request = new RestoreSnapshotRequest(
+            restoreSnapshot.repository(),
+            restoreSnapshot.snapshot(),
+            tablesToRestore,
+            settings,
+            includeTables,
+            includeViews,
+            stmt.includeCustomMetadata(),
+            stmt.customMetadataTypes(),
+            stmt.includeGlobalSettings(),
+            stmt.globalSettings()
+        );
+        dependencies.client().execute(TransportRestoreSnapshot.ACTION, request)
+            .whenComplete(new OneRowActionListener<>(consumer, response -> {
+                if (response == null) {
+                    return new Row1(-1L);
+                }
+                var restoreInfo = response.getRestoreInfo();
+                if (restoreInfo != null && restoreInfo.failedShards() > 0) {
+                    throw new SnapshotRestoreException(
+                        restoreSnapshot.repository(),
+                        restoreSnapshot.snapshot(),
+                        "failed to restore " + restoreInfo.failedShards() + " of " + restoreInfo.totalShards() + " shards"
+                    );
+                }
+                return new Row1(1L);
+            }));
+    }
+
+    @VisibleForTesting
+    public static BoundRestoreSnapshot bind(AnalyzedRestoreSnapshot restoreSnapshot,
+                                            CoordinatorTxnCtx txnCtx,
+                                            NodeContext nodeCtx,
+                                            Row parameters,
+                                            SubQueryResults subQueryResults,
+                                            Schemas schemas) {
+        Function<? super Symbol, Object> eval = x -> SymbolEvaluator.evaluate(
+            txnCtx,
+            nodeCtx,
+            x,
+            parameters,
+            subQueryResults
+        );
+
+        GenericProperties<Object> properties = restoreSnapshot.properties()
+            .ensureContainsOnly(SnapshotSettings.SETTINGS.keySet())
+            .map(eval);
+        Settings settings = Settings.builder().put(properties).build();
+
+        HashSet<BoundRestoreSnapshot.RestoreTableInfo> restoreTables = HashSet.newHashSet(restoreSnapshot.tables().size());
+        for (Table<Symbol> table : restoreSnapshot.tables()) {
+            var relationName = RelationName.of(
+                table.getName(),
+                txnCtx.sessionSettings().searchPath().currentSchema());
+
+            List<Assignment<Object>> partitionProperties = Lists.map(table.partitionProperties(), x -> x.map(eval));
+            PartitionName partitionName;
+            try {
+                RelationInfo relationInfo = schemas.findRelation(
+                    relationName.toQualifiedName(),
+                    Operation.RESTORE_SNAPSHOT,
+                    txnCtx.sessionSettings().sessionUser(),
+                    txnCtx.sessionSettings().searchPath()
+                );
+                if (partitionProperties.isEmpty()) {
+                    partitionName = null;
+                } else if (relationInfo instanceof DocTableInfo docTableInfo) {
+                    partitionName = PartitionName.ofAssignmentsUnsafe(docTableInfo, partitionProperties);
+                } else {
+                    // Views and foreign tables have no partitions
+                    throw new IllegalArgumentException(
+                        "relation '" + relationInfo.ident().fqn() + "' is not partitioned");
+                }
+            } catch (RelationUnknown | SchemaUnknownException e) {
+                partitionName = partitionProperties.isEmpty()
+                    ? null
+                    : PartitionName.ofAssignments(relationName, partitionProperties);
+            }
+            restoreTables.add(new BoundRestoreSnapshot.RestoreTableInfo(relationName, partitionName));
+        }
+
+        return new BoundRestoreSnapshot(
+            restoreSnapshot.repository(),
+            restoreSnapshot.snapshot(),
+            restoreTables,
+            restoreSnapshot.includeTables(),
+            restoreSnapshot.includeViews(),
+            restoreSnapshot.includeCustomMetadata(),
+            restoreSnapshot.customMetadataTypes(),
+            restoreSnapshot.includeGlobalSettings(),
+            restoreSnapshot.globalSettings(),
+            settings
+        );
+    }
+}

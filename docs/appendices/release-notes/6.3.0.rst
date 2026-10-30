@@ -1,0 +1,193 @@
+.. _version_6.3.0:
+
+=============
+Version 6.3.0
+=============
+
+Released on 2026-03-31
+
+.. WARNING::
+
+    Do not use this version when upgrading from any previous version
+    containing tables created before :ref:`version_5.5.0` as this may result
+    in data loss!
+
+    If the cluster contains tables created before :ref:`version_5.5.0`, after
+    upgrading to :ref:`version_6.3.0` certain actions on such tables like
+    deleting partitions, changing settings, rename, swap, etc. can lead to
+    corrupted table which causes all the data of the columns created
+    in versions before :ref:`version_5.5.0` to be shown as ``NULL``. The bug
+    has been fixed in :ref:`version_6.3.2`, so we highly recommend to avoid
+    upgrading to any earlier 6.3.x version.
+
+    Once already affected by the bug, existing data may be lost forever, while
+    new data (via ``INSERT`` or ``UPDATE``) can be retrieved normally.
+
+.. NOTE::
+
+    If you are upgrading a cluster, you must be running CrateDB 5.0.0 or higher
+    before you upgrade to 6.3.0.
+
+    We recommend that you upgrade to the latest 6.2 release before moving to
+    6.3.0.
+
+    A rolling upgrade from >= 6.2.0 to 6.3.0 is supported.
+    Before upgrading, you should `back up your data`_.
+
+.. WARNING::
+
+    Tables that were created before CrateDB 5.x will not function with 6.x
+    and must be recreated before moving to 6.x.x.
+
+    You can recreate tables using ``COPY TO`` and ``COPY FROM`` or by
+    `inserting the data into a new table`_.
+
+.. _back up your data: https://cratedb.com/docs/crate/reference/en/latest/admin/snapshots.html
+.. _inserting the data into a new table: https://cratedb.com/docs/crate/reference/en/latest/admin/system-information.html#tables-need-to-be-recreated
+
+.. rubric:: Table of contents
+
+.. contents::
+   :local:
+
+.. _version_6.3.0_breaking_changes:
+
+Breaking Changes
+================
+
+- Removed the ``canned_acl`` setting for repositories of type ``s3`` and also
+  removed the undocumented proxy settings.
+
+- Removed the ``token_uri`` setting for repositories of type ``gcs``.
+
+- Removed the following settings for repositories of type ``azure``:
+
+  - ``location_mode``
+  - ``secondary_endpoint``
+  - ``endpoint_suffix``
+  - ``timeout``
+  - ``proxy_type``
+  - ``proxy_host``
+  - ``proxy_port``
+
+Deprecations
+============
+
+None
+
+
+Changes
+=======
+
+SQL Statements
+--------------
+
+- `Dhruv Patel <https://github.com/DHRUV6029>`_ added support for
+  :ref:`ALTER TABLE ALTER COLUMN SET/DROP DEFAULT
+  <SQL-alter-table-alter-column-default>` to set or drop the default value of a
+  column.
+
+SQL Standard and PostgreSQL Compatibility
+-----------------------------------------
+
+- `Dhruv Patel <https://github.com/DHRUV6029>`_ added support for :ref:`CREATE
+  TABLE ... LIKE <ref-create-table-like>`.
+
+- Added support for ``RESTRICT`` and ``CASCADE`` to :ref:`DROP SCHEMA
+  <ref-drop-schema>`.
+
+- Added support for statements containing only comments like ``/* ping */`` for
+  compatibility with clients like pgx - which is used by Grafana since 12.4.
+
+- `Dhruv Patel <https://github.com/DHRUV6029>`_ added support for ``DEFAULT``
+  expressions in :ref:`INSERT INTO <sql-insert>` statements to explicitly
+  declare that the default expression of a column should be used.
+
+- Added the :ref:`information_schema.view_column_usage
+  <information_schema_view_column_usage>` table.
+
+- Added the :ref:`pg_sleep <scalar-pg_sleep>` function, which pauses a session.
+
+- Added the :ref:`has_function_privileges <scalar-has-function-priv>` function,
+  which checks whether a user has privileges to execute a function.
+
+- `Dhruv Patel <https://github.com/DHRUV6029>`_ added support for ``SELECT``
+  statements without a column list (e.g., ``SELECT FROM table``) to match
+  PostgreSQL behavior. This enables compatibility with tools like TinyETL that
+  use reflection queries such as
+  ``SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = $1)``.
+
+- `Sahin Akyol <https://github.com/sahinakyol>`_ added support for the
+  :ref:`IS [ NOT ] TRUE | FALSE <sql_dql_is_true_or_false>` boolean predicates.
+
+- Added support for using ``null`` and child columns of an ``object(ignored)``
+  type within ``ORDER BY``. Note that the latter has worse performance compared
+  to ordering on a properly typed column.
+
+- The :ref:`INFORMATION_SCHEMA.COLUMNS <information_schema_columns>` table now
+  shows values for the ``udt_name`` and ``udt_catalog`` columns.
+
+Data Types
+----------
+
+None
+
+
+Scalar and Aggregation Functions
+--------------------------------
+
+- `Dhruv Patel <https://github.com/DHRUV6029>`_ added support for ``interval``
+  type to the :ref:`percentile <aggregation-percentile>` aggregation function.
+
+- `Daniel Martínez Maqueda <https://github.com/belveryin>`_ added support for
+  the :ref:`regexp_count <scalar-regexp_count>` scalar function to count
+  regular expression matches, with optional ``start`` and ``flags`` arguments.
+
+- `Marc Theisen <https://github.com/marctheisen>`_ added support for the
+  :ref:`regexp_instr <scalar-regexp_instr>` scalar function to find the
+  position of the ``N`` th regular expression match.
+
+- `Dhruv Patel <https://github.com/DHRUV6029>`_ added support for the
+  :ref:`parse_ident <scalar-parse_ident>` scalar function to split a qualified
+  SQL identifier string into an array of identifiers.
+
+
+Performance and Resilience Improvements
+---------------------------------------
+
+- :ref:`analyze` now processes tables one after another to update the statistics
+  instead of processing all tables concurrently. This reduces the impact it has
+  on the cluster to avoid sudden spikes in disk IO or memory usage. The tradeoff
+  is that the operation will now run longer.
+
+- Added a :ref:`indices.breaker.policy` setting which can be set to either
+  ``current`` (default - current behavior) or ``top_consumer`` (new experimental
+  behavior). If set to ``top_consumer`` it changes the circuit breaking
+  mechanism to abort the query consuming the most memory on the node where the
+  circuit breaker was tripped instead of the query who tripped it.
+
+- Changed the :ref:`swapping <alter_cluster_swap_table>` and
+  :ref:`renaming <sql-alter-table-rename-to>` of tables to no longer re-allocate
+  the shards of the swapped/renamed table, so that in-progress snapshots can
+  finish successfully. Previously, the in-progress snapshots would fail and
+  remain in ``PARTIAL`` state, with an ``ABORTED`` failure message showing in
+  the :ref:`sys.snapshots <sys-snapshots>` system table.
+
+- :ref:`INSERT INTO <sql-insert>` statements that create new partitions are no
+  longer interrupted by :ref:`SWAP <alter_cluster_swap_table>` or
+  :ref:`RENAME <sql-alter-table-rename-to>` table statements.
+
+Administration and Operations
+-----------------------------
+
+- Added a ``region`` option to repositories of type ``s3`` for compatibility
+  with alternative s3 implementations like `Garage
+  <https://garagehq.deuxfleurs.fr/>`_.
+
+- Repositories of type ``s3`` now use path style access by default instead of
+  virtual host style when building the URI.
+
+Client interfaces
+-----------------
+
+None

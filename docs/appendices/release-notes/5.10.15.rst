@@ -1,0 +1,79 @@
+.. _version_5.10.15:
+
+===============
+Version 5.10.15
+===============
+
+Released on 2025-11-19.
+
+.. NOTE::
+
+    If you are upgrading a cluster, you must be running CrateDB 4.0.2 or higher
+    before you upgrade to 5.10.15.
+
+    We recommend that you upgrade to the latest 5.9 release before moving to
+    5.10.15.
+
+    A rolling upgrade from 5.9.x to 5.10.15 is supported.
+    Before upgrading, you should `back up your data`_.
+
+.. WARNING::
+
+    Tables that were created before CrateDB 4.x will not function with 5.x
+    and must be recreated before moving to 5.x.x.
+
+    You can recreate tables using ``COPY TO`` and ``COPY FROM`` or by
+    `inserting the data into a new table`_.
+
+.. _back up your data: https://crate.io/docs/crate/reference/en/latest/admin/snapshots.html
+.. _inserting the data into a new table: https://crate.io/docs/crate/reference/en/latest/admin/system-information.html#tables-need-to-be-recreated
+
+.. rubric:: Table of contents
+
+.. contents::
+   :local:
+
+
+See the :ref:`version_5.10.0` release notes for a full list of changes in the
+5.10 series.
+
+
+Fixes
+=====
+
+- Fixed a memory leak that could happen if running a query with a large result
+  set via a PostgreSQL client and then interrupting the connection.
+
+- Fixed an issue that allowed inserting values into ``ARRAY`` columns that
+  violated the array's inner type constraints. For example it was possible to
+  insert ``['aa']`` into a column of type ``ARRAY(VARCHAR(1))``.
+
+- Fixed an issue that could lead to incorrect results for window functions when
+  the window function used a ``PARTITION BY`` clause on an object subscript
+  coming from a view or CTE and if running in a cluster with more than one node.
+
+- Fixed a translog recovery issue, happening when a ``NULL`` value was stored
+  in an :ref:`type-object` with policy :ref:`type-object-columns-ignored` on
+  tables created before :ref:`version 5.5.0 <version_5.5.0>`.
+  To mitigate the issue, run CrateDB with a CLI option
+  ``-Des.xcontent.strict_duplicate_detection=false``. Please note, that this
+  flag has a global effect, and it's recommended to set it back to the default
+  value ``true`` once invalid records are processed. Issue can be considered
+  as mitigated when ``translog_stats['uncommitted_size']`` in the
+  :ref:`sys.shards <sys-shards>` table stops exceeding
+  :ref:`flush_threshold_size <sql-create-table-translog-flush-threshold-size>`.
+
+- Fixed an issue causing a ``GROUP BY ... LIMIT 0`` statement to not release
+  it's accounted memory on the ``QUERY`` circuit breaker.
+
+- Fixed an issue that caused RAM under-accounting, potentially leading to an
+  ``OutOfMemoryError`` when a large result set was returned by the ``HTTP``
+  endpoint.
+
+- Fixed an issue where certain join queries returned incorrect results when the
+  join condition referenced unknown object sub-columns coming from aliased CTEs
+  in nested joins.
+
+- Fixed an issue causing :ref:`sql-copy-from` statements to fail with an
+  ``CircuitBreakerException`` when no concrete ``bulk_size`` argument was
+  defined and the available memory is saturated on the first internal requests.

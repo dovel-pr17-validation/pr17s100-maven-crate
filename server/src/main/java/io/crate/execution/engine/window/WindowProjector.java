@@ -1,0 +1,321 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.execution.engine.window;
+
+import static io.crate.analyze.SymbolEvaluator.evaluateWithoutParams;
+import static io.crate.execution.engine.sort.Comparators.createComparator;
+
+import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.concurrent.Executor;
+import java.util.function.BiFunction;
+import java.util.function.IntSupplier;
+import java.util.function.Supplier;
+
+import org.elasticsearch.Version;
+import org.jspecify.annotations.Nullable;
+
+import io.crate.analyze.OrderBy;
+import io.crate.analyze.WindowDefinition;
+import io.crate.breaker.TypedCellsAccounting;
+import io.crate.data.Input;
+import io.crate.data.Projector;
+import io.crate.data.Row;
+import io.crate.data.breaker.RamAccounting;
+import io.crate.execution.dsl.projection.WindowAggProjection;
+import io.crate.execution.engine.aggregation.AggregationFunction;
+import io.crate.execution.engine.collect.CollectExpression;
+import io.crate.expression.ExpressionsInput;
+import io.crate.expression.InputFactory;
+import io.crate.expression.symbol.InputColumn;
+import io.crate.expression.symbol.Literal;
+import io.crate.expression.symbol.Symbol;
+import io.crate.expression.symbol.SymbolType;
+import io.crate.expression.symbol.Symbols;
+import io.crate.memory.MemoryManager;
+import io.crate.metadata.FunctionImplementation;
+import io.crate.metadata.NodeContext;
+import io.crate.metadata.TransactionContext;
+import io.crate.sql.tree.FrameBound;
+import io.crate.sql.tree.WindowFrame;
+import io.crate.types.DataType;
+import io.crate.types.DataTypes;
+import io.crate.types.IntervalType;
+
+public class WindowProjector {
+
+    public static Projector fromProjection(WindowAggProjection projection,
+                                           NodeContext nodeCtx,
+                                           InputFactory inputFactory,
+                                           TransactionContext txnCtx,
+                                           RamAccounting ramAccounting,
+                                           MemoryManager memoryManager,
+                                           Version minNodeVersion,
+                                           IntSupplier numThreads,
+                                           Executor executor) {
+        var windowFunctionSymbols = projection.windowFunctions();
+        var numWindowFunctions = windowFunctionSymbols.size();
+        assert numWindowFunctions > 0 : "WindowAggProjection must have at least 1 window function.";
+
+        ArrayList<WindowFunction> windowFunctions = new ArrayList<>(numWindowFunctions);
+        ArrayList<CollectExpression<Row, ?>> windowFuncArgsExpressions = new ArrayList<>(numWindowFunctions);
+        Input[][] windowFuncArgsInputs = new Input[numWindowFunctions][];
+        Boolean[] ignoreNulls = new Boolean[numWindowFunctions];
+
+        for (int idx = 0; idx < numWindowFunctions; idx++) {
+            var windowFunctionSymbol = windowFunctionSymbols.get(idx);
+
+            InputFactory.Context<CollectExpression<Row, ?>> ctx = inputFactory.ctxForInputColumns(txnCtx);
+            ctx.add(windowFunctionSymbol.arguments());
+
+            FunctionImplementation impl = nodeCtx.functions().getQualified(windowFunctionSymbol);
+            assert impl != null : "Function implementation not found using full qualified lookup";
+            if (impl instanceof AggregationFunction) {
+                var filterInputFactoryCtx = inputFactory.ctxForInputColumns(txnCtx);
+                var filterSymbol = windowFunctionSymbol.filter();
+
+                //noinspection unchecked
+                Input<Boolean> filterInput = filterSymbol == null
+                    ? Literal.BOOLEAN_TRUE
+                    : (Input<Boolean>) filterInputFactoryCtx.add(filterSymbol);
+
+                ExpressionsInput<Row, Boolean> filter = new ExpressionsInput<>(
+                    filterInput,
+                    filterInputFactoryCtx.expressions());
+
+                windowFunctions.add(
+                    new AggregateToWindowFunctionAdapter(
+                        (AggregationFunction) impl,
+                        filter,
+                        ramAccounting,
+                        memoryManager,
+                        minNodeVersion
+                    )
+                );
+            } else if (impl instanceof WindowFunction) {
+                windowFunctions.add((WindowFunction) impl);
+            } else {
+                throw new AssertionError("Function needs to be either a window or an aggregate function");
+            }
+            windowFuncArgsExpressions.addAll(ctx.expressions());
+            windowFuncArgsInputs[idx] = ctx.topLevelInputs().toArray(new Input[0]);
+            ignoreNulls[idx] = windowFunctionSymbol.ignoreNulls();
+        }
+        var windowDefinition = projection.windowDefinition();
+        var partitions = windowDefinition.partitions();
+        Supplier<InputFactory.Context<CollectExpression<Row, ?>>> createInputFactoryContext =
+            () -> inputFactory.ctxForInputColumns(txnCtx);
+        int arrayListElementOverHead = 32;
+        List<DataType<?>> rowTypes = Symbols.typeView(projection.standalone());
+        TypedCellsAccounting accounting = new TypedCellsAccounting(
+            rowTypes, ramAccounting, arrayListElementOverHead);
+        Comparator<Object[]> cmpPartitionBy = partitions.isEmpty()
+            ? null
+            : createComparator(createInputFactoryContext, rowTypes, new OrderBy(windowDefinition.partitions()));
+        Comparator<Object[]> cmpOrderBy = createComparator(
+            createInputFactoryContext,
+            rowTypes,
+            windowDefinition.orderBy()
+        );
+        int numCellsInSourceRow = projection.standalone().size();
+        ComputeFrameBoundary<Object[]> computeFrameStart = createComputeStartFrameBoundary(
+            numCellsInSourceRow,
+            txnCtx,
+            nodeCtx,
+            windowDefinition,
+            cmpOrderBy
+        );
+        ComputeFrameBoundary<Object[]> computeFrameEnd = createComputeEndFrameBoundary(
+            numCellsInSourceRow,
+            txnCtx,
+            nodeCtx,
+            windowDefinition,
+            cmpOrderBy
+        );
+        return sourceRows -> WindowFunctionBatchIterator.of(
+            sourceRows,
+            ramAccounting::addBytes,
+            accounting,
+            computeFrameStart,
+            computeFrameEnd,
+            cmpPartitionBy,
+            cmpOrderBy,
+            numCellsInSourceRow,
+            numThreads,
+            executor,
+            windowFunctions,
+            windowFuncArgsExpressions,
+            ignoreNulls,
+            windowFuncArgsInputs
+        );
+    }
+
+    static ComputeFrameBoundary<Object[]> createComputeEndFrameBoundary(int numCellsInSourceRow,
+                                                                        TransactionContext txnCtx,
+                                                                        NodeContext nodeCtx,
+                                                                        WindowDefinition windowDefinition,
+                                                                        Comparator<Object[]> cmpOrderBy) {
+        var frameDefinition = windowDefinition.windowFrameDefinition();
+        var frameBoundEnd = frameDefinition.end();
+        var framingMode = frameDefinition.mode();
+        Object evaluatedOffsetValue = evaluateWithoutParams(txnCtx, nodeCtx, frameBoundEnd.value());
+        if (frameBoundEnd.type() == FrameBound.Type.FOLLOWING && evaluatedOffsetValue == null) {
+            throw new IllegalArgumentException("The offset of a `<offset> PRECEDING/FOLLOWING` frame bound must not be null");
+        }
+        final Object offsetValue;
+        if (framingMode == WindowFrame.Mode.ROWS && evaluatedOffsetValue instanceof BigDecimal bigDecimalValue) {
+            offsetValue = normalizeIntegralFrameBound(bigDecimalValue);
+        } else {
+            offsetValue = evaluatedOffsetValue;
+        }
+        DataType<?> offsetType = frameBoundEnd.value().valueType();
+        Object[] endProbeValues = new Object[numCellsInSourceRow];
+        BiFunction<Object[], Object[], Object[]> updateProbeValues;
+        if (offsetValue != null && framingMode == WindowFrame.Mode.RANGE) {
+            BiFunction<DataType<?>, DataType<?>, BiFunction> offsetFn = windowDefinition.orderBy().reverseFlags()[0]
+                ? WindowFrameBoundaryArithmetic::getSubtractFunction
+                : WindowFrameBoundaryArithmetic::getAddFunction;
+            updateProbeValues = createUpdateProbeValueFunction(windowDefinition, offsetFn, offsetValue, offsetType);
+        } else {
+            updateProbeValues = (currentRow, x) -> x;
+        }
+        return (partitionStart, partitionEnd, currentIndex, sortedRows) -> frameBoundEnd.type().getEnd(
+            framingMode,
+            partitionStart,
+            partitionEnd,
+            currentIndex,
+            offsetValue,
+            updateProbeValues.apply(sortedRows.get(currentIndex), endProbeValues),
+            cmpOrderBy,
+            sortedRows
+        );
+    }
+
+    static ComputeFrameBoundary<Object[]> createComputeStartFrameBoundary(int numCellsInSourceRow,
+                                                                          TransactionContext txnCtx,
+                                                                          NodeContext nodeCtx,
+                                                                          WindowDefinition windowDefinition,
+                                                                          @Nullable Comparator<Object[]> cmpOrderBy) {
+        var frameDefinition = windowDefinition.windowFrameDefinition();
+        var frameBoundStart = frameDefinition.start();
+        var framingMode = frameDefinition.mode();
+        Object evaluatedOffsetValue = evaluateWithoutParams(txnCtx, nodeCtx, frameBoundStart.value());
+        if (frameBoundStart.type() == FrameBound.Type.PRECEDING && evaluatedOffsetValue == null) {
+            throw new IllegalArgumentException("The offset of a `<offset> PRECEDING/FOLLOWING` frame bound must not be null");
+        }
+        final Object offsetValue;
+        if (framingMode == WindowFrame.Mode.ROWS && evaluatedOffsetValue instanceof BigDecimal bigDecimalValue) {
+            offsetValue = normalizeIntegralFrameBound(bigDecimalValue);
+        } else {
+            offsetValue = evaluatedOffsetValue;
+        }
+        DataType<?> offsetType = frameBoundStart.value().valueType();
+        Object[] startProbeValues = new Object[numCellsInSourceRow];
+        BiFunction<Object[], Object[], Object[]> updateStartProbeValue;
+        if (offsetValue != null && framingMode == WindowFrame.Mode.RANGE) {
+            BiFunction<DataType<?>, DataType<?>, BiFunction> offsetFn = windowDefinition.orderBy().reverseFlags()[0]
+                ? WindowFrameBoundaryArithmetic::getAddFunction
+                : WindowFrameBoundaryArithmetic::getSubtractFunction;
+            updateStartProbeValue = createUpdateProbeValueFunction(windowDefinition, offsetFn, offsetValue, offsetType);
+        } else {
+            updateStartProbeValue = (currentRow, x) -> x;
+        }
+        return (partitionStart, partitionEnd, currentIndex, sortedRows) -> frameBoundStart.type().getStart(
+            framingMode,
+            partitionStart,
+            partitionEnd,
+            currentIndex,
+            offsetValue,
+            updateStartProbeValue.apply(sortedRows.get(currentIndex), startProbeValues),
+            cmpOrderBy,
+            sortedRows
+        );
+    }
+
+    private static BiFunction<Object[], Object[], Object[]> createUpdateProbeValueFunction(WindowDefinition windowDefinition,
+                                                                                           BiFunction<DataType<?>, DataType<?>, BiFunction> getOffsetApplicationFunction,
+                                                                                           Object offsetValue,
+                                                                                           DataType<?> offsetType) {
+        OrderBy windowOrdering = windowDefinition.orderBy();
+        assert windowOrdering != null : "The window definition must be ordered if custom offsets are specified";
+        List<Symbol> orderBySymbols = windowOrdering.orderBySymbols();
+        if (orderBySymbols.size() != 1) {
+            throw new IllegalArgumentException("Must have exactly 1 ORDER BY expression if using <offset> FOLLOWING/PRECEDING");
+        }
+        int offsetColumnPosition;
+        Symbol orderSymbol = orderBySymbols.get(0);
+        DataType<?> orderSymbolType = orderSymbol.valueType();
+        BiFunction applyOffsetOnOrderingValue = getOffsetApplicationFunction.apply(orderSymbolType, offsetType);
+        if (orderSymbol.symbolType() == SymbolType.LITERAL) {
+            offsetColumnPosition = -1;
+        } else {
+            assert orderSymbol instanceof InputColumn
+                : "ORDER BY expression must resolve to an InputColumn, but got: " + orderSymbol;
+            offsetColumnPosition = ((InputColumn) orderSymbol).index();
+        }
+        var orderSymbolTypeId = orderSymbolType.id();
+        final Object finalOffsetValue;
+        if (offsetType.id() == IntervalType.ID) {
+            finalOffsetValue = offsetType.sanitizeValue(offsetValue);
+        } else if ((orderSymbolTypeId == DataTypes.BYTE.id() ||
+            orderSymbolTypeId == DataTypes.SHORT.id() ||
+            orderSymbolTypeId == DataTypes.INTEGER.id() ||
+            orderSymbolTypeId == DataTypes.LONG.id() ||
+            orderSymbolTypeId == DataTypes.DATE.id() ||
+            orderSymbolTypeId == DataTypes.TIMESTAMPZ.id() ||
+            orderSymbolTypeId == DataTypes.TIMESTAMP.id()) &&
+            offsetValue instanceof BigDecimal bigDecimal) {
+            // For the types that use long-based boundary arithmetic, NUMERIC bounds must be normalized without overflowing a long.
+            finalOffsetValue = normalizeIntegralFrameBound(bigDecimal);
+        } else {
+            finalOffsetValue = offsetValue;
+        }
+        return (currentRow, x) -> {
+            // if the offsetCell position is -1 the window is ordered by a Literal so we leave the
+            // probe value to null so it doesn't impact ordering (ie. all values will be consistently GT or LT
+            // `null`)
+            if (offsetColumnPosition != -1) {
+                Object curValue = currentRow[offsetColumnPosition];
+                x[offsetColumnPosition] = curValue == null ? null : applyOffsetOnOrderingValue.apply(curValue, finalOffsetValue);
+            }
+            return x;
+        };
+    }
+
+    /**
+     * Converts a numeric frame bound to long, discarding any fractions and
+     * rejecting values outside the long range.
+     */
+    private static long normalizeIntegralFrameBound(BigDecimal value) {
+        BigInteger bigIntegerValue = value.toBigInteger();
+        if (BigInteger.valueOf(Long.MAX_VALUE).compareTo(bigIntegerValue) < 0 ||
+            BigInteger.valueOf(Long.MIN_VALUE).compareTo(bigIntegerValue) > 0) {
+            throw new IllegalArgumentException(
+                "The window frame bound " + value.toPlainString()
+                    + " is not representable as a value of type bigint");
+        }
+        return bigIntegerValue.longValue();
+    }
+}

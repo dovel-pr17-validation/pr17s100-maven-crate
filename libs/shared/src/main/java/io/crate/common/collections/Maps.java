@@ -1,0 +1,333 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.common.collections;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.RandomAccess;
+import java.util.function.BiFunction;
+import java.util.function.Function;
+
+import org.jspecify.annotations.Nullable;
+
+import io.crate.common.StringUtils;
+import io.crate.common.TriConsumer;
+
+public final class Maps {
+
+    public static <K, V> Map<K, V> concat(Map<K, V> m1, Map<K, V> m2) {
+        if (m1.isEmpty()) {
+            return m2;
+        }
+        if (m2.isEmpty()) {
+            return m1;
+        }
+        HashMap<K, V> result = new HashMap<>();
+        result.putAll(m1);
+        result.putAll(m2);
+        return Collections.unmodifiableMap(result);
+    }
+
+
+    public static <K, V> Map<K, V> merge(Map<K, V> m1, Map<K, V> m2, BiFunction<V, V, V> mergeValues) {
+        if (m1.isEmpty()) {
+            return m2;
+        }
+        if (m2.isEmpty()) {
+            return m1;
+        }
+        var result = new HashMap<K, V>();
+        for (var m1Entry : m1.entrySet()) {
+            var m1Key = m1Entry.getKey();
+            var m1Values = m1Entry.getValue();
+            var m2Values = m2.get(m1Key);
+            if (m1Values != null && m2Values != null) {
+                result.put(m1Key, mergeValues.apply(m1Values, m2Values));
+            } else if (m1Values != null) {
+                result.put(m1Key, m1Values);
+            } else if (m2Values != null) {
+                result.put(m1Key, m2Values);
+            }
+        }
+        for (var key : Sets.difference(m2.keySet(), result.keySet())) {
+            result.put(key, m2.get(key));
+        }
+        return result;
+    }
+
+    @SuppressWarnings("unchecked")
+    public static <T> T get(Map<String, ?> map, String key) {
+        return (T) map.get(key);
+    }
+
+    @SuppressWarnings("unchecked")
+    public static <T> T getOrDefault(@Nullable Map<String, Object> map, String key, T defaultValue) {
+        if (map == null) {
+            return defaultValue;
+        }
+        return (T) map.getOrDefault(key, defaultValue);
+    }
+
+    @Nullable
+    public static Object getByPath(Map<String, Object> map, String path) {
+        assert path != null : "path should not be null";
+        return getByPath(map, StringUtils.splitToList('.', path));
+    }
+
+    @Nullable
+    public static Object getByPath(Map<?, ?> value, List<String> path) {
+        return getByPath(value, path, 0);
+    }
+
+    @Nullable
+    public static Object getByPath(Object value, List<String> path) {
+        if (value instanceof Map<?, ?> map) {
+            return getByPath(map, path);
+        } else if (value instanceof List<?> list) {
+            return getByPath(list, path, -1);
+        } else {
+            return null;
+        }
+    }
+
+    private static Object getByPath(Map<?, ?> value, List<String> path, int startIndex) {
+        assert path instanceof RandomAccess : "Path must support random access for fast iteration";
+        Map<?, ?> map = value;
+        for (int i = startIndex; i < path.size(); i++) {
+            Object key = path.get(i);
+            Object val = map.get(key);
+            if (i + 1 == path.size()) {
+                return val;
+            } else if (val instanceof Map<?, ?> m) {
+                map = m;
+            } else if (val instanceof List<?> list) {
+                return getByPath(list, path, i);
+            } else {
+                return null;
+            }
+        }
+        return map;
+    }
+
+    private static Object getByPath(List<?> list, List<String> path, int startIndex) {
+        if (startIndex + 1 == path.size()) {
+            return list;
+        }
+        ArrayList<Object> newList = new ArrayList<>(list.size());
+        for (Object o : list) {
+            if (o instanceof Map<?,?> m) {
+                newList.add(getByPath(m, path, startIndex + 1));
+            } else if (o instanceof List<?> l) {
+                newList.add(getByPath(l, path, startIndex));
+            } else {
+                newList.add(o);
+            }
+        }
+        return newList;
+    }
+
+    public static boolean pathExists(Map<?, ?> map, List<String> path) {
+        Map<?, ?> current = map;
+        for (int i = 0; i < path.size(); i++) {
+            String key = path.get(i);
+            // must use Map.containsKey instead of Map.get because a column can be mapped to a null value
+            if (!current.containsKey(key)) {
+                return false;
+            }
+            if (i + 1 == path.size()) {
+                return true;
+            }
+            var val = current.get(key);
+            if (val instanceof Map<?, ?> nested) {
+                current = nested;
+            } else {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    @Nullable
+    @SuppressWarnings("unchecked")
+    public static <T> T removeByPath(Map<String, T> map, List<String> path) {
+        assert path instanceof RandomAccess : "`path` must support random access for performance";
+        Map<String, T> m = map;
+        for (int i = 0; i < path.size(); i++) {
+            String key = path.get(i);
+            if (i + 1 == path.size()) {
+                return m.remove(key);
+            } else {
+                T val = map.get(key);
+                if (val instanceof Map) {
+                    m = (Map<String, T>) val;
+                } else {
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Inserts a value into source under the given key+path
+     */
+    public static void mergeInto(Map<String, Object> source,
+                                 String key,
+                                 List<String> path,
+                                 Object value) {
+        mergeInto(source, key, path, value, Map::put, true);
+    }
+
+    /**
+     * Inserts a value into source under the given key+path
+     */
+    @SuppressWarnings("unchecked")
+    public static void mergeInto(Map<String, Object> source,
+                                 String key,
+                                 List<String> path,
+                                 Object value,
+                                 TriConsumer<Map<String, Object>, String, Object> writer,
+                                 boolean createPaths) {
+        if (path.isEmpty()) {
+            writer.accept(source, key, value);
+        } else {
+            if (source.containsKey(key)) {
+                Map<String, Object> contents = (Map<String, Object>) source.get(key);
+                if (contents == null) {
+                    if (createPaths) {
+                        contents = new HashMap<>();
+                        source.put(key, contents);
+                    } else {
+                        return;
+                    }
+                }
+                String nextKey = path.get(0);
+                mergeInto(contents, nextKey, path.subList(1, path.size()), value, writer, createPaths);
+            } else {
+                writer.accept(source, key, nestedMaps(path, value));
+            }
+        }
+    }
+
+    private static Map<String, Object> nestedMaps(List<String> path, Object value) {
+        final HashMap<String, Object> root = HashMap.newHashMap(1);
+        HashMap<String, Object> m = root;
+        for (int i = 0, size = path.size(); i < size; i++) {
+            String key = path.get(i);
+            if (i + 1 == size) {
+                m.put(key, value);
+            } else {
+                HashMap<String, Object> nextChild = HashMap.newHashMap(1);
+                m.put(key, nextChild);
+                m = nextChild;
+            }
+        }
+        return root;
+    }
+
+
+    /**
+     * Add entries in `additions` to `map`.
+     * If `map` already contains an entry that is also present in `addition`:
+     *  - It will recurse into it if it is a map
+     *  - Skip the entry otherwise
+     **/
+    public static void extendRecursive(Map<String, Object> map, Map<String, Object> additions) {
+        extendRecursive(map, additions, (oldList, newList) -> Lists.concatUnique(oldList, newList));
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    public static void extendRecursive(Map<String, Object> map,
+                                       Map<String, Object> additions,
+                                       BiFunction<List<Object>, Collection<Object>, List<Object>> mergeLists) {
+        for (Map.Entry<String, Object> additionEntry : additions.entrySet()) {
+            String key = additionEntry.getKey();
+            Object addition = additionEntry.getValue();
+            if (map.containsKey(key)) {
+                Object sourceValue = map.get(key);
+                if (sourceValue instanceof Map && addition instanceof Map) {
+                    //noinspection unchecked
+                    extendRecursive((Map) sourceValue, (Map) addition);
+                }
+                if (sourceValue instanceof List && addition instanceof Collection) {
+                    map.put(key, mergeLists.apply((List<Object>) sourceValue, (List<Object>) addition));
+                }
+            } else {
+                map.put(key, addition);
+            }
+        }
+    }
+
+    public static <K, V> Map<K, V> uniqueIndex(Iterable<V> values, Function<? super V, K> keyFunction) {
+        var result = new HashMap<K, V>();
+        for (V value : values) {
+            var key = keyFunction.apply(value);
+            var previous = result.put(key, value);
+            if (previous != null) {
+                throw new IllegalArgumentException(String.format(Locale.ENGLISH, "Duplicated value %s for key %s", previous, key));
+            }
+        }
+        return Collections.unmodifiableMap(result);
+    }
+
+    /**
+     * Adds the value under the given key to the given map unless the value is null.
+     */
+    public static <K, V> V putNonNull(Map<K, V> map, K key, @Nullable V value) {
+        if (value != null) {
+            return map.put(key, value);
+        }
+        return null;
+    }
+
+    /**
+     * Returns a modifiable deep copy of the given map.
+     */
+    public static <K, V> Map<K, V> deepCopy(Map<K, V> map) {
+        Map<K, V> copy = new HashMap<>();
+        for (Map.Entry<K, V> e : map.entrySet()) {
+            K key = e.getKey();
+            V value = e.getValue();
+            if (value instanceof Map<?, ?> nested) {
+                copy.put(key, (V) deepCopy(nested));
+            } else if (value instanceof List<?> list) {
+                List<Object> newList = new ArrayList<>();
+                for (Object item : list) {
+                    if (item instanceof Map<?, ?> m) {
+                        newList.add(deepCopy(m));
+                    } else {
+                        newList.add(item);
+                    }
+                }
+                copy.put(key, (V) newList);
+            } else {
+                copy.put(key, value);
+            }
+        }
+        return copy;
+    }
+}

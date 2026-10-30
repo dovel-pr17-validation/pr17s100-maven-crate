@@ -1,0 +1,392 @@
+/*
+ * Licensed to Elasticsearch under one or more contributor
+ * license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright
+ * ownership. Elasticsearch licenses this file to you under
+ * the Apache License, Version 2.0 (the "License"); you may
+ * not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.elasticsearch.cluster.metadata;
+
+import static org.elasticsearch.cluster.metadata.IndexMetadata.SETTING_VERSION_CREATED;
+import static org.elasticsearch.cluster.metadata.IndexMetadata.SETTING_VERSION_UPGRADED;
+import static org.elasticsearch.cluster.metadata.Metadata.OID_UNASSIGNED;
+
+import java.util.List;
+import java.util.Locale;
+import java.util.stream.Collectors;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.apache.logging.log4j.message.ParameterizedMessage;
+import org.elasticsearch.Version;
+import org.elasticsearch.common.settings.AbstractScopedSettings;
+import org.elasticsearch.common.settings.IndexScopedSettings;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.index.Index;
+
+import io.crate.blob.v2.BlobIndex;
+import io.crate.expression.udf.UserDefinedFunctionService;
+import io.crate.expression.udf.UserDefinedFunctionsMetadata;
+import io.crate.fdw.ForeignTablesMetadata;
+import io.crate.metadata.DocTableInfo;
+import io.crate.metadata.Functions;
+import io.crate.metadata.IndexName;
+import io.crate.metadata.IndexParts;
+import io.crate.metadata.NodeContext;
+import io.crate.metadata.PartitionName;
+import io.crate.metadata.RelationMetadata;
+import io.crate.metadata.RelationName;
+import io.crate.metadata.doc.DocTableInfoFactory;
+import io.crate.metadata.upgrade.IndexTemplateUpgrader;
+import io.crate.metadata.upgrade.MetadataIndexUpgrader;
+import io.crate.metadata.view.ViewMetadata;
+import io.crate.metadata.view.ViewsMetadata;
+import io.crate.replication.logical.metadata.Publication;
+import io.crate.replication.logical.metadata.PublicationsMetadata;
+import io.crate.sql.tree.CheckConstraint;
+
+/**
+ * This service is responsible for upgrading legacy index metadata to the current version
+ * <p>
+ * Every time an existing index is introduced into cluster this service should be used
+ * to upgrade the existing index metadata to the latest version of the cluster. It typically
+ * occurs during cluster upgrade, when dangling indices are imported into the cluster or indices
+ * are restored from a repository.
+ */
+@SuppressWarnings("deprecation") // suppressed because this class by design deals with migrating from deprecated components to non-deprecated.
+public class MetadataUpgradeService {
+
+    private static final Logger LOGGER = LogManager.getLogger(MetadataUpgradeService.class);
+
+    private final IndexScopedSettings indexScopedSettings;
+    private final UserDefinedFunctionService userDefinedFunctionService;
+    private final NodeContext nodeContext;
+
+    public MetadataUpgradeService(NodeContext nodeContext,
+                                  IndexScopedSettings indexScopedSettings,
+                                  UserDefinedFunctionService userDefinedFunctionService) {
+        this.nodeContext = nodeContext;
+        this.userDefinedFunctionService = userDefinedFunctionService;
+        this.indexScopedSettings = indexScopedSettings;
+    }
+
+    /// Creates a DocTableInfoFactory for each upgrade invocation.
+    /// Metadata can come from a foreign cluster, so the factory must be solely based on the metadata being upgraded.
+    private DocTableInfoFactory createDocTableFactory(Metadata metadata) {
+        Functions functions = nodeContext.functions().copyOfBuiltIns();
+        functions.setUDFs(userDefinedFunctionService.buildUDFResolvers(metadata));
+        return new DocTableInfoFactory(nodeContext.withFunctions(functions));
+    }
+
+    public Metadata upgradeMetadata(Metadata metadata) {
+        return upgradeMetadata(metadata, false);
+    }
+
+    public Metadata upgradeMetadata(Metadata metadata, boolean nodeStart) {
+        final Metadata.Builder newMetadata = Metadata.builder(upgradeUDFMetadata(metadata));
+        ViewsMetadata viewsMetadata = metadata.custom(ViewsMetadata.TYPE);
+        if (viewsMetadata != null) {
+            for (var entry : viewsMetadata.views().entrySet()) {
+                String viewNameStr = entry.getKey();
+                RelationName viewName = RelationName.fromIndexName(viewNameStr);
+                ViewMetadata viewMetadata = entry.getValue();
+                newMetadata.setView(
+                    viewName,
+                    viewMetadata.stmt(),
+                    viewMetadata.owner(),
+                    viewMetadata.searchPath(),
+                    viewMetadata.errorOnUnknownObjectKey());
+            }
+            newMetadata.removeCustom(ViewsMetadata.TYPE);
+        }
+
+        // DocTableInfoFactory must have access to the UDF definitions from the given
+        // Metadata so table validation can resolve UDF dependencies.
+        DocTableInfoFactory tableInfoFactory = createDocTableFactory(newMetadata.build());
+
+        ForeignTablesMetadata foreignTablesMetadata = metadata.custom(ForeignTablesMetadata.TYPE);
+        if (foreignTablesMetadata != null) {
+            for (var foreignTable : foreignTablesMetadata) {
+                newMetadata.setForeignTable(foreignTable);
+            }
+            newMetadata.removeCustom(ForeignTablesMetadata.TYPE);
+        }
+
+        // Templates only exist in Metadata from < 6.1.0
+        // If streaming Metadata to nodes < 6.1.0 templates are re-created on demand
+        for (var entry : metadata.templates().entrySet()) {
+            String templateName = entry.getKey();
+            newMetadata.removeTemplate(templateName);
+            if (IndexTemplateUpgrader.CRATE_DEFAULTS.equals(templateName)) {
+                continue;
+            }
+            IndexTemplateMetadata template = entry.getValue();
+            RelationName relationName = IndexName.decode(template.name()).toRelationName();
+            RelationMetadata relation = metadata.getRelation(relationName);
+            assert relation == null
+                : "If there is still a template present there shouldn't be any RelationMetadata";
+
+            DocTableInfo docTable = tableInfoFactory.create(template, OID_UNASSIGNED);
+            Version versionCreated = getFixedVersionCreated(metadata, docTable);
+
+            // versionCreated could be missing from the template settings and "calculated" afterwards
+            // in DocTableInfo, so put it back to RelationMetadata#parameters
+            Settings settings = Settings.builder()
+                // If RelationMetadata exist in the cluster state, make sure to override them with
+                // the upgraded settings which currently takes place on IndexTemplateMetadata
+                .put(pruneArchived(template.settings()))
+                .put(SETTING_VERSION_CREATED, versionCreated)
+                .put(SETTING_VERSION_UPGRADED, Version.CURRENT)
+                .build();
+
+            newMetadata.setTable(
+                relationName,
+                docTable.allReferences(),
+                settings,
+                docTable.clusteredBy(),
+                docTable.columnPolicy(),
+                docTable.pkConstraintName(),
+                docTable.checkConstraints()
+                    .stream().collect(Collectors.toMap(CheckConstraint::name, CheckConstraint::expressionStr)),
+                docTable.primaryKey(),
+                docTable.partitionedBy(),
+                docTable.isClosed() ? IndexMetadata.State.CLOSE : IndexMetadata.State.OPEN,
+                List.of(),
+                docTable.tableVersion(),
+                OID_UNASSIGNED
+            );
+        }
+
+        // upgrade index meta data
+        for (IndexMetadata indexMetadata : metadata) {
+            String indexName = indexMetadata.getIndex().name();
+            IndexMetadata newIndexMetadata = upgradeIndexMetadata(
+                indexMetadata,
+                Version.CURRENT.minimumIndexCompatibilityVersion()
+            );
+            // Remove any existing metadata, registered by it's name, for the index
+            newMetadata.remove(indexName);
+            newMetadata.put(newIndexMetadata, false);
+
+            String indexUUID = indexMetadata.getIndexUUID();
+            RelationMetadata relation = metadata.getRelation(indexUUID);
+            DocTableInfo tableInfo = null;
+            if (relation == null) {
+                IndexParts indexParts = IndexName.decode(indexName);
+                RelationName relationName = indexParts.toRelationName();
+                relation = newMetadata.getRelation(relationName);
+                if (!BlobIndex.isBlobIndex(indexName)) {
+                    IndexTemplateMetadata template = IndexName.isPartitioned(indexName)
+                        ? newMetadata.getTemplate(PartitionName.templateName(indexName))
+                        : null;
+                    tableInfo = tableInfoFactory.create(indexMetadata, template, OID_UNASSIGNED);
+                }
+            }
+            if (relation == null) {
+                if (tableInfo instanceof DocTableInfo docTable) {
+                    newMetadata.setTable(
+                        docTable.ident(),
+                        docTable.allReferences(),
+                        // If RelationMetadata exist in the cluster state, make sure to override them with
+                        // the upgraded settings which currently takes place on IndexMetadata
+                        newIndexMetadata.getSettings(),
+                        docTable.clusteredBy(),
+                        docTable.columnPolicy(),
+                        docTable.pkConstraintName(),
+                        docTable.checkConstraints()
+                            .stream().collect(Collectors.toMap(CheckConstraint::name, CheckConstraint::expressionStr)),
+                        docTable.primaryKey(),
+                        docTable.partitionedBy(),
+                        newIndexMetadata.getState(),
+                        List.of(newIndexMetadata.getIndexUUID()),
+                        docTable.tableVersion(),
+                        OID_UNASSIGNED
+                    );
+                } else if (BlobIndex.isBlobIndex(indexName)) {
+                    newMetadata.setBlobTable(
+                        RelationName.fromIndexName(indexName),
+                        indexUUID,
+                        newIndexMetadata.getSettings(),
+                        newIndexMetadata.getState(),
+                        OID_UNASSIGNED
+                    );
+                } else {
+                    throw new AssertionError(String.format(
+                        Locale.ENGLISH,
+                        "RelationMetadata for indexName=%s uuid=%s is missing. Couldn't create DocTableInfo and it is not a blob index",
+                        indexName,
+                        indexUUID
+                    ));
+                }
+            } else if (relation instanceof RelationMetadata.Table table) {
+                if (!table.indexUUIDs().contains(indexUUID)) {
+                    newMetadata.addIndexUUIDs(table, List.of(indexUUID));
+                }
+            } else if (relation instanceof RelationMetadata.BlobTable blobTable) {
+                assert blobTable.indexUUID().equals(indexUUID)
+                    : "If there exists a RelationMetadata.BlobTable entry the incoming IndexMetadata indexUUID must match";
+            }
+        }
+        if (nodeStart) {
+            removeDanglingPublicationTables(newMetadata);
+        }
+        return newMetadata.build();
+    }
+
+    private static void removeDanglingPublicationTables(Metadata.Builder metadata) {
+        PublicationsMetadata publications = (PublicationsMetadata) metadata.getCustom(PublicationsMetadata.TYPE);
+        if (publications == null) {
+            return;
+        }
+        PublicationsMetadata updated = PublicationsMetadata.newInstance(publications);
+        boolean isUpdated = false;
+        for (var entry : publications.publications().entrySet()) {
+            Publication publication = entry.getValue();
+            if (publication.isForAllTables()) {
+                continue;
+            }
+            var tables = publication.tables().stream()
+                .filter(table -> metadata.getRelation(table) instanceof RelationMetadata.Table)
+                .toList();
+            if (tables.size() != publication.tables().size()) {
+                updated.publications().put(entry.getKey(), new Publication(publication.owner(), false, tables));
+                isUpdated = true;
+            }
+        }
+        if (isUpdated) {
+            metadata.putCustom(PublicationsMetadata.TYPE, updated);
+        }
+    }
+
+    private static Metadata upgradeUDFMetadata(Metadata metadata) {
+        final Metadata.Builder newMetadata = Metadata.builder(metadata);
+        UserDefinedFunctionsMetadata udfMetadata = metadata.custom(UserDefinedFunctionsMetadata.TYPE);
+        if (udfMetadata != null) {
+            for (var udf : udfMetadata.functionsMetadata()) {
+                newMetadata.setUDF(udf);
+            }
+            newMetadata.removeCustom(UserDefinedFunctionsMetadata.TYPE);
+        }
+        return newMetadata.build();
+    }
+
+    private static Settings pruneArchived(Settings settings) {
+        return IndexScopedSettings.DEFAULT_SCOPED_SETTINGS.archiveUnknownOrInvalidSettings(
+            settings,
+            _ -> {},
+            (_, _) -> {}
+        ).filter(k -> !k.startsWith(AbstractScopedSettings.ARCHIVED_SETTINGS_PREFIX));
+    }
+
+
+    /// Return a "fixed" version
+    ///
+    /// See https://github.com/crate/crate/pull/17178
+    /// In versions up to 5.9.7 ALTER TABLE on a partitioned table could change the
+    /// `versionCreated` property on the template.
+    ///
+    private static Version getFixedVersionCreated(Metadata metadata, DocTableInfo docTable) {
+        Version versionCreated = docTable.versionCreated();
+
+        // Look through partitions and takes their lowest version
+        RelationName relationName = docTable.ident();
+        Index[] concreteIndices = IndexNameExpressionResolver.lenientOpenIndices(
+            metadata,
+            PartitionName.templatePrefix(relationName.schema(), relationName.name())
+        );
+        for (Index index : concreteIndices) {
+            IndexMetadata indexMetadata = metadata.index(index);
+            if (indexMetadata != null) {
+                versionCreated = Version.min(versionCreated, indexMetadata.getCreationVersion());
+            }
+        }
+
+        // If partitions were deleted the above logic can still yield wrong versions.
+        // This does another "correction" by checking oid assignment
+        // If a column doesn't have OIDs the table must be from < 5.5.0
+        if (versionCreated.onOrAfter(DocTableInfo.COLUMN_OID_VERSION)) {
+            if (docTable.rootColumns().stream().anyMatch(ref -> ref.oid() == OID_UNASSIGNED)) {
+                versionCreated = Version.V_5_4_0;
+            }
+        }
+        return versionCreated;
+    }
+
+    private IndexMetadata upgradeIndexMetadata(IndexMetadata indexMetadata, Version minimumIndexCompatibilityVersion) {
+        if (isUpgraded(indexMetadata)) {
+            return indexMetadata;
+        }
+        // Throws an exception if there are too-old segments:
+        checkSupportedVersion(indexMetadata, minimumIndexCompatibilityVersion);
+
+        IndexMetadata newMetadata = indexMetadata;
+        // we have to run this first otherwise in we try to create IndexSettings
+        // with broken settings and fail in checkMappingsCompatibility
+        newMetadata = archiveBrokenIndexSettings(newMetadata);
+        newMetadata = MetadataIndexUpgrader.upgrade(newMetadata);
+        return markAsUpgraded(newMetadata);
+    }
+
+    /**
+     * Checks if the index was already opened by this version of CrateDB and doesn't require any additional checks.
+     */
+    private boolean isUpgraded(IndexMetadata indexMetadata) {
+        return indexMetadata.getCreationVersion().onOrAfter(Version.CURRENT)
+            || indexMetadata.getUpgradedVersion().onOrAfter(Version.CURRENT);
+    }
+
+    /**
+     * Elasticsearch v6.0 no longer supports indices created pre v5.0. All indices
+     * that were created before Elasticsearch v5.0 should be re-indexed in Elasticsearch 5.x
+     * before they can be opened by this version of elasticsearch.
+     */
+    private void checkSupportedVersion(IndexMetadata indexMetadata, Version minimumIndexCompatibilityVersion) {
+        if (indexMetadata.getState() == IndexMetadata.State.OPEN
+            && isSupportedVersion(indexMetadata, minimumIndexCompatibilityVersion) == false) {
+            throw new IllegalStateException("The index [" + indexMetadata.getIndex() + "] was created with version ["
+                + indexMetadata.getCreationVersion() + "] but the minimum compatible version is ["
+                + minimumIndexCompatibilityVersion + "]."
+                + "It should be re-indexed in the previous major version of CrateDB before upgrading to " + Version.CURRENT + ".");
+        }
+    }
+
+    /*
+     * Returns true if this index can be supported by the current version of elasticsearch
+     */
+    private static boolean isSupportedVersion(IndexMetadata indexMetadata, Version minimumIndexCompatibilityVersion) {
+        return indexMetadata.getCreationVersion().onOrAfter(minimumIndexCompatibilityVersion);
+    }
+
+    /**
+     * Marks index as upgraded so we don't have to test it again
+     */
+    private IndexMetadata markAsUpgraded(IndexMetadata indexMetadata) {
+        Settings settings = Settings.builder().put(indexMetadata.getSettings()).put(SETTING_VERSION_UPGRADED, Version.CURRENT).build();
+        return IndexMetadata.builder(indexMetadata).settings(settings).build();
+    }
+
+    private IndexMetadata archiveBrokenIndexSettings(IndexMetadata indexMetadata) {
+        final Settings settings = indexMetadata.getSettings();
+        final Settings upgrade = indexScopedSettings.archiveUnknownOrInvalidSettings(
+            settings,
+            e -> LOGGER.warn("{} ignoring unknown index setting: [{}] with value [{}]; archiving", indexMetadata.getIndex(), e.getKey(), e.getValue()),
+            (e, ex) -> LOGGER.warn(() -> new ParameterizedMessage("{} ignoring invalid index setting: [{}] with value [{}]; archiving", indexMetadata.getIndex(), e.getKey(), e.getValue()), ex));
+        if (upgrade != settings) {
+            return IndexMetadata.builder(indexMetadata).settings(upgrade).build();
+        } else {
+            return indexMetadata;
+        }
+    }
+}

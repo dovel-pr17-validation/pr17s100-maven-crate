@@ -1,0 +1,131 @@
+.. _version_6.2.2:
+
+=============
+Version 6.2.2
+=============
+
+Released on 2026-03-03.
+
+.. WARNING::
+
+    Do not use this version when upgrading from any previous version
+    containing tables created before :ref:`version_5.5.0` as this may result
+    in data loss!
+
+    If the cluster contains tables created before :ref:`version_5.5.0`, after
+    upgrading to :ref:`version_6.2.2` certain actions on such tables like
+    deleting partitions, changing settings, rename, swap, etc. can lead to
+    corrupted table which causes all the data of the columns created
+    in versions before :ref:`version_5.5.0` to be shown as ``NULL``. The bug
+    has been fixed in :ref:`version_6.2.6`, so we highly recommend to avoid
+    upgrading to any earlier 6.2.x version.
+
+    Once already affected by the bug, existing data may be lost forever, while
+    new data (via ``INSERT`` or ``UPDATE``) can be retrieved normally.
+
+.. NOTE::
+
+    If you are upgrading a cluster, you must be running CrateDB 5.0.0 or higher
+    before you upgrade to 6.2.2.
+
+    We recommend that you upgrade to the latest 6.1 release before moving to
+    6.2.2.
+
+    A rolling upgrade from >= 6.1.2 to 6.2.2 is supported. Doing a rolling
+    upgrade from an earlier version than 6.1.2 can cause runtime errors when
+    executing statements relying on implicit casts.
+
+    Before upgrading, you should `back up your data`_.
+
+.. WARNING::
+
+    Tables that were created before CrateDB 5.x will not function with 6.x
+    and must be recreated before moving to 6.x.x.
+
+    You can recreate tables using ``COPY TO`` and ``COPY FROM`` or by
+    `inserting the data into a new table`_.
+
+.. _back up your data: https://cratedb.com/docs/crate/reference/en/latest/admin/snapshots.html
+.. _inserting the data into a new table: https://cratedb.com/docs/crate/reference/en/latest/admin/system-information.html#tables-need-to-be-recreated
+
+.. rubric:: Table of contents
+
+.. contents::
+   :local:
+
+
+See the :ref:`version_6.2.0` release notes for a full list of changes in the 6.2
+series.
+
+Fixes
+=====
+
+- Fixed an issue that caused ``ALTER TABLE`` statements to fail if the table
+  contains columns of type ``UNDEFINED`` due to dynamic column creation with
+  ``null`` values.
+
+- Fixed an issue that could cause a ``NullPointerException`` when using the
+  :ref:`topk <aggregation-topk>` aggregation on a column containing ``null``
+  values.
+
+- Fixed an issue that caused a :ref:`SUM <aggregation-sum>` aggregation to cause
+  a ``NullPointerException`` if used on a column containing null values and used
+  as part of a window function with a window definition where the null values
+  appeared first or intermediate instead of last.
+
+  An Example::
+
+    select sum(x) over (order by x nulls first rows between 1 preceding and 1 following)
+    from (
+      select null
+      union all
+      select 1
+      union all
+      select 2
+    ) tbl (x);
+
+- Fixed an issue that caused :ref:`swap table <alter_cluster_swap_table>` or
+  :ref:`drop table <drop-table>` to cause temporary metadata corruption if
+  run during a rolling upgrade from 5.10.x. The corruption can be recovered by
+  restarting the upgraded nodes. Rolling upgrades from 6.0+ to 6.2.2 weren't
+  affected.
+
+- Fixed an issue that caused :ref:`swap table <alter_cluster_swap_table>` on
+  partitioned tables to be rejected with ``IllegalStateException`` due to wrong
+  version upgrade migration logic. Only tables created on or before 5.10.x are
+  affected.
+
+- Fixed an issue that could lead to queries being stuck when a distributed
+  query was interrupted by a ``CircuitBreakingException`` on a cluster under
+  high memory pressure.
+
+- Fixed an issue where a ``KILL ALL`` statement is not succeeding due to
+  existing high memory pressure on the cluster.
+
+- Fixed a regression introduced in :ref:`version_6.0.0` that caused a
+  ``ColumnUnknownException``, even when disabling errors via the
+  :ref:`error_on_unknown_object_key <conf-session-error_on_unknown_object_key>`
+  session setting, when selecting a sub-column or array-index on a
+  ``DYNAMIC`` or ``IGNORED`` object/array value returned by a table function
+  like :ref:`UNNEST <unnest>`. Example::
+
+    SET SESSION error_on_unknown_object_key = FALSE;
+    SELECT obj_arr['child_obj']['unknown_array'][1]
+    FROM (
+      SELECT unnest([ {child_obj = { known_col = 'foo'}} ]) AS obj_arr
+    ) AS sub1;
+
+- Fixed a regression introduced in :ref:`version_6.0.0` that caused an error
+  when trying to insert a nested array, or JSON string containing a nested
+  array, with incompatible inner value types into a column of type
+  ``OBJECT(ARRAY(OBJECT(IGNORED)))``. Example::
+
+    CREATE TABLE t1 (obj OBJECT(DYNAMIC) AS (arr ARRAY(OBJECT(IGNORED))));
+    INSERT INTO t1 (obj) VALUES (
+    $$
+       {"arr":[{"b": "str_val"}, {"b": ["array_val"]}]}
+    $$);
+
+- Fixed an issue causing cache to retain some heavy structures, potentially
+  leading to an ``OutOfMemoryError``.
+

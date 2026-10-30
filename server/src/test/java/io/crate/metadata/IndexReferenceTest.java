@@ -1,0 +1,91 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.metadata;
+
+import static io.crate.testing.Asserts.assertThat;
+import static org.assertj.core.api.Assertions.assertThat;
+
+import java.util.List;
+import java.util.Map;
+
+import org.elasticsearch.cluster.metadata.IndexMetadata;
+import org.elasticsearch.common.io.stream.BytesStreamOutput;
+import org.elasticsearch.common.io.stream.StreamInput;
+import org.junit.Test;
+
+import io.crate.test.integration.CrateDummyClusterServiceUnitTest;
+import io.crate.testing.SQLExecutor;
+import io.crate.types.StringType;
+
+public class IndexReferenceTest extends CrateDummyClusterServiceUnitTest {
+
+    @Test
+    public void testStreaming() throws Exception {
+        RelationName relationName = new RelationName("doc", "test");
+        SimpleReference reference = new SimpleReference(
+            relationName, ColumnIdent.of("string_col"), RowGranularity.DOC, StringType.INSTANCE, 1, null);
+
+        IndexReference indexReferenceInfo = new IndexReference(
+            2,
+            123,
+            true,
+            relationName,
+            ColumnIdent.of("index_column"),
+            IndexType.FULLTEXT, List.of(reference), "my_analyzer");
+
+        BytesStreamOutput out = new BytesStreamOutput();
+        Reference.toStream(out, indexReferenceInfo);
+
+        StreamInput in = out.bytes().streamInput();
+        IndexReference indexReferenceInfo2 = Reference.fromStream(in);
+
+        assertThat(indexReferenceInfo2).isEqualTo(indexReferenceInfo);
+    }
+
+    @Test
+    public void test_mapping_generation_ft_col_has_source_columns() throws Exception {
+        SQLExecutor e = SQLExecutor.of(clusterService)
+            .addTable("create table tbl (title string, description string, " +
+                      "index title_desc_fulltext using fulltext(title, description) " +
+                      "with (analyzer = 'stop'))"
+            );
+
+        DocTableInfo table = e.resolveTableInfo("tbl");
+        IndexReference reference = table.indexColumn(ColumnIdent.of("title_desc_fulltext"));
+        var titleRef = table.getReference(ColumnIdent.of("title"));
+        var descRef = table.getReference(ColumnIdent.of("description"));
+
+        Map<String, Object> mapping = reference.toMapping(reference.position());
+        assertThat(mapping)
+            .containsEntry("sources", List.of(titleRef.storageIdent(), descRef.storageIdent()))
+            .containsEntry("oid", 3L)
+            .containsEntry("analyzer", "stop");
+        IndexMetadata indexMetadata = clusterService.state().metadata().indices().values().iterator().next();
+        assertThat(indexMetadata.mapping()).isNull();
+        assertThat(reference.columns()).satisfiesExactly(
+            x -> assertThat(x).isEqualTo(titleRef),
+            x -> assertThat(x).isEqualTo(descRef)
+        );
+    }
+
+
+}

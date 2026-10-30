@@ -1,0 +1,69 @@
+.. _version_5.10.13:
+
+===============
+Version 5.10.13
+===============
+
+Released on 2025-10-13.
+
+.. NOTE::
+
+    If you are upgrading a cluster, you must be running CrateDB 4.0.2 or higher
+    before you upgrade to 5.10.13.
+
+    We recommend that you upgrade to the latest 5.9 release before moving to
+    5.10.13.
+
+    A rolling upgrade from 5.9.x to 5.10.13 is supported.
+    Before upgrading, you should `back up your data`_.
+
+.. WARNING::
+
+    Tables that were created before CrateDB 4.x will not function with 5.x
+    and must be recreated before moving to 5.x.x.
+
+    You can recreate tables using ``COPY TO`` and ``COPY FROM`` or by
+    `inserting the data into a new table`_.
+
+.. _back up your data: https://cratedb.com/docs/crate/reference/en/latest/admin/snapshots.html
+.. _inserting the data into a new table: https://cratedb.com/docs/crate/reference/en/latest/admin/system-information.html#tables-need-to-be-recreated
+
+.. rubric:: Table of contents
+
+.. contents::
+   :local:
+
+
+See the :ref:`version_5.10.0` release notes for a full list of changes in the
+5.10 series.
+
+
+Fixes
+=====
+
+- Fixed a race condition that could lead PostgreSQL clients to receive fewer
+  results than available if using protocol level fetch more than once.
+
+- Fixed an issue that could lead to PostgreSQL wire protocol messages being sent
+  in the wrong order to the client. The issue was triggered when using batched
+  statements where one of the statements caused a parse or bind error.
+
+- Fixed an issue that could lead to stuck jobs, memory leaks and even make a
+  cluster unstable when a query with a ``LIMIT`` clause was interrupted by a
+  ``CircuitBreakingException``.
+
+- Fixed an issue that caused ``ArrayIndexOutOfBoundsExeption`` when executing
+  ``COPY FROM`` on a table containing non-deterministic generated or default
+  columns.
+
+- Fixed an issue where null-valued sub-columns of objects were omitted when
+  queried.
+
+- Upgraded Lucene to ``9.12.3`` that fixed an issue with ``MMapDirectory``
+  leaking maps that could cause exceeding of the ``vm.max_map_count`` limit
+  and lead to a node crash.
+
+- Fixed an issue that caused ``query`` CircuitBreaker's state to not be reset
+  if a sub-query failed (for example, due to a ``CircuitBreakingException``).
+  If repeated, could bring CircuitBreaker to the point when each consequent
+  query is tripped and make a cluster unresponsive.

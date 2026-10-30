@@ -1,0 +1,322 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.execution.ddl.tables;
+
+import static io.crate.testing.Asserts.assertThat;
+import static java.util.Collections.singletonList;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+import java.util.List;
+import java.util.Map;
+
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.metadata.IndexMetadata;
+import org.elasticsearch.cluster.metadata.Metadata;
+import org.junit.Test;
+
+import io.crate.analyze.DropColumn;
+import io.crate.metadata.ColumnIdent;
+import io.crate.metadata.DocTableInfo;
+import io.crate.metadata.Reference;
+import io.crate.metadata.RelationName;
+import io.crate.metadata.RowGranularity;
+import io.crate.metadata.SimpleReference;
+import io.crate.metadata.doc.DocTableInfoFactory;
+import io.crate.test.integration.CrateDummyClusterServiceUnitTest;
+import io.crate.testing.SQLExecutor;
+import io.crate.types.DataTypes;
+import io.crate.types.ObjectType;
+
+public class DropColumnTaskTest extends CrateDummyClusterServiceUnitTest {
+
+    private static AlterTableTask<DropColumnRequest> buildDropColumnTask(SQLExecutor e, RelationName tblName) {
+        return new AlterTableTask<>(
+            e.nodeCtx, tblName, Metadata.OID_UNASSIGNED, e.fulltextAnalyzerResolver(), TransportDropColumn.DROP_COLUMN_OPERATOR);
+    }
+
+    @Test
+    public void test_can_drop_simple_column() throws Exception {
+        var e = SQLExecutor.of(clusterService)
+            .addTable("create table tbl (x int, y int, z int)");
+        DocTableInfo tbl = e.resolveTableInfo("tbl");
+        ClusterState initialState = clusterService.state();
+        var dropColumnTask = buildDropColumnTask(e, tbl.ident());
+        Reference colToDrop = tbl.getReference(ColumnIdent.of("y"));
+        var request = new DropColumnRequest(tbl.ident(), Metadata.OID_UNASSIGNED, List.of(new DropColumn(colToDrop, false)));
+        ClusterState newState = dropColumnTask.execute(initialState, request);
+
+        assertThat(newState.version())
+            .as("Version is not increased. The MasterService does when the state is applied")
+            .isEqualTo(initialState.version());
+        assertThat(newState.metadata().version())
+            .as("Version is not increased. The MasterService does when the state is applied")
+            .isEqualTo(initialState.metadata().version());
+
+        String indexUUID = newState.metadata().getIndex(tbl.ident(), List.of(), true, IndexMetadata::getIndexUUID);
+        assertThat(newState.metadata().index(indexUUID).getVersion())
+            .isGreaterThan(initialState.metadata().index(indexUUID).getVersion());
+
+        DocTableInfo newTable = new DocTableInfoFactory(e.nodeCtx).create(tbl.ident(), newState.metadata());
+
+        assertThat(newTable.getReference(colToDrop.column())).isNull();
+        assertThat(newTable.rootColumns()).hasSize(2);
+        assertThat(newTable.droppedColumns()).satisfiesExactly(
+            x -> assertThat(x)
+                .hasName("y")
+                .hasFieldOrPropertyWithValue("dropped", true)
+                .hasPosition(2)
+        );
+    }
+
+    @Test
+    public void test_can_drop_generated_column() throws Exception {
+        var e = SQLExecutor.of(clusterService)
+            .addTable("create table tbl (x int, y int GENERATED ALWAYS AS (x+1), z int)");
+        DocTableInfo tbl = e.resolveTableInfo("tbl");
+        ClusterState initialState = clusterService.state();
+        var dropColumnTask = buildDropColumnTask(e, tbl.ident());
+        Reference colToDrop = tbl.getReference(ColumnIdent.of("y"));
+        var request = new DropColumnRequest(tbl.ident(), Metadata.OID_UNASSIGNED, List.of(new DropColumn(colToDrop, false)));
+        ClusterState newState = dropColumnTask.execute(initialState, request);
+
+        assertThat(newState.version())
+            .as("Version is not increased. The MasterService does when the state is applied")
+            .isEqualTo(initialState.version());
+        assertThat(newState.metadata().version())
+            .as("Version is not increased. The MasterService does when the state is applied")
+            .isEqualTo(initialState.metadata().version());
+
+        String indexUUID = newState.metadata().getIndex(tbl.ident(), List.of(), true, IndexMetadata::getIndexUUID);
+        assertThat(newState.metadata().index(indexUUID).getVersion())
+            .isGreaterThan(initialState.metadata().index(indexUUID).getVersion());
+
+        DocTableInfo newTable = new DocTableInfoFactory(e.nodeCtx).create(tbl.ident(), newState.metadata());
+
+        assertThat(newTable.getReference(colToDrop.column())).isNull();
+        assertThat(newTable.rootColumns()).hasSize(2);
+        assertThat(newTable.droppedColumns()).satisfiesExactly(
+            x -> assertThat(x)
+                .hasName("y")
+                .hasFieldOrPropertyWithValue("dropped", true)
+                .hasPosition(2)
+        );
+    }
+
+    @Test
+    public void test_can_drop_subcolumn() throws Exception {
+        var e = SQLExecutor.of(clusterService)
+            .addTable("create table tbl (id int, o object AS(a int, b int, oo object AS (a int, b int)))");
+        DocTableInfo tbl = e.resolveTableInfo("tbl");
+        var dropColumnTask = buildDropColumnTask(e, tbl.ident());
+        Reference colToDrop = tbl.getReference(ColumnIdent.of("o", "oo"));
+        var request = new DropColumnRequest(tbl.ident(), Metadata.OID_UNASSIGNED, List.of(new DropColumn(colToDrop, false)));
+        ClusterState newState = dropColumnTask.execute(clusterService.state(), request);
+        DocTableInfo newTable = new DocTableInfoFactory(e.nodeCtx).create(tbl.ident(), newState.metadata());
+
+        assertThat(newTable.getReference(colToDrop.column())).isNull();
+        Reference o = newTable.getReference(ColumnIdent.of("o"));
+        assertThat(o.valueType()).isExactlyInstanceOf(ObjectType.class);
+        ObjectType objectType = (ObjectType) o.valueType();
+        assertThat(objectType.innerTypes())
+            .as("Parent column objectType is updated")
+            .containsExactly(
+                Map.entry("a", DataTypes.INTEGER),
+                Map.entry("b", DataTypes.INTEGER)
+            );
+    }
+
+    @Test
+    public void test_can_drop_subcolumn_and_parent_together() throws Exception {
+        var e = SQLExecutor.of(clusterService)
+            .addTable("create table tbl (o object as (o2 object as (c int)))");
+        DocTableInfo tbl = e.resolveTableInfo("tbl");
+        var dropColumnTask = buildDropColumnTask(e, tbl.ident());
+        // parent specified first then its child
+        Reference colToDrop1 = tbl.getReference(ColumnIdent.of("o", "o2"));
+        Reference colToDrop2 = tbl.getReference(ColumnIdent.of("o", List.of("o2", "c")));
+        var request = new DropColumnRequest(tbl.ident(), Metadata.OID_UNASSIGNED, List.of(
+            new DropColumn(colToDrop1, false),
+            new DropColumn(colToDrop2, false)));
+        ClusterState newState = dropColumnTask.execute(clusterService.state(), request);
+        DocTableInfo newTable = new DocTableInfoFactory(e.nodeCtx).create(tbl.ident(), newState.metadata());
+
+        assertThat(newTable.getReference(colToDrop1.column())).isNull();
+        assertThat(newTable.getReference(colToDrop2.column())).isNull();
+    }
+
+    @Test
+    public void test_is_no_op_if_columns_exist() throws Exception {
+        var e = SQLExecutor.of(clusterService)
+            .addTable("create table tbl (x int, y int)");
+        DocTableInfo tbl = e.resolveTableInfo("tbl");
+        ClusterState state = clusterService.state();
+        var dropColumnTask = buildDropColumnTask(e, tbl.ident());
+        SimpleReference colToDrop = new SimpleReference(
+            tbl.ident(),
+            ColumnIdent.of("z"),
+            RowGranularity.DOC,
+            DataTypes.INTEGER,
+            333, // irrelevant
+            null
+        );
+        var request = new DropColumnRequest(tbl.ident(), Metadata.OID_UNASSIGNED, List.of(new DropColumn(colToDrop, true)));
+        ClusterState newState = dropColumnTask.execute(state, request);
+        assertThat(newState).isSameAs(state);
+    }
+
+    @Test
+    public void test_drop_column_with_check_constraint() throws Exception {
+        var e = SQLExecutor.of(clusterService)
+            .addTable("create table tbl (x int check (x > 0), y int check (y > 0))");
+        DocTableInfo tbl = e.resolveTableInfo("tbl");
+        var dropColumnTask = buildDropColumnTask(e, tbl.ident());
+        SimpleReference colToDrop = new SimpleReference(
+            tbl.ident(),
+            ColumnIdent.of("y"),
+            RowGranularity.DOC,
+            DataTypes.INTEGER,
+            333, // irrelevant
+            null
+        );
+        var request = new DropColumnRequest(tbl.ident(), Metadata.OID_UNASSIGNED, List.of(new DropColumn(colToDrop, false)));
+        ClusterState newState = dropColumnTask.execute(clusterService.state(), request);
+        DocTableInfo newTable = new DocTableInfoFactory(e.nodeCtx).create(tbl.ident(), newState.metadata());
+
+        assertThat(newTable.getReference(colToDrop.column())).isNull();
+        assertThat(newTable.checkConstraints()).hasSize(1);
+        assertThat(newTable.checkConstraints().get(0).expressionStr()).isEqualTo("\"x\" > 0");
+    }
+
+    @Test
+    public void test_cannot_drop_column_used_in_generated_expression() throws Exception {
+        var e = SQLExecutor.of(clusterService)
+            .addTable("create table tbl (x int, y int, z as (y + 1))");
+        DocTableInfo tbl = e.resolveTableInfo("tbl");
+        ClusterState state = clusterService.state();
+        var dropColumnTask = buildDropColumnTask(e, tbl.ident());
+        Reference ref = tbl.getReference(ColumnIdent.of("y"));
+
+        DropColumnRequest request = new DropColumnRequest(tbl.ident(), Metadata.OID_UNASSIGNED, List.of(new DropColumn(ref, true)));
+        assertThatThrownBy(() -> dropColumnTask.execute(state, request))
+            .isExactlyInstanceOf(UnsupportedOperationException.class)
+            .hasMessage(
+                "Cannot drop column `y`. It's used in generated column `z`: (y + 1)");
+    }
+
+    @Test
+    public void test_drop_subcolumn_with_check_constraint() throws Exception {
+        var e = SQLExecutor.of(clusterService)
+            .addTable("create table tbl (id int, o object AS(a int, b int, oo object AS (" +
+                      "a int check (o['oo']['a'] > 0), b int)))");
+        DocTableInfo tbl = e.resolveTableInfo("tbl");
+        var dropColumnTask = buildDropColumnTask(e, tbl.ident());
+        SimpleReference colToDrop = new SimpleReference(
+            tbl.ident(),
+            ColumnIdent.of("o", List.of("oo", "a")),
+            RowGranularity.DOC,
+            DataTypes.SHORT, // irrelevant
+            333, // irrelevant
+            null
+        );
+        var request = new DropColumnRequest(tbl.ident(), Metadata.OID_UNASSIGNED, List.of(new DropColumn(colToDrop, false)));
+        ClusterState newState = dropColumnTask.execute(clusterService.state(), request);
+        DocTableInfo newTable = new DocTableInfoFactory(e.nodeCtx).create(tbl.ident(), newState.metadata());
+
+        assertThat(newTable.getReference(colToDrop.column())).isNull();
+        assertThat(newTable.checkConstraints()).isEmpty();
+    }
+
+    @Test
+    public void test_drop_column_with_table_level_check_constraint() throws Exception {
+        var e = SQLExecutor.of(clusterService)
+            .addTable("create table tbl (x int, y int, check (x > 0), check (y > 0))");
+        DocTableInfo tbl = e.resolveTableInfo("tbl");
+        var dropColumnTask = buildDropColumnTask(e, tbl.ident());
+        SimpleReference colToDrop = new SimpleReference(
+            tbl.ident(),
+            ColumnIdent.of("y"),
+            RowGranularity.DOC,
+            DataTypes.INTEGER,
+            333, // irrelevant
+            null
+        );
+        var request = new DropColumnRequest(tbl.ident(), Metadata.OID_UNASSIGNED, List.of(new DropColumn(colToDrop, false)));
+        ClusterState newState = dropColumnTask.execute(clusterService.state(), request);
+        DocTableInfo newTable = new DocTableInfoFactory(e.nodeCtx).create(tbl.ident(), newState.metadata());
+
+        assertThat(newTable.getReference(colToDrop.column())).isNull();
+        assertThat(newTable.checkConstraints()).hasSize(1);
+        assertThat(newTable.checkConstraints().get(0).expressionStr()).isEqualTo("\"x\" > 0");
+    }
+
+    @Test
+    public void test_drop_column_with_check_constraint_from_partitioned_table() throws Exception {
+        var e = SQLExecutor.of(clusterService)
+            .addTable("create table doc.parted(x int check (x > 0), y int check (y > 0)) " +
+                                 "partitioned by (x)" ,
+                singletonList("1"),
+                singletonList("2"),
+                singletonList(null)
+            );
+        DocTableInfo tbl = e.resolveTableInfo("doc.parted");
+        var dropColumnTask = buildDropColumnTask(e, tbl.ident());
+        SimpleReference colToDrop = new SimpleReference(
+            tbl.ident(),
+            ColumnIdent.of("y"),
+            RowGranularity.DOC,
+            DataTypes.INTEGER,
+            333, // irrelevant
+            null
+        );
+        var request = new DropColumnRequest(tbl.ident(), Metadata.OID_UNASSIGNED, List.of(new DropColumn(colToDrop, false)));
+        ClusterState newState = dropColumnTask.execute(clusterService.state(), request);
+        DocTableInfo newTable = new DocTableInfoFactory(e.nodeCtx).create(tbl.ident(), newState.metadata());
+
+        assertThat(newTable.getReference(colToDrop.column())).isNull();
+        assertThat(newTable.checkConstraints()).hasSize(1);
+        assertThat(newTable.checkConstraints().get(0).expressionStr()).isEqualTo("\"x\" > 0");
+    }
+
+    @Test
+    public void test_drop_subcolumn_with_check_constraint_on_children() throws Exception {
+        var e = SQLExecutor.of(clusterService)
+            .addTable("create table tbl (id int, o object AS(a int, b int, oo object AS (" +
+                "a int, ooo object AS (a int))), check (o['oo']['a'] + o['oo']['ooo']['a']> 0))");
+        DocTableInfo tbl = e.resolveTableInfo("tbl");
+        var dropColumnTask = buildDropColumnTask(e, tbl.ident());
+        SimpleReference colToDrop = new SimpleReference(
+            tbl.ident(),
+            ColumnIdent.of("o", List.of("oo")),
+            RowGranularity.DOC,
+            DataTypes.SHORT, // irrelevant
+            333, // irrelevant
+            null
+        );
+        var request = new DropColumnRequest(tbl.ident(), Metadata.OID_UNASSIGNED, List.of(new DropColumn(colToDrop, false)));
+        ClusterState newState = dropColumnTask.execute(clusterService.state(), request);
+        DocTableInfo newTable = new DocTableInfoFactory(e.nodeCtx).create(tbl.ident(), newState.metadata());
+
+        assertThat(newTable.getReference(colToDrop.column())).isNull();
+        assertThat(newTable.checkConstraints()).isEmpty();
+    }
+}

@@ -1,0 +1,448 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.expression.reference.sys.shard;
+
+import java.util.Collection;
+import java.util.List;
+import java.util.Locale;
+import java.util.function.Supplier;
+
+import org.apache.lucene.store.AlreadyClosedException;
+import org.elasticsearch.Version;
+import org.elasticsearch.cluster.metadata.IndexMetadata;
+import org.elasticsearch.cluster.metadata.Metadata;
+import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.index.seqno.RetentionLease;
+import org.elasticsearch.index.seqno.RetentionLeaseStats;
+import org.elasticsearch.index.seqno.SeqNoStats;
+import org.elasticsearch.index.shard.IllegalIndexShardStateException;
+import org.elasticsearch.index.shard.IndexShard;
+import org.elasticsearch.index.shard.IndexShardClosedException;
+import org.elasticsearch.index.shard.MergeStats;
+import org.elasticsearch.index.shard.ShardId;
+import org.elasticsearch.index.store.StoreStats;
+import org.elasticsearch.index.translog.TranslogStats;
+import org.jspecify.annotations.Nullable;
+
+import io.crate.blob.v2.BlobShard;
+import io.crate.metadata.IndexName;
+import io.crate.metadata.PartitionName;
+import io.crate.metadata.RelationMetadata;
+import io.crate.metadata.RelationName;
+
+public class ShardRowContext {
+
+    private final Supplier<RelationName> relationNameSupplier;
+    private final IndexShard indexShard;
+    @Nullable
+    private final BlobShard blobShard;
+    private final ClusterService clusterService;
+    private final Supplier<Long> sizeSupplier;
+    private final String partitionIdent;
+    private final List<String> partitionValues;
+    private final int id;
+    private final String path;
+    @Nullable
+    private final String blobPath;
+    private final Supplier<Boolean> orphanedPartitionSupplier;
+    private final MergeStats mergeStats;
+
+    @Nullable
+    private TranslogStats translogStats = null;
+
+    @Nullable
+    private SeqNoStats seqNoStats = null;
+
+    @Nullable
+    private RetentionLeaseStats retentionLeaseStats = null;
+
+    public ShardRowContext(IndexShard indexShard, ClusterService clusterService) {
+        this(indexShard, null, clusterService, () -> {
+            try {
+                StoreStats storeStats = indexShard.storeStats();
+                return storeStats.sizeInBytes();
+            } catch (AlreadyClosedException e) {
+                return 0L;
+            }
+        });
+    }
+
+    public ShardRowContext(BlobShard blobShard, ClusterService clusterService) {
+        this(blobShard.indexShard(), blobShard, clusterService, blobShard::getTotalSize);
+    }
+
+    private ShardRowContext(IndexShard indexShard,
+                            @Nullable BlobShard blobShard,
+                            ClusterService clusterService,
+                            Supplier<Long> sizeSupplier) {
+        this.indexShard = indexShard;
+        this.blobShard = blobShard;
+        this.clusterService = clusterService;
+        this.sizeSupplier = sizeSupplier;
+        ShardId shardId = indexShard.shardId();
+        this.id = shardId.id();
+        Metadata metadata = clusterService.state().metadata();
+        IndexMetadata index = metadata.index(shardId.getIndexUUID());
+        if (index == null) {
+            throw new IllegalArgumentException(
+                String.format(Locale.ENGLISH, "IndexMetadata for shard %s does not exist in the cluster state", shardId));
+        }
+        this.orphanedPartitionSupplier = () -> clusterService.state().metadata().getRelation(shardId.getIndexUUID()) == null;
+        this.relationNameSupplier = () -> {
+            RelationMetadata relation = clusterService.state().metadata().getRelation(shardId.getIndexUUID());
+            return relation == null ?
+                IndexName.decode(shardId.getIndexName()).toRelationName() :
+                relation.name();
+        };
+        partitionValues = index.partitionValues();
+        partitionIdent = partitionValues.isEmpty() ? "" : PartitionName.encodeIdent(index.partitionValues());
+        path = indexShard.shardPath().getDataPath().toString();
+        blobPath = blobShard == null ? null : blobShard.blobContainer().getBaseDirectory().toString();
+        mergeStats = indexShard.mergeStats();
+    }
+
+    public RelationName relationName() {
+        return relationNameSupplier.get();
+    }
+
+    public List<String> partitionValues() {
+        return partitionValues;
+    }
+
+    public IndexShard indexShard() {
+        return indexShard;
+    }
+
+    public ClusterService clusterService() {
+        return clusterService;
+    }
+
+    public Long size() {
+        return sizeSupplier.get();
+    }
+
+    @Nullable
+    public String partitionIdent() {
+        return partitionIdent;
+    }
+
+    public String partitionUUID() {
+        return indexShard.shardId().getIndex().uuid();
+    }
+
+    public int id() {
+        return id;
+    }
+
+    public String path() {
+        return path;
+    }
+
+    @Nullable
+    public String blobPath() {
+        return blobPath;
+    }
+
+    @Nullable
+    public Long numDocs() {
+        if (blobShard == null) {
+            try {
+                return indexShard.numDocs();
+            } catch (IllegalIndexShardStateException e) {
+                return null;
+            }
+        } else {
+            return blobShard.getBlobsCount();
+        }
+    }
+
+    public boolean isOrphanedPartition() {
+        return orphanedPartitionSupplier.get();
+    }
+
+    public boolean isClosed() {
+        return indexShard.isClosed();
+    }
+
+    @Nullable
+    public String minLuceneVersion() {
+        long numDocs;
+        try {
+            numDocs = indexShard.numDocs();
+        } catch (IllegalIndexShardStateException e) {
+            return null;
+        }
+        if (numDocs == 0) {
+            // If there are no documents we've no segments and `indexShard.minimumCompatibleVersion`
+            // will return the version the index was created with.
+            // That would cause `TableNeedsUpgradeSysCheck` to trigger a warning
+            //
+            // If a new segment is created in an empty shard it will use the newer lucene version
+            return Version.CURRENT.luceneVersion.toString();
+        }
+        try {
+            return indexShard.minimumCompatibleVersion().toString();
+        } catch (AlreadyClosedException e) {
+            return null;
+        }
+    }
+
+    private SeqNoStats seqNoStats() {
+        if (seqNoStats == null) {
+            SeqNoStats stats = indexShard.seqNoStats();
+            seqNoStats = stats;
+            return stats;
+        }
+        return seqNoStats;
+    }
+
+    public long maxSeqNo() {
+        try {
+            var stats = seqNoStats();
+            return stats.getMaxSeqNo();
+        } catch (AlreadyClosedException e) {
+            return 0L;
+        }
+    }
+
+    public long localSeqNoCheckpoint() {
+        try {
+            var stats = seqNoStats();
+            return stats.getLocalCheckpoint();
+        } catch (AlreadyClosedException e) {
+            return 0L;
+        }
+    }
+
+    public long globalSeqNoCheckpoint() {
+        try {
+            var stats = seqNoStats();
+            return stats.getGlobalCheckpoint();
+        } catch (AlreadyClosedException e) {
+            return 0L;
+        }
+    }
+
+    private TranslogStats translogStats() {
+        if (translogStats == null) {
+            TranslogStats stats = indexShard.translogStats();
+            translogStats = stats;
+            return stats;
+        }
+        return translogStats;
+    }
+
+    @Nullable
+    public Long translogSizeInBytes() {
+        try {
+            var stats = translogStats();
+            return stats == null ? null : stats.getTranslogSizeInBytes();
+        } catch (AlreadyClosedException e) {
+            return 0L;
+        }
+    }
+
+    @Nullable
+    public Long translogUncommittedSizeInBytes() {
+        try {
+            var stats = translogStats();
+            return stats == null ? null : stats.getUncommittedSizeInBytes();
+        } catch (AlreadyClosedException e) {
+            return 0L;
+        }
+    }
+
+    @Nullable
+    public Integer translogEstimatedNumberOfOperations() {
+        try {
+            var stats = translogStats();
+            return stats == null ? null : stats.estimatedNumberOfOperations();
+        } catch (AlreadyClosedException e) {
+            return 0;
+        }
+    }
+
+    @Nullable
+    public Integer translogUncommittedOperations() {
+        try {
+            var stats = translogStats();
+            return stats == null ? null : stats.getUncommittedOperations();
+        } catch (AlreadyClosedException e) {
+            return 0;
+        }
+    }
+
+    @Nullable
+    public String recoveryStage() {
+        var recoveryState = indexShard.recoveryState();
+        return recoveryState == null
+            ? null
+            : recoveryState.getStage().name();
+    }
+
+    @Nullable
+    public String recoveryType() {
+        var recoveryState = indexShard.recoveryState();
+        return recoveryState == null
+            ? null
+            : recoveryState.getRecoverySource().getType().name();
+    }
+
+    @Nullable
+    public Long recoveryTotalTime() {
+        var recoveryState = indexShard.recoveryState();
+        return recoveryState == null
+            ? null
+            : recoveryState.getTimer().time();
+    }
+
+    @Nullable
+    public Long recoverySizeUsed() {
+        var recoveryState = indexShard.recoveryState();
+        return recoveryState == null
+            ? null
+            : recoveryState.getIndex().totalBytes();
+    }
+
+    @Nullable
+    public Long recoverySizeReused() {
+        var recoveryState = indexShard.recoveryState();
+        return recoveryState == null
+            ? null
+            : recoveryState.getIndex().reusedBytes();
+    }
+
+    @Nullable
+    public Long recoverySizeRecoveredBytes() {
+        var recoveryState = indexShard.recoveryState();
+        return recoveryState == null
+            ? null
+            : recoveryState.getIndex().recoveredBytes();
+    }
+
+    @Nullable
+    public Float recoverySizeRecoveredBytesPercent() {
+        var recoveryState = indexShard.recoveryState();
+        return recoveryState == null
+            ? null
+            : recoveryState.getIndex().recoveredBytesPercent();
+    }
+
+    @Nullable
+    public Integer recoveryFilesUsed() {
+        var recoveryState = indexShard.recoveryState();
+        return recoveryState == null
+            ? null
+            : recoveryState.getIndex().totalFileCount();
+    }
+
+    @Nullable
+    public Integer recoveryFilesReused() {
+        var recoveryState = indexShard.recoveryState();
+        return recoveryState == null
+            ? null
+            : recoveryState.getIndex().reusedFileCount();
+    }
+
+    @Nullable
+    public Integer recoveryFilesRecovered() {
+        var recoveryState = indexShard.recoveryState();
+        return recoveryState == null
+            ? null
+            : recoveryState.getIndex().recoveredFileCount();
+    }
+
+    @Nullable
+    public Float recoveryFilesPercent() {
+        var recoveryState = indexShard.recoveryState();
+        return recoveryState == null
+            ? null
+            : recoveryState.getIndex().recoveredFilesPercent();
+    }
+
+    private RetentionLeaseStats retentionLeaseStats() {
+        if (retentionLeaseStats == null) {
+            RetentionLeaseStats stats = indexShard.getRetentionLeaseStats();
+            retentionLeaseStats = stats;
+            return stats;
+        }
+        return retentionLeaseStats;
+    }
+
+    public Long retentionLeasesPrimaryTerm() {
+        try {
+            return retentionLeaseStats().leases().primaryTerm();
+        } catch (AlreadyClosedException | IndexShardClosedException e) {
+            return null;
+        }
+    }
+
+    public Long retentionLeasesVersion() {
+        try {
+            return retentionLeaseStats().leases().version();
+        } catch (AlreadyClosedException | IndexShardClosedException e) {
+            return null;
+        }
+    }
+
+    public Collection<RetentionLease> retentionLeases() {
+        try {
+            return retentionLeaseStats().leases().leases();
+        } catch (AlreadyClosedException | IndexShardClosedException e) {
+            return List.of();
+        }
+    }
+
+    public long flushCount() {
+        return indexShard.getFlushMetric().count();
+    }
+
+    public long flushTotalTimeNs() {
+        return indexShard.getFlushMetric().sum();
+    }
+
+    public long flushPeriodicCount() {
+        return indexShard.periodicFlushCount();
+    }
+
+    public MergeStats mergeStats() {
+        return mergeStats;
+    }
+
+    public long refreshCount() {
+        return indexShard.getRefreshMetric().count();
+    }
+
+    public long refreshTotalTimeNs() {
+        return indexShard.getRefreshMetric().sum();
+    }
+
+    public long refreshPendingCount() {
+        return indexShard.refreshListenerCount();
+    }
+
+    public void reset() {
+        translogStats = null;
+        seqNoStats = null;
+        retentionLeaseStats = null;
+    }
+}

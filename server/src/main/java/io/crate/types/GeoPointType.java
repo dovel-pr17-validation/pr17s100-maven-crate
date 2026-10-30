@@ -1,0 +1,285 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.types;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.text.ParseException;
+import java.util.List;
+import java.util.Locale;
+import java.util.function.Function;
+import java.util.function.Predicate;
+
+import org.elasticsearch.Version;
+import org.elasticsearch.common.io.stream.StreamInput;
+import org.elasticsearch.common.io.stream.StreamOutput;
+import org.elasticsearch.common.xcontent.DeprecationHandler;
+import org.elasticsearch.common.xcontent.NamedXContentRegistry;
+import org.elasticsearch.common.xcontent.XContentParser;
+import org.elasticsearch.common.xcontent.json.JsonXContent;
+import org.locationtech.spatial4j.context.jts.JtsSpatialContext;
+import org.locationtech.spatial4j.exception.InvalidShapeException;
+import org.locationtech.spatial4j.io.WKTReader;
+import org.locationtech.spatial4j.shape.Point;
+import org.locationtech.spatial4j.shape.impl.PointImpl;
+
+import io.crate.Streamer;
+import io.crate.execution.dml.GeoPointIndexer;
+import io.crate.execution.dml.ValueIndexer;
+import io.crate.expression.reference.doc.lucene.GeoPointColumnReference;
+import io.crate.expression.reference.doc.lucene.LuceneCollectorExpression;
+import io.crate.expression.reference.doc.lucene.SourceParser;
+import io.crate.metadata.ColumnIdent;
+import io.crate.metadata.Reference;
+import io.crate.metadata.RelationName;
+
+public class GeoPointType extends DataType<Point> implements Streamer<Point>, FixedWidthType {
+
+    public static final int ID = 13;
+    public static final String NAME = "geo_point";
+    public static final GeoPointType INSTANCE = new GeoPointType();
+    private static final StorageSupport<Point> STORAGE = new StorageSupport<>(true, false, null) {
+
+        @Override
+        public ValueIndexer<Point> valueIndexer(RelationName table,
+                                                Reference ref,
+                                                Function<ColumnIdent, Reference> getRef) {
+            return new GeoPointIndexer(ref);
+        }
+
+        @Override
+        public Point decode(ColumnIdent column, SourceParser sourceParser, Version tableVersion, byte[] bytes) {
+            var doubles = ByteBuffer.wrap(bytes).asDoubleBuffer();
+            return new PointImpl(doubles.get(0), doubles.get(1), JtsSpatialContext.GEO);
+        }
+
+        @Override
+        public boolean retrieveFromStoredFields() {
+            // there's a difference in precision between the stored value and the dv value
+            // so when we're retrieving for display or exact comparisons, go to the stored
+            // value
+            return true;
+        }
+
+        @Override
+        public LuceneCollectorExpression<Point> getLuceneExpression(Reference ref,
+                                                                    Predicate<Reference> isParentIgnored) {
+            return new GeoPointColumnReference(ref.storageIdent());
+        }
+
+        @Override
+        public Point decode(DataType<Point> type, XContentParser parser) throws IOException {
+            return type.implicitCast(parser.list());
+        }
+    };
+
+    private GeoPointType() {
+    }
+
+    public static final WKTReader WKT_READER = (WKTReader) JtsSpatialContext.GEO.getFormats().getWktReader();
+
+    @Override
+    public int id() {
+        return ID;
+    }
+
+    @Override
+    public Precedence precedence() {
+        return Precedence.GEO_POINT;
+    }
+
+    @Override
+    public String getName() {
+        return NAME;
+    }
+
+    @Override
+    public TypeSignature getTypeSignature() {
+        return TypeSignature.GEO_POINT;
+    }
+
+    @Override
+    public Streamer<Point> streamer() {
+        return this;
+    }
+
+    @Override
+    public Point implicitCast(Object value) throws IllegalArgumentException, ClassCastException {
+        if (value == null) {
+            return null;
+        } else if (value instanceof Point point) {
+            return point;
+        } else if (value instanceof Double[] doubles) {
+            checkLengthIs2(doubles.length);
+            return pointFromCoordinates(doubles[0], doubles[1]);
+        } else if (value instanceof Object[] values) {
+            checkLengthIs2(values.length);
+            return pointFromCoordinates(values[0], values[1]);
+        } else if (value instanceof String str) {
+            return pointFromString(str);
+        } else if (value instanceof List<?> values) {
+            checkLengthIs2(values.size());
+            return pointFromCoordinates(values.getFirst(), values.getLast());
+        } else {
+            throw new ClassCastException("Can't cast '" + value + "' to " + getName());
+        }
+    }
+
+    @Override
+    public Point sanitizeValue(Object value) {
+        if (value == null) {
+            return null;
+        } else if (value instanceof List<?> values) {
+            checkLengthIs2(values.size());
+            return pointFromCoordinates(values.getFirst(), values.getLast());
+        } else {
+            return (Point) value;
+        }
+    }
+
+    private static void ensurePointsInRange(double x, double y) {
+        if (!arePointsInRange(x, y)) {
+            throw new IllegalArgumentException(String.format(Locale.ENGLISH,
+                "Failed to validate geo point [lon=%f, lat=%f], not a valid location.",
+                x, y));
+        }
+    }
+
+    private static boolean arePointsInRange(double x, double y) {
+        return x >= -180.0d && x <= 180.0d && y >= -90.0d && y <= 90.0d;
+    }
+
+    private static void checkLengthIs2(int actualLength) {
+        if (actualLength != 2) {
+            throw new IllegalArgumentException(
+                "The value of a GeoPoint must be a double array with 2 items, not " + actualLength);
+        }
+    }
+
+    private static Point pointFromString(String value) {
+        String trimmed = value.trim();
+
+        if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+            return pointFromJsonArray(trimmed);
+        }
+
+        try {
+            return (Point) WKT_READER.parse(value);
+        } catch (ParseException | InvalidShapeException e) {
+            throw new IllegalArgumentException(String.format(Locale.ENGLISH,
+                "Cannot convert \"%s\" to geo_point. %s", value, e.getLocalizedMessage()), e);
+        }
+    }
+
+    private static Point pointFromJsonArray(String value) {
+        try (XContentParser parser = JsonXContent.JSON_XCONTENT.createParser(
+            NamedXContentRegistry.EMPTY,
+            DeprecationHandler.THROW_UNSUPPORTED_OPERATION,
+            value.getBytes(StandardCharsets.UTF_8)
+        )) {
+            List<Object> values = parser.list();
+            checkLengthIs2(values.size());
+            return pointFromCoordinates(values.getFirst(), values.getLast());
+        } catch (IOException e) {
+            throw new IllegalArgumentException("Cannot parse `" + value + "` as geo_point", e);
+        }
+    }
+
+    private static Point pointFromCoordinates(Object lon, Object lat) {
+        if (lon == null || lat == null) {
+            return null;
+        }
+        PointImpl point = new PointImpl(
+            ((Number) lon).doubleValue(),
+            ((Number) lat).doubleValue(),
+            JtsSpatialContext.GEO);
+        ensurePointsInRange(point.getX(), point.getY());
+        return point;
+    }
+
+    @Override
+    public int compare(Point val1, Point val2) {
+        if (val1 == null) {
+            return -1;
+        }
+        if (val2 == null) {
+            return 1;
+        }
+        // this is probably not really correct, but should be sufficient for the compareValueTo use case
+        // (which is ordering and equality check)
+        int latComp = Double.compare(val1.getX(), val2.getX());
+        if (latComp != 0) {
+            return latComp;
+        }
+        return Double.compare(val1.getY(), val2.getY());
+    }
+
+    @Override
+    public Point readValueFrom(StreamInput in) throws IOException {
+        if (in.readBoolean()) {
+            return new PointImpl(in.readDouble(), in.readDouble(), JtsSpatialContext.GEO);
+        } else {
+            return null;
+        }
+    }
+
+    @Override
+    public void writeValueTo(StreamOutput out, Point point) throws IOException {
+        if (point == null) {
+            out.writeBoolean(false);
+        } else {
+            out.writeBoolean(true);
+            out.writeDouble(point.getX());
+            out.writeDouble(point.getY());
+        }
+    }
+
+    @Override
+    public int fixedSize() {
+        return 40; // 2x double + array overhead
+    }
+
+    @Override
+    public long valueBytes(Point value) {
+        return 40;
+    }
+
+    @Override
+    public boolean isConvertableTo(DataType<?> other, boolean explicitCast) {
+        if (other.id() == id()
+            || other instanceof ArrayType && ((ArrayType<?>) other).innerType().equals(DataTypes.DOUBLE)) {
+            return true;
+        }
+        return super.isConvertableTo(other, explicitCast);
+    }
+
+    @Override
+    public StorageSupport<Point> storageSupport() {
+        return STORAGE;
+    }
+
+    @Override
+    public Sort sortSupport() {
+        return Sort.COMPARATOR;
+    }
+}

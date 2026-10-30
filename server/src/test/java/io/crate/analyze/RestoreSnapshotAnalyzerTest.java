@@ -1,0 +1,469 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.analyze;
+
+import static io.crate.analyze.RestoreSnapshotAnalyzer.METADATA_CUSTOM_TYPE_MAP;
+import static io.crate.analyze.RestoreSnapshotAnalyzer.USER_MANAGEMENT_METADATA;
+import static io.crate.analyze.TableDefinitions.TEST_DOC_LOCATIONS_TABLE_DEFINITION;
+import static io.crate.analyze.TableDefinitions.TEST_PARTITIONED_TABLE_DEFINITION;
+import static io.crate.analyze.TableDefinitions.TEST_PARTITIONED_TABLE_PARTITIONS;
+import static io.crate.analyze.TableDefinitions.USER_TABLE_DEFINITION;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+import java.io.IOException;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+
+import org.assertj.core.api.Assertions;
+import org.elasticsearch.action.admin.cluster.snapshots.create.CreateSnapshotRequest;
+import org.elasticsearch.cluster.ClusterName;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.metadata.Metadata;
+import org.elasticsearch.cluster.metadata.RepositoriesMetadata;
+import org.elasticsearch.cluster.metadata.RepositoryMetadata;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.repositories.RepositoryMissingException;
+import org.elasticsearch.test.ClusterServiceUtils;
+import org.junit.Before;
+import org.junit.Test;
+
+import io.crate.data.Row;
+import io.crate.exceptions.OperationOnInaccessibleRelationException;
+import io.crate.exceptions.PartitionUnknownException;
+import io.crate.exceptions.RelationUnknown;
+import io.crate.exceptions.SchemaUnknownException;
+import io.crate.metadata.PartitionName;
+import io.crate.metadata.RelationName;
+import io.crate.metadata.doc.DocSchemaInfo;
+import io.crate.metadata.settings.AnalyzerSettings;
+import io.crate.planner.PlannerContext;
+import io.crate.planner.node.ddl.CreateSnapshotPlan;
+import io.crate.planner.node.ddl.RestoreSnapshotPlan;
+import io.crate.planner.operators.SubQueryResults;
+import io.crate.test.integration.CrateDummyClusterServiceUnitTest;
+import io.crate.testing.SQLExecutor;
+
+public class RestoreSnapshotAnalyzerTest extends CrateDummyClusterServiceUnitTest {
+
+    private SQLExecutor e;
+    private PlannerContext plannerContext;
+
+    @Before
+    public void prepare() throws IOException {
+        RepositoriesMetadata repositoriesMetadata = new RepositoriesMetadata(
+            Collections.singletonList(
+                new RepositoryMetadata(
+                    "my_repo",
+                    "fs",
+                    Settings.builder().put("location", "/tmp/my_repo").build()
+            )));
+        ClusterState clusterState = ClusterState.builder(new ClusterName("testing"))
+            .metadata(new Metadata.Builder(Metadata.OID_UNASSIGNED)
+                .putCustom(RepositoriesMetadata.TYPE, repositoriesMetadata))
+            .build();
+        ClusterServiceUtils.setState(clusterService, clusterState);
+        e = SQLExecutor.of(clusterService)
+            .addTable(USER_TABLE_DEFINITION)
+            .addTable(TEST_DOC_LOCATIONS_TABLE_DEFINITION)
+            .addTable(TEST_PARTITIONED_TABLE_DEFINITION, TEST_PARTITIONED_TABLE_PARTITIONS)
+            .addBlobTable("create blob table my_blobs");
+        plannerContext = e.getPlannerContext();
+    }
+
+    @SuppressWarnings({"unchecked"})
+    private <T> T analyze(SQLExecutor e, String statement) {
+        AnalyzedStatement analyzedStatement = e.analyze(statement);
+        if (analyzedStatement instanceof AnalyzedCreateSnapshot) {
+            return (T) CreateSnapshotPlan.createRequest(
+                (AnalyzedCreateSnapshot) analyzedStatement,
+                plannerContext.transactionContext(),
+                plannerContext.nodeContext(),
+                Row.EMPTY,
+                SubQueryResults.EMPTY,
+                e.schemas(),
+                e.getPlannerContext().clusterState().metadata());
+        } else if (analyzedStatement instanceof AnalyzedRestoreSnapshot) {
+            return (T) RestoreSnapshotPlan.bind(
+                (AnalyzedRestoreSnapshot) analyzedStatement,
+                plannerContext.transactionContext(),
+                plannerContext.nodeContext(),
+                Row.EMPTY,
+                SubQueryResults.EMPTY,
+                e.schemas());
+        } else {
+            return e.analyze(statement);
+        }
+    }
+
+    @Test
+    public void testCreateSnapshotAll() throws Exception {
+        CreateSnapshotRequest request = analyze(
+            e,
+            "CREATE SNAPSHOT my_repo.my_snapshot ALL WITH (wait_for_completion=true)");
+        assertThat(request.relationNames()).isEmpty();
+        assertThat(request.repository()).isEqualTo("my_repo");
+        assertThat(request.snapshot()).isEqualTo("my_snapshot");
+        assertThat(request.settings().getAsStructuredMap()).containsExactly(
+            Map.entry("wait_for_completion", "true"));
+    }
+
+    @Test
+    public void testCreateSnapshotUnknownRepo() throws Exception {
+        assertThatThrownBy(() -> analyze(e, "CREATE SNAPSHOT unknown_repo.my_snapshot ALL"))
+            .isExactlyInstanceOf(RepositoryMissingException.class)
+            .hasMessage("[unknown_repo] missing");
+    }
+
+    @Test
+    public void testCreateSnapshotUnsupportedParameter() throws Exception {
+        assertThatThrownBy(() -> analyze(e, "CREATE SNAPSHOT my_repo.my_snapshot ALL with (foo=true)"))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessage("Setting 'foo' is not supported");
+    }
+
+    @Test
+    public void testCreateSnapshotUnknownTables() throws Exception {
+        assertThatThrownBy(() -> analyze(e, "CREATE SNAPSHOT my_repo.my_snapshot TABLE users, t2, custom.users"))
+            .isExactlyInstanceOf(RelationUnknown.class)
+            .hasMessage("Relation 't2' unknown");
+    }
+
+    @Test
+    public void testCreateSnapshotUnknownSchema() throws Exception {
+        assertThatThrownBy(() -> analyze(e, "CREATE SNAPSHOT my_repo.my_snapshot TABLE users, myschema.users"))
+            .isExactlyInstanceOf(SchemaUnknownException.class)
+            .hasMessage("Schema 'myschema' unknown");
+    }
+
+    @Test
+    public void testCreateSnapshotUnknownPartition() throws Exception {
+        assertThatThrownBy(
+            () -> analyze(e, "CREATE SNAPSHOT my_repo.my_snapshot TABLE parted PARTITION (date='1970-01-01')"))
+            .isExactlyInstanceOf(PartitionUnknownException.class)
+            .hasMessage("No partition for table 'doc.parted' with ident '04130' exists");
+    }
+
+    @Test
+    public void testCreateSnapshotUnknownTableIgnore() throws Exception {
+        CreateSnapshotRequest request = analyze(
+            e,
+            "CREATE SNAPSHOT my_repo.my_snapshot TABLE users, t2 WITH (ignore_unavailable=true)");
+        assertThat(request.relationNames()).containsExactly(new RelationName("doc", "users"));
+    }
+
+    @Test
+    public void testCreateSnapshotUnknownSchemaIgnore() throws Exception {
+        CreateSnapshotRequest request = analyze(
+            e,
+            "CREATE SNAPSHOT my_repo.my_snapshot TABLE users, my_schema.t2 WITH (ignore_unavailable=true)");
+        assertThat(request.relationNames()).containsExactly(new RelationName("doc", "users"));
+    }
+
+    @Test
+    public void testCreateSnapshotCreateSnapshotTables() throws Exception {
+        CreateSnapshotRequest request = analyze(
+            e,
+            "CREATE SNAPSHOT my_repo.my_snapshot TABLE users, locations " +
+            "WITH (wait_for_completion=true)");
+        assertThat(request.includeGlobalState()).isFalse();
+        assertThat(request.relationNames()).containsExactlyInAnyOrder(new RelationName("doc", "users"), new RelationName("doc", "locations"));
+        assertThat(request.repository()).isEqualTo("my_repo");
+        assertThat(request.snapshot()).isEqualTo("my_snapshot");
+        assertThat(request.settings().getAsStructuredMap()).containsExactly(Map.entry("wait_for_completion", "true"));
+    }
+
+    @Test
+    public void testCreateSnapshotNoRepoName() throws Exception {
+        assertThatThrownBy(() -> analyze(e, "CREATE SNAPSHOT my_snapshot TABLE users "))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessage("Snapshot must be specified by \"<repository_name>\".\"<snapshot_name>\"");
+    }
+
+    @Test
+    public void testCreateSnapshotInvalidRepoName() throws Exception {
+        assertThatThrownBy(() -> analyze(e, "CREATE SNAPSHOT my.repo.my_snapshot ALL"))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessage("Invalid repository name 'my.repo'");
+    }
+
+    @Test
+    public void testCreateSnapshotSnapshotSysTable() throws Exception {
+        assertThatThrownBy(() -> analyze(e, "CREATE SNAPSHOT my_repo.my_snapshot TABLE sys.shards"))
+            .isExactlyInstanceOf(OperationOnInaccessibleRelationException.class)
+            .hasMessage("The relation \"sys.shards\" doesn't support or allow " +
+                        "CREATE SNAPSHOT operations");
+    }
+
+    @Test
+    public void testCreateSnapshotNoWildcards() throws Exception {
+        assertThatThrownBy(() -> analyze(e, "CREATE SNAPSHOT my_repo.my_snapshot TABLE \"foobar*\""))
+            .isExactlyInstanceOf(RelationUnknown.class)
+            .hasMessage("Relation 'foobar*' unknown");
+    }
+
+    @Test
+    public void testCreateSnapshotFromBlobTable() throws Exception {
+        assertThatThrownBy(() -> analyze(e, "CREATE SNAPSHOT my_repo.my_snapshot TABLE blob.my_blobs"))
+            .isExactlyInstanceOf(OperationOnInaccessibleRelationException.class)
+            .hasMessage("The relation \"blob.my_blobs\" doesn't support or allow CREATE SNAPSHOT operations");
+    }
+
+    @Test
+    public void testCreateSnapshotListTablesTwice() throws Exception {
+        CreateSnapshotRequest request = analyze(
+            e,
+            "CREATE SNAPSHOT my_repo.my_snapshot TABLE users, locations, users");
+        assertThat(request.relationNames()).containsExactlyInAnyOrder(new RelationName("doc", "users"), new RelationName("doc", "locations"));
+    }
+
+    @Test
+    public void testCreateSnapshotListPartitionsAndPartitionedTable() throws Exception {
+        CreateSnapshotRequest request = analyze(
+            e,
+            "CREATE SNAPSHOT my_repo.my_snapshot TABLE parted, parted PARTITION (date=1395961200000)");
+        assertThat(request.relationNames()).containsExactly(new RelationName("doc", "parted"));
+        assertThat(request.partitionNames()).containsExactly(new PartitionName(new RelationName("doc", "parted"), List.of("1395961200000")));
+        assertThat(request.includeGlobalState()).isFalse();
+    }
+
+    @Test
+    public void testDropSnapshot() throws Exception {
+        AnalyzedDropSnapshot statement = analyze(e, "DROP SNAPSHOT my_repo.my_snap_1");
+        assertThat(statement.repository()).isEqualTo("my_repo");
+        assertThat(statement.snapshot()).isEqualTo("my_snap_1");
+    }
+
+    @Test
+    public void testDropSnapshotUnknownRepo() throws Exception {
+        assertThatThrownBy(() -> analyze(e, "DROP SNAPSHOT unknown_repo.my_snap_1"))
+            .isExactlyInstanceOf(RepositoryMissingException.class)
+            .hasMessage("[unknown_repo] missing");
+    }
+
+    @Test
+    public void testRestoreSnapshotAll() throws Exception {
+        BoundRestoreSnapshot statement =
+            analyze(e, "RESTORE SNAPSHOT my_repo.my_snapshot ALL");
+        assertThat(statement.repository()).isEqualTo("my_repo");
+        assertThat(statement.snapshot()).isEqualTo("my_snapshot");
+        assertThat(statement.restoreTables().isEmpty()).isTrue();
+        assertThat(statement.includeTables()).isTrue();
+        assertThat(statement.includeCustomMetadata()).isTrue();
+        assertThat(statement.includeGlobalSettings()).isTrue();
+    }
+
+    @Test
+    public void testRestoreSnapshotSingleTable() throws Exception {
+        BoundRestoreSnapshot statement =
+            analyze(e, "RESTORE SNAPSHOT my_repo.my_snapshot TABLE custom.restoreme");
+        assertThat(statement.restoreTables()).hasSize(1);
+        var table = statement.restoreTables().iterator().next();
+        assertThat(table.tableIdent()).isEqualTo(new RelationName("custom", "restoreme"));
+        assertThat(table.partitionName()).isNull();
+        assertThat(statement.includeTables()).isTrue();
+        assertThat(statement.includeCustomMetadata()).isFalse();
+        assertThat(statement.includeGlobalSettings()).isFalse();
+    }
+
+    @Test
+    public void test_restore_foreign_table_existing_in_cluster() throws Exception {
+        e.addServer("pg", "jdbc", "crate", Settings.builder().put("url", "jdbc:postgresql://localhost:5432/").build())
+            .addForeignTable("create foreign table custom.remote (x int) server pg");
+        BoundRestoreSnapshot statement =
+            analyze(e, "RESTORE SNAPSHOT my_repo.my_snapshot TABLE custom.remote");
+        assertThat(statement.restoreTables()).satisfiesExactly(
+            table -> {
+                assertThat(table.tableIdent()).isEqualTo(new RelationName("custom", "remote"));
+                assertThat(table.partitionName()).isNull();
+            }
+        );
+    }
+
+    @Test
+    public void test_restore_view_existing_in_cluster() throws Exception {
+        e.addView(new RelationName("custom", "my_view"), "SELECT 1");
+        BoundRestoreSnapshot statement =
+            analyze(e, "RESTORE SNAPSHOT my_repo.my_snapshot TABLE custom.my_view");
+        assertThat(statement.restoreTables()).satisfiesExactly(
+            table -> {
+                assertThat(table.tableIdent()).isEqualTo(new RelationName("custom", "my_view"));
+                assertThat(table.partitionName()).isNull();
+            }
+        );
+    }
+
+    @Test
+    public void test_restore_foreign_table_existing_in_cluster_with_partition_clause_fails() throws Exception {
+        e.addServer("pg", "jdbc", "crate", Settings.builder().put("url", "jdbc:postgresql://localhost:5432/").build())
+            .addForeignTable("create foreign table custom.remote (x int) server pg");
+        assertThatThrownBy(() -> analyze(e, "RESTORE SNAPSHOT my_repo.my_snapshot TABLE custom.remote PARTITION (x = 1)"))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessage("relation 'custom.remote' is not partitioned");
+    }
+
+    @Test
+    public void test_restore_view_existing_in_cluster_with_partition_clause_fails() throws Exception {
+        e.addView(new RelationName("custom", "my_view"), "SELECT 1");
+        assertThatThrownBy(() -> analyze(e, "RESTORE SNAPSHOT my_repo.my_snapshot TABLE custom.my_view PARTITION (x = 1)"))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessage("relation 'custom.my_view' is not partitioned");
+    }
+
+    @Test
+    public void testRestoreUnsupportedParameter() throws Exception {
+        assertThatThrownBy(() -> analyze(e, "RESTORE SNAPSHOT my_repo.my_snapshot TABLE users WITH (foo=true)"))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessage("Setting 'foo' is not supported");
+    }
+
+    @Test
+    public void testRestoreSinglePartition() throws Exception {
+        BoundRestoreSnapshot statement = analyze(
+            e,
+            "RESTORE SNAPSHOT my_repo.my_snapshot TABLE parted PARTITION (date=123)");
+        PartitionName partition = new PartitionName(
+            new RelationName("doc", "parted"), List.of("123"));
+        assertThat(statement.restoreTables()).hasSize(1);
+        var table = statement.restoreTables().iterator().next();
+        assertThat(table.partitionName()).isEqualTo(partition);
+        assertThat(table.tableIdent()).isEqualTo(new RelationName(DocSchemaInfo.NAME, "parted"));
+        assertThat(statement.includeTables()).isTrue();
+        assertThat(statement.includeCustomMetadata()).isFalse();
+        assertThat(statement.includeGlobalSettings()).isFalse();
+    }
+
+    @Test
+    public void testRestoreSinglePartitionToUnknownTable() throws Exception {
+        BoundRestoreSnapshot statement = analyze(
+            e,
+            "RESTORE SNAPSHOT my_repo.my_snapshot TABLE unknown_parted PARTITION (date=123)");
+        PartitionName partitionName = new PartitionName(
+            new RelationName("doc", "unknown_parted"), List.of("123"));
+        assertThat(statement.restoreTables()).hasSize(1);
+        var table = statement.restoreTables().iterator().next();
+        assertThat(table.partitionName()).isEqualTo(partitionName);
+        assertThat(table.tableIdent()).isEqualTo(new RelationName(DocSchemaInfo.NAME, "unknown_parted"));
+    }
+
+    @Test
+    public void testRestoreUnknownRepo() throws Exception {
+        assertThatThrownBy(() -> analyze(e, "RESTORE SNAPSHOT unknown_repo.my_snapshot ALL"))
+            .isExactlyInstanceOf(RepositoryMissingException.class)
+            .hasMessage("[unknown_repo] missing");
+    }
+
+    @Test
+    public void test_restore_all_tables() {
+        BoundRestoreSnapshot statement =
+            analyze(e, "RESTORE SNAPSHOT my_repo.my_snapshot TABLES");
+        assertThat(statement.repository()).isEqualTo("my_repo");
+        assertThat(statement.snapshot()).isEqualTo("my_snapshot");
+        assertThat(statement.restoreTables().isEmpty()).isTrue();
+        assertThat(statement.includeTables()).isTrue();
+        assertThat(statement.includeCustomMetadata()).isFalse();
+        assertThat(statement.customMetadataTypes().isEmpty()).isTrue();
+        assertThat(statement.includeGlobalSettings()).isFalse();
+        assertThat(statement.globalSettings().isEmpty()).isTrue();
+    }
+
+    @Test
+    public void test_restore_all_metadata() {
+        BoundRestoreSnapshot statement =
+            analyze(e, "RESTORE SNAPSHOT my_repo.my_snapshot METADATA");
+        assertThat(statement.repository()).isEqualTo("my_repo");
+        assertThat(statement.snapshot()).isEqualTo("my_snapshot");
+        assertThat(statement.restoreTables().isEmpty()).isTrue();
+        assertThat(statement.includeTables()).isFalse();
+        assertThat(statement.includeCustomMetadata()).isTrue();
+        assertThat(statement.customMetadataTypes().isEmpty()).isTrue();
+        assertThat(statement.includeGlobalSettings()).isTrue();
+        assertThat(statement.globalSettings()).containsExactly(AnalyzerSettings.CUSTOM_ANALYSIS_SETTINGS_PREFIX);
+    }
+
+    @Test
+    public void test_restore_analyzers() {
+        BoundRestoreSnapshot statement =
+            analyze(e, "RESTORE SNAPSHOT my_repo.my_snapshot ANALYZERS");
+        assertThat(statement.repository()).isEqualTo("my_repo");
+        assertThat(statement.snapshot()).isEqualTo("my_snapshot");
+        assertThat(statement.restoreTables().isEmpty()).isTrue();
+        assertThat(statement.includeTables()).isFalse();
+        assertThat(statement.includeCustomMetadata()).isFalse();
+        assertThat(statement.customMetadataTypes().isEmpty()).isTrue();
+        assertThat(statement.includeGlobalSettings()).isTrue();
+        assertThat(statement.globalSettings()).containsExactly(AnalyzerSettings.CUSTOM_ANALYSIS_SETTINGS_PREFIX);
+    }
+
+    @Test
+    public void test_restore_custom_metadata() {
+        for (var meta : List.of("USERMANAGEMENT", "UDFS")) {
+            BoundRestoreSnapshot statement =
+                analyze(e, "RESTORE SNAPSHOT my_repo.my_snapshot " + meta);
+            assertThat(statement.repository()).isEqualTo("my_repo");
+            assertThat(statement.snapshot()).isEqualTo("my_snapshot");
+            assertThat(statement.restoreTables().isEmpty()).isTrue();
+            assertThat(statement.includeTables()).isFalse();
+            assertThat(statement.includeViews()).isFalse();
+            assertThat(statement.includeCustomMetadata()).isTrue();
+            assertThat(statement.customMetadataTypes())
+                .containsExactlyInAnyOrderElementsOf(METADATA_CUSTOM_TYPE_MAP.get(meta));
+            assertThat(statement.includeGlobalSettings()).isFalse();
+            assertThat(statement.globalSettings().isEmpty()).isTrue();
+        }
+    }
+
+    @Test
+    public void test_restore_user_mananagement_metadata() {
+        BoundRestoreSnapshot statement = analyze(e, "RESTORE SNAPSHOT my_repo.my_snapshot USERMANAGEMENT");
+        assertThat(statement.repository()).isEqualTo("my_repo");
+        assertThat(statement.snapshot()).isEqualTo("my_snapshot");
+        assertThat(statement.includeTables()).isFalse();
+        assertThat(statement.restoreTables().isEmpty()).isTrue();
+        assertThat(statement.includeCustomMetadata()).isTrue();
+        assertThat(statement.customMetadataTypes()).containsExactlyInAnyOrderElementsOf(USER_MANAGEMENT_METADATA);
+        assertThat(statement.includeGlobalSettings()).isFalse();
+        assertThat(statement.globalSettings().isEmpty()).isTrue();
+    }
+
+    @Test
+    public void test_restore_tables_and_views() {
+        BoundRestoreSnapshot statement =
+            analyze(e, "RESTORE SNAPSHOT my_repo.my_snapshot TABLES, VIEWS");
+        assertThat(statement.repository()).isEqualTo("my_repo");
+        assertThat(statement.snapshot()).isEqualTo("my_snapshot");
+        assertThat(statement.includeTables()).isTrue();
+        assertThat(statement.includeViews()).isTrue();
+        assertThat(statement.includeCustomMetadata()).isFalse();
+        assertThat(statement.customMetadataTypes()).isEmpty();
+        assertThat(statement.includeGlobalSettings()).isFalse();
+        assertThat(statement.globalSettings().isEmpty()).isTrue();
+    }
+
+    @Test
+    public void test_restore_unknown_metadata() {
+        Assertions.assertThatThrownBy(() -> analyze(e, "RESTORE SNAPSHOT my_repo.my_snapshot UNKNOWN_META"))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("Unknown metadata type 'UNKNOWN_META'");
+    }
+}

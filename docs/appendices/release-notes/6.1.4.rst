@@ -1,0 +1,60 @@
+.. _version_6.1.4:
+
+=============
+Version 6.1.4
+=============
+
+Released on 2026-04-17.
+
+.. NOTE::
+
+    If you are upgrading a cluster, you must be running CrateDB 5.0.0 or higher
+    before you upgrade to 6.1.4.
+
+    We recommend that you upgrade to the latest 6.0 release before moving to
+    6.1.4.
+
+    A rolling upgrade from >= 6.0.2 to 6.1.4 is supported.
+    Before upgrading, you should `back up your data`_.
+
+.. WARNING::
+
+    Tables that were created before CrateDB 5.x will not function with 6.x
+    and must be recreated before moving to 6.x.x.
+
+    You can recreate tables using ``COPY TO`` and ``COPY FROM`` or by
+    `inserting the data into a new table`_.
+
+.. _back up your data: https://cratedb.com/docs/crate/reference/en/latest/admin/snapshots.html
+.. _inserting the data into a new table: https://cratedb.com/docs/crate/reference/en/latest/admin/system-information.html#tables-need-to-be-recreated
+
+.. rubric:: Table of contents
+
+.. contents::
+   :local:
+
+
+See the :ref:`version_6.1.0` release notes for a full list of changes in the 6.1
+series.
+
+Fixes
+=====
+
+- Fixed an issue that caused :ref:`swap table <alter_cluster_swap_table>` or
+  :ref:`drop table <drop-table>` to cause temporary metadata corruption if
+  run during a rolling upgrade from 5.10.x. The corruption can be recovered by
+  restarting the upgraded nodes. Rolling upgrades from 6.0+ to 6.2.2 weren't
+  affected.
+
+- Fixed an issue that caused :ref:`swap table <alter_cluster_swap_table>` on
+  partitioned tables to be rejected with ``IllegalStateException`` due to wrong
+  version upgrade migration logic. Only tables created on or before 5.10.x are
+  affected.
+
+- Fixed an issue that could lead to data loss for due to corruption of the
+  metadata for tables created before :ref:`version_5.5.0`, when the cluster is
+  upgraded to versions :ref:`version_6.0.0` or newer, and certain actions take
+  place on these tables, e.g.: ``ALTER TABLE SET <config_param>=value``,
+  dropping a partition, etc. The corruption will cause all columns to return
+  ``NULL`` values, for all existing data in the table, whereas new data (via
+  ``INSERT`` or ``UPDATE``), can be retrieved normally.

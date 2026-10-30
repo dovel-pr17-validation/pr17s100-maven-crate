@@ -1,0 +1,448 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.metadata;
+
+import static org.elasticsearch.cluster.metadata.Metadata.OID_UNASSIGNED;
+
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
+import java.util.function.IntSupplier;
+import java.util.function.LongSupplier;
+
+import org.apache.lucene.util.RamUsageEstimator;
+import org.elasticsearch.Version;
+import org.elasticsearch.common.io.stream.StreamInput;
+import org.elasticsearch.common.io.stream.StreamOutput;
+import org.jspecify.annotations.Nullable;
+
+import io.crate.expression.scalar.cast.CastMode;
+import io.crate.expression.symbol.Symbol;
+import io.crate.expression.symbol.SymbolType;
+import io.crate.expression.symbol.SymbolVisitor;
+import io.crate.expression.symbol.format.Style;
+import io.crate.metadata.doc.DocTableInfoFactory;
+import io.crate.sql.tree.ColumnPolicy;
+import io.crate.types.ArrayType;
+import io.crate.types.DataType;
+import io.crate.types.DataTypes;
+import io.crate.types.DataTypesBwc;
+import io.crate.types.ObjectType;
+import io.crate.types.StorageSupport;
+
+public class SimpleReference implements Reference {
+
+    private static final long SHALLOW_SIZE = RamUsageEstimator.shallowSizeOfInstance(SimpleReference.class);
+
+    protected DataType<?> type;
+
+    protected final int position;
+    protected final long oid;
+    protected boolean isDropped;
+
+    protected final RelationName relation;
+    protected final ColumnIdent column;
+    protected final RowGranularity granularity;
+    protected final IndexType indexType;
+    protected final boolean nullable;
+    protected final boolean hasDocValues;
+
+    @Nullable
+    protected final Symbol defaultExpression;
+
+    public SimpleReference(RelationName relation,
+                           ColumnIdent column,
+                           RowGranularity granularity,
+                           DataType<?> type,
+                           int position,
+                           @Nullable Symbol defaultExpression) {
+        this(relation,
+             column,
+             granularity,
+             type,
+             IndexType.PLAIN,
+             true,
+             false,
+             position,
+            OID_UNASSIGNED,
+             false,
+             defaultExpression);
+    }
+
+    public SimpleReference(RelationName relation,
+                           ColumnIdent column,
+                           RowGranularity granularity,
+                           DataType<?> type,
+                           IndexType indexType,
+                           boolean nullable,
+                           boolean hasDocValues,
+                           int position,
+                           long oid,
+                           boolean isDropped,
+                           @Nullable Symbol defaultExpression) {
+        this.position = position;
+        this.relation = relation;
+        this.column = column;
+        this.type = type;
+        this.granularity = granularity;
+        this.indexType = indexType;
+        this.nullable = nullable;
+        this.hasDocValues = hasDocValues;
+        this.oid = oid;
+        this.isDropped = isDropped;
+        if (defaultExpression == null) {
+            this.defaultExpression = null;
+        } else {
+            if (defaultExpression.hasFunctionType(FunctionType.TABLE)) {
+                throw new UnsupportedOperationException(
+                    "Cannot use table function in default expression of column `" + column.fqn() + "`");
+            }
+            this.defaultExpression = defaultExpression.cast(type, CastMode.IMPLICIT);
+        }
+    }
+
+    public SimpleReference(StreamInput in) throws IOException {
+        column = ColumnIdent.of(in);
+        relation = new RelationName(in);
+        position = in.readVInt();
+        Version version = in.getVersion();
+        if (version.onOrAfter(Version.V_5_5_0)) {
+            oid = in.readLong();
+            isDropped = in.readBoolean();
+        } else {
+            oid = OID_UNASSIGNED;
+            isDropped = false;
+        }
+        type = DataTypes.fromStream(in);
+        granularity = RowGranularity.fromStream(in);
+
+        if (version.before(Version.V_5_10_0)) {
+            ColumnPolicy columnPolicy = ColumnPolicy.VALUES.get(in.readVInt());
+            int dimensions = ArrayType.dimensions(type);
+            if (ArrayType.unnest(type) instanceof ObjectType objectType) {
+                ObjectType.Builder builder = ObjectType.of(columnPolicy);
+                for (var innerType : objectType.innerTypes().entrySet()) {
+                    builder.setInnerType(innerType.getKey(), innerType.getValue());
+                }
+                type = ArrayType.makeArray(builder.build(), dimensions);
+            }
+        }
+        indexType = IndexType.fromStream(in);
+        nullable = in.readBoolean();
+
+        // property was "columnStoreDisabled" so need to reverse the value.
+        hasDocValues = !in.readBoolean();
+        final boolean hasDefaultExpression = in.readBoolean();
+        defaultExpression = hasDefaultExpression
+            ? Symbol.fromStream(in)
+            : null;
+    }
+
+    @Override
+    public void writeTo(StreamOutput out) throws IOException {
+        column.writeTo(out);
+        relation.writeTo(out);
+        out.writeVInt(position);
+        Version version = out.getVersion();
+        if (version.onOrAfter(Version.V_5_5_0)) {
+            out.writeLong(oid);
+            out.writeBoolean(isDropped);
+        }
+        DataTypes.toStream(type, out);
+        RowGranularity.toStream(granularity, out);
+
+        if (version.before(Version.V_5_10_0)) {
+            out.writeVInt(valueType().columnPolicy().ordinal());
+        }
+        out.writeVInt(indexType.ordinal());
+        out.writeBoolean(nullable);
+        // property was "columnStoreDisabled" so need to reverse the value.
+        out.writeBoolean(!hasDocValues);
+        Symbol.nullableToStream(defaultExpression, out);
+    }
+
+    @Override
+    public Reference withColumn(ColumnIdent column) {
+        return new SimpleReference(
+            relation,
+            column,
+            granularity,
+            type,
+            indexType,
+            nullable,
+            hasDocValues,
+            position,
+            oid,
+            isDropped,
+            defaultExpression
+        );
+    }
+
+    /**
+     * Returns a cloned Reference with the given ident
+     */
+    @Override
+    public Reference withRelation(RelationName relation) {
+        return new SimpleReference(
+            relation,
+            column,
+            granularity,
+            type,
+            indexType,
+            nullable,
+            hasDocValues,
+            position,
+            oid,
+            isDropped,
+            defaultExpression
+        );
+    }
+
+    @Override
+    public Reference withOidAndPosition(LongSupplier acquireOid, IntSupplier acquirePosition) {
+        long newOid = oid == OID_UNASSIGNED ? acquireOid.getAsLong() : oid;
+        int newPosition = position < 0 ? acquirePosition.getAsInt() : position;
+        if (newOid == oid && newPosition == position) {
+            return this;
+        }
+        return new SimpleReference(
+            relation,
+            column,
+            granularity,
+            type,
+            indexType,
+            nullable,
+            hasDocValues,
+            newPosition,
+            newOid,
+            isDropped,
+            defaultExpression
+        );
+    }
+
+    @Override
+    public Reference withDropped(boolean dropped) {
+        return new SimpleReference(
+            relation,
+            column,
+            granularity,
+            type,
+            indexType,
+            nullable,
+            hasDocValues,
+            position,
+            oid,
+            dropped,
+            defaultExpression
+        );
+    }
+
+    @Override
+    public Reference withValueType(DataType<?> newType) {
+        return new SimpleReference(
+            relation,
+            column,
+            granularity,
+            newType,
+            indexType,
+            nullable,
+            hasDocValues,
+            position,
+            oid,
+            isDropped,
+            defaultExpression
+        );
+    }
+
+    @Override
+    public Reference withDefaultExpression(@Nullable Symbol defaultExpression) {
+        return new SimpleReference(
+            relation,
+            column,
+            granularity,
+            type,
+            indexType,
+            nullable,
+            hasDocValues,
+            position,
+            oid,
+            isDropped,
+            defaultExpression
+        );
+    }
+
+    @Override
+    public SymbolType symbolType() {
+        return SymbolType.REFERENCE;
+    }
+
+    @Override
+    public <C, R> R accept(SymbolVisitor<C, R> visitor, C context) {
+        return visitor.visitReference(this, context);
+    }
+
+    @Override
+    public DataType<?> valueType() {
+        return type;
+    }
+
+    @Override
+    public String toString() {
+        return toString(Style.UNQUALIFIED);
+    }
+
+    @Override
+    public String toString(Style style) {
+        if (style == Style.QUALIFIED) {
+            return relation.sqlFqn() + '.' + column().quotedOutputName();
+        }
+        return column().quotedOutputName();
+    }
+
+    @Override
+    public RelationName relation() {
+        return relation;
+    }
+
+    @Override
+    public ColumnIdent column() {
+        return column;
+    }
+
+    @Override
+    public RowGranularity granularity() {
+        return granularity;
+    }
+
+    @Override
+    public IndexType indexType() {
+        return indexType;
+    }
+
+    @Override
+    public boolean isNullable() {
+        return nullable;
+    }
+
+    @Override
+    public boolean hasDocValues() {
+        return hasDocValues;
+    }
+
+    @Override
+    public int position() {
+        return position;
+    }
+
+    @Override
+    public long oid() {
+        return oid;
+    }
+
+    @Override
+    public boolean isDropped() {
+        return isDropped;
+    }
+
+    @Nullable
+    @Override
+    public Symbol defaultExpression() {
+        return defaultExpression;
+    }
+
+    @Override
+    public boolean isGenerated() {
+        return false;
+    }
+
+    @Override
+    public Map<String, Object> toMapping(int position) {
+        DataType<?> innerType = ArrayType.unnest(type);
+        Map<String, Object> mapping = new HashMap<>();
+        mapping.put("type", DataTypesBwc.esMappingNameFrom(innerType.id()));
+        mapping.put("position", position);
+        if (oid != OID_UNASSIGNED) {
+            mapping.put("oid", oid);
+        }
+        if (isDropped) {
+            mapping.put("dropped", true);
+        }
+        if (indexType == IndexType.NONE && type.id() != ObjectType.ID) {
+            mapping.put("index", false);
+        }
+        StorageSupport<?> storageSupport = innerType.storageSupport();
+        if (storageSupport != null) {
+            boolean docValuesDefault = storageSupport.getComputedDocValuesDefault(indexType);
+            if (docValuesDefault != hasDocValues) {
+                mapping.put(DocTableInfoFactory.MappingKeys.DOC_VALUES, Boolean.toString(hasDocValues));
+            }
+        }
+        if (defaultExpression != null) {
+            mapping.put("default_expr", defaultExpression.toString(Style.UNQUALIFIED));
+        }
+        innerType.addMappingOptions(mapping);
+        return mapping;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        return this == o || (
+            o instanceof SimpleReference ref
+            && oid == ref.oid
+            && position == ref.position
+            && column.equals(ref.column)
+            && type.equals(ref.type)
+            && relation.equals(ref.relation)
+            && indexType == ref.indexType
+            && nullable == ref.nullable
+            && hasDocValues == ref.hasDocValues
+            && granularity == ref.granularity
+            && isDropped == ref.isDropped
+            && Objects.equals(defaultExpression, ref.defaultExpression));
+    }
+
+    @Override
+    public int hashCode() {
+        int result = type.hashCode();
+        result = 31 * result + Integer.hashCode(position);
+        result = 31 * result + column.hashCode();
+        result = 31 * result + relation.hashCode();
+        result = 31 * result + granularity.hashCode();
+        result = 31 * result + indexType.hashCode();
+        result = 31 * result + (nullable ? 1 : 0);
+        result = 31 * result + (hasDocValues ? 1 : 0);
+        result = 31 * result + Long.hashCode(oid);
+        result = 31 * result + Boolean.hashCode(isDropped);
+        result = 31 * result + (defaultExpression != null ? defaultExpression.hashCode() : 0);
+        return result;
+    }
+
+    @Override
+    public long ramBytesUsed() {
+        return SHALLOW_SIZE
+            + type.ramBytesUsed()
+            + relation.ramBytesUsed()
+            + column.ramBytesUsed()
+            + (defaultExpression == null ? 0 : defaultExpression.ramBytesUsed());
+    }
+}

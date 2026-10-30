@@ -1,0 +1,569 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.analyze;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.elasticsearch.cluster.metadata.Metadata.OID_UNASSIGNED;
+
+import java.io.IOException;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import org.elasticsearch.Version;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.metadata.IndexMetadata;
+import org.elasticsearch.cluster.metadata.Metadata;
+import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.cluster.node.DiscoveryNodes;
+import org.elasticsearch.cluster.routing.allocation.command.AllocateEmptyPrimaryAllocationCommand;
+import org.elasticsearch.cluster.routing.allocation.command.AllocateReplicaAllocationCommand;
+import org.elasticsearch.cluster.routing.allocation.command.AllocateStalePrimaryAllocationCommand;
+import org.elasticsearch.cluster.routing.allocation.command.CancelAllocationCommand;
+import org.elasticsearch.cluster.routing.allocation.command.MoveAllocationCommand;
+import org.elasticsearch.test.ClusterServiceUtils;
+import org.junit.Before;
+import org.junit.Test;
+
+import io.crate.data.RowN;
+import io.crate.exceptions.OperationOnInaccessibleRelationException;
+import io.crate.metadata.RelationMetadata;
+import io.crate.metadata.RelationName;
+import io.crate.metadata.blob.BlobSchemaInfo;
+import io.crate.planner.PlannerContext;
+import io.crate.planner.node.management.AlterTableReroutePlan;
+import io.crate.planner.operators.SubQueryResults;
+import io.crate.test.integration.CrateDummyClusterServiceUnitTest;
+import io.crate.testing.SQLExecutor;
+
+public class AlterTableRerouteAnalyzerTest extends CrateDummyClusterServiceUnitTest {
+
+    private SQLExecutor e;
+    private PlannerContext plannerContext;
+    private String usersIndexUUID;
+
+    @Before
+    public void prepare() throws IOException {
+        e = SQLExecutor.of(clusterService)
+            .addBlobTable("create blob table blobs;")
+            .addTable(TableDefinitions.USER_TABLE_DEFINITION)
+            .addTable("create table other (id int) clustered into 1 shards")
+            .addTable(
+                TableDefinitions.TEST_PARTITIONED_TABLE_DEFINITION,
+                TableDefinitions.TEST_PARTITIONED_TABLE_PARTITIONS
+            );
+        plannerContext = e.getPlannerContext();
+        usersIndexUUID = clusterService.state().metadata().getIndex(
+            new RelationName("doc", "users"),
+            List.of(),
+            true,
+            IndexMetadata::getIndexUUID
+        );
+    }
+
+    @SuppressWarnings("unchecked")
+    private <S> S analyze(String stmt, Object... arguments) {
+        return analyze(stmt, plannerContext.clusterState().metadata(), arguments);
+    }
+
+    @SuppressWarnings("unchecked")
+    private <S> S analyze(String stmt, Metadata metadata, Object... arguments) {
+        AnalyzedStatement analyzedStatement = e.analyze(stmt);
+        return (S) AlterTableReroutePlan.createRerouteCommand(
+            analyzedStatement,
+            plannerContext.transactionContext(),
+            plannerContext.nodeContext(),
+            new RowN(arguments),
+            SubQueryResults.EMPTY,
+            DiscoveryNodes.builder()
+                .add(clusterService.localNode()) // n1
+                .add(new DiscoveryNode(
+                    "n2",
+                    buildNewFakeTransportAddress(),
+                    Map.of(),
+                    Set.of(),
+                    Version.CURRENT))
+                .build(),
+            metadata
+        );
+    }
+
+    @Test
+    public void testRerouteOnSystemTableIsNotAllowed() {
+        assertThatThrownBy(() -> analyze("ALTER TABLE sys.cluster REROUTE MOVE SHARD 0 FROM 'n1' TO 'n2'"))
+            .isExactlyInstanceOf(OperationOnInaccessibleRelationException.class)
+            .hasMessage("The relation \"sys.cluster\" doesn't support or" +
+                        " allow ALTER REROUTE operations");
+    }
+
+    @Test
+    public void testRerouteMoveShardWithLiterals() {
+        MoveAllocationCommand command = analyze(
+            "ALTER TABLE users REROUTE MOVE SHARD 0 FROM 'n2' TO 'n1'");
+        assertThat(command.index()).isEqualTo(usersIndexUUID);
+        assertThat(command.shardId()).isEqualTo(0);
+        assertThat(command.fromNode()).isEqualTo("n2");
+        assertThat(command.toNode()).isEqualTo("n1");
+
+        command = analyze(
+            "ALTER TABLE users REROUTE MOVE SHARD CAST('11' AS int) FROM 'n2' TO 'n1'");
+        assertThat(command.index()).isEqualTo(usersIndexUUID);
+        assertThat(command.shardId()).isEqualTo(11);
+        assertThat(command.fromNode()).isEqualTo("n2");
+        assertThat(command.toNode()).isEqualTo("n1");
+    }
+
+    @Test
+    public void testRerouteMoveShardWithParameters() {
+        MoveAllocationCommand command = analyze(
+            "ALTER TABLE users REROUTE MOVE SHARD 0 FROM ? TO ?", "n2", "n1");
+        assertThat(command.index()).isEqualTo(usersIndexUUID);
+        assertThat(command.shardId()).isEqualTo(0);
+        assertThat(command.fromNode()).isEqualTo("n2");
+        assertThat(command.toNode()).isEqualTo("n1");
+
+        command = analyze(
+            "ALTER TABLE users REROUTE MOVE SHARD ?::long FROM ? TO ?", "12", "n2", "n1");
+        assertThat(command.index()).isEqualTo(usersIndexUUID);
+        assertThat(command.shardId()).isEqualTo(12);
+        assertThat(command.fromNode()).isEqualTo("n2");
+        assertThat(command.toNode()).isEqualTo("n1");
+    }
+
+    @Test
+    public void test_reroute_uses_table_oid_if_source_name_points_to_another_table() {
+        RelationName usersName = new RelationName("doc", "users");
+        RelationName otherName = new RelationName("doc", "other");
+
+        Metadata metadata = plannerContext.clusterState().metadata();
+
+        RelationMetadata.Table users = metadata.getRelation(usersName);
+        RelationMetadata.Table other = metadata.getRelation(otherName);
+
+        Metadata metadataAfterSwap = Metadata.builder(metadata)
+            .dropRelation(usersName)
+            .dropRelation(otherName)
+            .setTable(
+                usersName,
+                other.columns().stream().map(ref -> ref.withRelation(usersName)).toList(),
+                other.settings(),
+                other.routingColumn(),
+                other.columnPolicy(),
+                other.pkConstraintName(),
+                other.checkConstraints(),
+                other.primaryKeys(),
+                other.partitionedBy(),
+                other.state(),
+                other.indexUUIDs(),
+                other.tableVersion() + 1,
+                other.oid()
+            )
+            .setTable(
+                otherName,
+                users.columns().stream().map(ref -> ref.withRelation(otherName)).toList(),
+                users.settings(),
+                users.routingColumn(),
+                users.columnPolicy(),
+                users.pkConstraintName(),
+                users.checkConstraints(),
+                users.primaryKeys(),
+                users.partitionedBy(),
+                users.state(),
+                users.indexUUIDs(),
+                users.tableVersion() + 1,
+                users.oid()
+            )
+            .build();
+
+        MoveAllocationCommand command = analyze(
+            "ALTER TABLE users REROUTE MOVE SHARD 0 FROM 'n2' TO 'n1'",
+            metadataAfterSwap);
+        assertThat(command.index()).isEqualTo(usersIndexUUID);
+    }
+
+    @Test
+    public void test_reroute_partition_uses_table_oid_if_source_name_points_to_another_table() {
+        RelationName partedName = new RelationName("doc", "parted");
+        RelationName otherName = new RelationName("doc", "other");
+
+        Metadata metadata = plannerContext.clusterState().metadata();
+
+        RelationMetadata.Table parted = metadata.getRelation(partedName);
+        RelationMetadata.Table other = metadata.getRelation(otherName);
+        String partedIndexUUID = metadata.getIndex(
+            partedName,
+            List.of("1395874800000"),
+            true,
+            IndexMetadata::getIndexUUID
+        );
+
+        Metadata metadataAfterSwap = Metadata.builder(metadata)
+            .dropRelation(partedName)
+            .dropRelation(otherName)
+            .setTable(
+                partedName,
+                other.columns().stream().map(ref -> ref.withRelation(partedName)).toList(),
+                other.settings(),
+                other.routingColumn(),
+                other.columnPolicy(),
+                other.pkConstraintName(),
+                other.checkConstraints(),
+                other.primaryKeys(),
+                other.partitionedBy(),
+                other.state(),
+                other.indexUUIDs(),
+                other.tableVersion() + 1,
+                other.oid()
+            )
+            .setTable(
+                otherName,
+                parted.columns().stream().map(ref -> ref.withRelation(otherName)).toList(),
+                parted.settings(),
+                parted.routingColumn(),
+                parted.columnPolicy(),
+                parted.pkConstraintName(),
+                parted.checkConstraints(),
+                parted.primaryKeys(),
+                parted.partitionedBy(),
+                parted.state(),
+                parted.indexUUIDs(),
+                parted.tableVersion() + 1,
+                parted.oid()
+            )
+            .build();
+
+        MoveAllocationCommand command = analyze(
+            "ALTER TABLE parted PARTITION (date = 1395874800000) REROUTE MOVE SHARD 0 FROM 'n1' TO 'n2'",
+            metadataAfterSwap);
+        assertThat(command.index()).isEqualTo(partedIndexUUID);
+    }
+
+    @Test
+    public void test_reroute_partition_falls_back_to_relation_name_if_table_oid_is_unassigned() {
+        RelationName partedName = new RelationName("doc", "parted");
+
+        Metadata metadata = plannerContext.clusterState().metadata();
+        RelationMetadata.Table parted = metadata.getRelation(partedName);
+        Metadata metadataWithUnassignedOid = Metadata.builder(metadata)
+            .dropRelation(partedName)
+            .setTable(
+                partedName,
+                parted.columns(),
+                parted.settings(),
+                parted.routingColumn(),
+                parted.columnPolicy(),
+                parted.pkConstraintName(),
+                parted.checkConstraints(),
+                parted.primaryKeys(),
+                parted.partitionedBy(),
+                parted.state(),
+                parted.indexUUIDs(),
+                parted.tableVersion(),
+                OID_UNASSIGNED
+            )
+            .version(metadata.version() + 1)
+            .build();
+        ClusterServiceUtils.setState(
+            clusterService,
+            ClusterState.builder(clusterService.state()).metadata(metadataWithUnassignedOid).build()
+        );
+        plannerContext = e.getPlannerContext();
+
+        String partedIndexUUID = metadataWithUnassignedOid.getIndex(
+            partedName,
+            List.of("1395874800000"),
+            true,
+            IndexMetadata::getIndexUUID
+        );
+        MoveAllocationCommand command = analyze(
+            "ALTER TABLE parted PARTITION (date = 1395874800000) REROUTE MOVE SHARD 0 FROM 'n1' TO 'n2'");
+        assertThat(command.index()).isEqualTo(partedIndexUUID);
+    }
+
+    @Test
+    public void test_reroute_falls_back_to_relation_name_if_table_oid_is_unassigned() {
+        RelationName usersName = new RelationName("doc", "users");
+
+        Metadata metadata = plannerContext.clusterState().metadata();
+        RelationMetadata.Table users = metadata.getRelation(usersName);
+        Metadata metadataWithUnassignedOid = Metadata.builder(metadata)
+            .dropRelation(usersName)
+            .setTable(
+                usersName,
+                users.columns(),
+                users.settings(),
+                users.routingColumn(),
+                users.columnPolicy(),
+                users.pkConstraintName(),
+                users.checkConstraints(),
+                users.primaryKeys(),
+                users.partitionedBy(),
+                users.state(),
+                users.indexUUIDs(),
+                users.tableVersion(),
+                OID_UNASSIGNED
+            )
+            .version(metadata.version() + 1)
+            .build();
+        ClusterServiceUtils.setState(
+            clusterService,
+            ClusterState.builder(clusterService.state()).metadata(metadataWithUnassignedOid).build()
+        );
+        plannerContext = e.getPlannerContext();
+
+        MoveAllocationCommand command = analyze(
+            "ALTER TABLE users REROUTE MOVE SHARD 0 FROM 'n2' TO 'n1'");
+        assertThat(command.index()).isEqualTo(usersIndexUUID);
+    }
+
+    @Test
+    public void testRerouteMoveShardWithNullShardId() {
+        assertThatThrownBy(() -> analyze("ALTER TABLE users REROUTE MOVE SHARD null FROM 'n2' TO 'n1'"))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("Shard Id cannot be [null]");
+    }
+
+    @Test
+    public void testRerouteMoveShardPartitionedTable() {
+        String indexUUID = clusterService.state().metadata().getIndex(
+            new RelationName("doc", "parted"),
+            List.of("1395874800000"),
+            true,
+            IndexMetadata::getIndexUUID
+        );
+        MoveAllocationCommand command = analyze(
+            "ALTER TABLE parted PARTITION (date = 1395874800000) REROUTE MOVE SHARD 0 FROM 'n1' TO 'n2'");
+        assertThat(command.index()).isEqualTo(indexUUID);
+        assertThat(command.shardId()).isEqualTo(0);
+        assertThat(command.fromNode()).isEqualTo("n1");
+        assertThat(command.toNode()).isEqualTo("n2");
+    }
+
+    @Test
+    public void testRerouteOnBlobTable() {
+        String indexUUID = clusterService.state().metadata().getIndex(
+            new RelationName(BlobSchemaInfo.NAME, "blobs"),
+            List.of(),
+            true,
+            IndexMetadata::getIndexUUID
+        );
+        MoveAllocationCommand command = analyze(
+            "ALTER TABLE blob.blobs REROUTE MOVE SHARD 0 FROM 'n1' TO 'n2'");
+        assertThat(command.index()).isEqualTo(indexUUID);
+    }
+
+    @Test
+    public void test_reroute_blob_table_falls_back_to_concrete_index_if_table_oid_is_unassigned() {
+        RelationName blobsName = new RelationName(BlobSchemaInfo.NAME, "blobs");
+
+        Metadata metadata = plannerContext.clusterState().metadata();
+        RelationMetadata.BlobTable blobs = metadata.getRelation(blobsName);
+        Metadata metadataWithUnassignedOid = Metadata.builder(metadata)
+            .dropRelation(blobsName)
+            .setBlobTable(
+                blobsName,
+                blobs.indexUUID(),
+                blobs.settings(),
+                blobs.state(),
+                OID_UNASSIGNED
+            )
+            .version(metadata.version() + 1)
+            .build();
+        ClusterServiceUtils.setState(
+            clusterService,
+            ClusterState.builder(clusterService.state()).metadata(metadataWithUnassignedOid).build()
+        );
+        plannerContext = e.getPlannerContext();
+
+        MoveAllocationCommand command = analyze(
+            "ALTER TABLE blob.blobs REROUTE MOVE SHARD 0 FROM 'n1' TO 'n2'");
+        assertThat(command.index()).isEqualTo(blobs.indexUUID());
+    }
+
+    @Test
+    public void testRerouteAllocateReplicaShardWithLiterals() {
+        AllocateReplicaAllocationCommand command = analyze(
+            "ALTER TABLE users REROUTE ALLOCATE REPLICA SHARD 0 ON 'n1'");
+        assertThat(command.index()).isEqualTo(usersIndexUUID);
+        assertThat(command.shardId()).isEqualTo(0);
+        assertThat(command.node()).isEqualTo("n1");
+
+        command = analyze(
+            "ALTER TABLE users REROUTE ALLOCATE REPLICA SHARD '12'::short ON 'n1'");
+        assertThat(command.index()).isEqualTo(usersIndexUUID);
+        assertThat(command.shardId()).isEqualTo(12);
+        assertThat(command.node()).isEqualTo("n1");
+    }
+
+    @Test
+    public void testRerouteAllocateReplicaShardWithParameters() {
+        AllocateReplicaAllocationCommand command = analyze(
+            "ALTER TABLE users REROUTE ALLOCATE REPLICA SHARD 0 ON ?", "n1");
+        assertThat(command.index()).isEqualTo(usersIndexUUID);
+        assertThat(command.shardId()).isEqualTo(0);
+        assertThat(command.node()).isEqualTo("n1");
+
+        command = analyze(
+            "ALTER TABLE users REROUTE ALLOCATE REPLICA SHARD CAST(? AS int) ON ?", "123", "n1");
+        assertThat(command.index()).isEqualTo(usersIndexUUID);
+        assertThat(command.shardId()).isEqualTo(123);
+        assertThat(command.node()).isEqualTo("n1");
+    }
+
+    @Test
+    public void testRerouteAllocateReplicaShardWithNullShardId() {
+        assertThatThrownBy(() -> analyze("ALTER TABLE users REROUTE ALLOCATE REPLICA SHARD null ON 'n1'"))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("Shard Id cannot be [null]");
+    }
+
+    @Test
+    public void testRerouteCancelShardWithLiterals() {
+        CancelAllocationCommand command = analyze(
+            "ALTER TABLE users REROUTE CANCEL SHARD 0 ON 'n2'");
+        assertThat(command.index()).isEqualTo(usersIndexUUID);
+        assertThat(command.shardId()).isEqualTo(0);
+        assertThat(command.node()).isEqualTo("n2");
+        assertThat(command.allowPrimary()).isFalse();
+
+        command = analyze(
+            "ALTER TABLE users REROUTE CANCEL SHARD CAST('12' AS long) ON 'n2'");
+        assertThat(command.index()).isEqualTo(usersIndexUUID);
+        assertThat(command.shardId()).isEqualTo(12);
+        assertThat(command.node()).isEqualTo("n2");
+        assertThat(command.allowPrimary()).isFalse();
+    }
+
+    @Test
+    public void testRerouteCancelShardWithParameters() {
+        CancelAllocationCommand command = analyze(
+            "ALTER TABLE users REROUTE CANCEL SHARD 0 ON ?", "n2");
+        assertThat(command.index()).isEqualTo(usersIndexUUID);
+        assertThat(command.shardId()).isEqualTo(0);
+        assertThat(command.node()).isEqualTo("n2");
+        assertThat(command.allowPrimary()).isFalse();
+
+        command = analyze(
+            "ALTER TABLE users REROUTE CANCEL SHARD ?::int ON ?", "32", "n2");
+        assertThat(command.index()).isEqualTo(usersIndexUUID);
+        assertThat(command.shardId()).isEqualTo(32);
+        assertThat(command.node()).isEqualTo("n2");
+        assertThat(command.allowPrimary()).isFalse();
+    }
+
+    @Test
+    public void testRerouteCancelShardWithNullShardId() {
+        assertThatThrownBy(() -> analyze("ALTER TABLE users REROUTE CANCEL SHARD null ON 'n2'"))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("Shard Id cannot be [null]");
+    }
+
+    @Test
+    public void testRerouteCancelShardWithOptions() {
+        CancelAllocationCommand command = analyze(
+            "ALTER TABLE users REROUTE CANCEL SHARD 0 ON 'n1' WITH (allow_primary = TRUE)");
+        assertThat(command.index()).isEqualTo(usersIndexUUID);
+        assertThat(command.shardId()).isEqualTo(0);
+        assertThat(command.node()).isEqualTo("n1");
+        assertThat(command.allowPrimary()).isTrue();
+
+        command = analyze(
+            "ALTER TABLE users REROUTE CANCEL SHARD 0 ON 'n2' WITH (allow_primary = FALSE)");
+        assertThat(command.index()).isEqualTo(usersIndexUUID);
+        assertThat(command.shardId()).isEqualTo(0);
+        assertThat(command.node()).isEqualTo("n2");
+        assertThat(command.allowPrimary()).isFalse();
+    }
+
+    @Test
+    public void test_promote_replica_shard_with_literals() {
+        AllocateStalePrimaryAllocationCommand command = analyze(
+            "ALTER TABLE users REROUTE PROMOTE REPLICA SHARD 2 ON 'n1' WITH (accept_data_loss = true)");
+        assertThat(command.index()).isEqualTo(usersIndexUUID);
+        assertThat(command.shardId()).isEqualTo(2);
+        assertThat(command.node()).isEqualTo("n1");
+        assertThat(command.acceptDataLoss()).isTrue();
+    }
+
+    @Test
+    public void test_promote_replica_shard_with_parameters() {
+        AllocateStalePrimaryAllocationCommand command = analyze(
+            "ALTER TABLE users REROUTE PROMOTE REPLICA SHARD 2 ON ? WITH (accept_data_loss = ?)", "n1", true);
+        assertThat(command.index()).isEqualTo(usersIndexUUID);
+        assertThat(command.shardId()).isEqualTo(2);
+        assertThat(command.node()).isEqualTo("n1");
+        assertThat(command.acceptDataLoss()).isTrue();
+    }
+
+    public void test_promote_replica_shard_with_null_shardId() {
+        assertThatThrownBy(() -> analyze("ALTER TABLE users REROUTE PROMOTE REPLICA SHARD null ON 'n1'"))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("Shard Id cannot be [null]");
+    }
+
+    @Test
+    public void test_promote_replica_fails_if_unsupported_option_is_provided() {
+        assertThatThrownBy(() ->
+            analyze("ALTER TABLE users REROUTE PROMOTE REPLICA SHARD ? ON ? WITH (foobar = true)"))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessage("Unsupported options provided to REROUTE PROMOTE REPLICA: [foobar]");
+
+    }
+
+    @Test
+    public void test_accept_data_loss_defaults_to_false_if_not_provided() {
+        AllocateStalePrimaryAllocationCommand command = analyze(
+            "ALTER TABLE users REROUTE PROMOTE REPLICA SHARD 0 ON 'n1'");
+        assertThat(command.acceptDataLoss()).isFalse();
+    }
+
+    @Test
+    public void test_reroute_allocate_stale_primary_shard() {
+        AllocateStalePrimaryAllocationCommand command = analyze(
+            "ALTER TABLE users REROUTE ALLOCATE STALE PRIMARY SHARD 2 ON 'n1' WITH (accept_data_loss = true)");
+        assertThat(command.index()).isEqualTo(usersIndexUUID);
+        assertThat(command.shardId()).isEqualTo(2);
+        assertThat(command.node()).isEqualTo("n1");
+        assertThat(command.acceptDataLoss()).isTrue();
+
+        assertThatThrownBy(() ->
+            analyze("ALTER TABLE users REROUTE ALLOCATE STALE PRIMARY SHARD ? ON ? WITH (foobar = true)"))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessage("Setting 'foobar' is not supported");
+    }
+
+    @Test
+    public void test_reroute_allocate_empty_primary_shard() {
+        AllocateEmptyPrimaryAllocationCommand command = analyze(
+            "ALTER TABLE users REROUTE ALLOCATE EMPTY PRIMARY SHARD 2 ON 'n1' WITH (accept_data_loss = true)");
+        assertThat(command.index()).isEqualTo(usersIndexUUID);
+        assertThat(command.shardId()).isEqualTo(2);
+        assertThat(command.node()).isEqualTo("n1");
+        assertThat(command.acceptDataLoss()).isTrue();
+
+        assertThatThrownBy(() ->
+            analyze("ALTER TABLE users REROUTE ALLOCATE EMPTY PRIMARY SHARD ? ON ? WITH (foobar = true)"))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessage("Setting 'foobar' is not supported");
+    }
+}

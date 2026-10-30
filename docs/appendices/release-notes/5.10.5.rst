@@ -1,0 +1,72 @@
+.. _version_5.10.5:
+
+==============
+Version 5.10.5
+==============
+
+Released on 2025-04-28.
+
+.. NOTE::
+
+    If you are upgrading a cluster, you must be running CrateDB 4.0.2 or higher
+    before you upgrade to 5.10.5.
+
+    We recommend that you upgrade to the latest 5.9 release before moving to
+    5.10.5.
+
+    A rolling upgrade from 5.9.x to 5.10.5 is supported.
+    Before upgrading, you should `back up your data`_.
+
+.. WARNING::
+
+    Tables that were created before CrateDB 4.x will not function with 5.x
+    and must be recreated before moving to 5.x.x.
+
+    You can recreate tables using ``COPY TO`` and ``COPY FROM`` or by
+    `inserting the data into a new table`_.
+
+.. _back up your data: https://cratedb.com/docs/crate/reference/en/latest/admin/snapshots.html
+.. _inserting the data into a new table: https://cratedb.com/docs/crate/reference/en/latest/admin/system-information.html#tables-need-to-be-recreated
+
+.. rubric:: Table of contents
+
+.. contents::
+   :local:
+
+See the :ref:`version_5.10.0` release notes for a full list of changes in the
+5.10 series.
+
+Fixes
+=====
+
+- Fixed memory estimation for ``INSERT INTO`` statements with ``ON CONFLICT``
+  clause. This should help prevent nodes from running out of memory.
+
+- Improved the handling of ``statement_timeout`` to reduce memory consumption.
+  Before it would consume extra memory per executed query for the full
+  ``statement_duration`` even if the query finished early. Now the memory is
+  released once a query finishes.
+
+- Fixed an issue that prevented ``MATCH (geo_shape_column, ...)`` from matching
+  any records if ``geo_shape_column`` is a generated column.
+
+- Fixed a race condition that could lead to a memory leak if nodes within the
+  cluster were temporarily not reachable.
+
+- Fixed an issue that led to an ``no viable alternative at input 'SELECT FROM'``
+  error when using ``SELECT count(*) FROM remote_tbl`` where ``remote_tbl`` is a
+  foreign table using the JDBC foreign data wrapper.
+
+- Fixed edge cases of fixed length character comparisons involving whitespaces,
+  E.g.::
+
+    CREATE TABLE t (col CHAR(3))
+    INSERT INTO t VALUES ('')
+    SELECT col > e'\n' from t
+    
+  now returns ``TRUE`` because ``''`` is padded with ``' '`` which is ``32`` in
+  ``ASCII`` and ``e'\n'`` is ``10`` in ``ASCII``.
+
+- Fixed behavior of ``COPY ... FROM ... with (fail_fast = true)`` to stop on
+  non-retryable IO errors as well. Before the flag used to be applied only for
+  write errors.

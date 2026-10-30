@@ -1,0 +1,368 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.execution.jobs;
+
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Locale;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+import java.util.stream.Stream;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.elasticsearch.ElasticsearchException;
+import org.elasticsearch.action.NoSuchNodeException;
+import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.cluster.node.DiscoveryNodes;
+import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.component.AbstractLifecycleComponent;
+import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
+import org.elasticsearch.transport.Transport.Connection;
+import org.elasticsearch.transport.TransportConnectionListener;
+import org.jspecify.annotations.NonNull;
+import org.jspecify.annotations.Nullable;
+
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+
+import io.crate.common.annotations.VisibleForTesting;
+import io.crate.common.collections.Lists;
+import io.crate.concurrent.CountdownFuture;
+import io.crate.exceptions.JobKilledException;
+import io.crate.exceptions.TaskMissing;
+import io.crate.execution.engine.collect.stats.JobsLogs;
+import io.crate.execution.jobs.RootTask.Builder;
+import io.crate.execution.jobs.kill.KillAllListener;
+import io.crate.expression.reference.sys.operation.OperationContext;
+import io.crate.role.Role;
+
+public class TasksService extends AbstractLifecycleComponent implements TransportConnectionListener {
+
+    private static final Logger LOGGER = LogManager.getLogger(TasksService.class);
+
+    private final ClusterService clusterService;
+    private final JobsLogs jobsLogs;
+    private final NodeLimits nodeLimits;
+    private final ConcurrentMap<UUID, RootTask> activeTasks =
+        ConcurrentCollections.newConcurrentMapWithAggressiveConcurrency();
+
+    private final List<KillAllListener> killAllListeners = new CopyOnWriteArrayList<>();
+
+    private final Object failedSentinel = new Object();
+    private final Cache<UUID, Object> recentlyFailed = Caffeine.newBuilder()
+        .executor(Runnable::run)
+        .maximumSize(1000L)
+        .expireAfterWrite(30, TimeUnit.SECONDS)
+        .build();
+
+    public TasksService(ClusterService clusterService, JobsLogs jobsLogs, NodeLimits nodeLimits) {
+        this.clusterService = clusterService;
+        this.jobsLogs = jobsLogs;
+        this.nodeLimits = nodeLimits;
+    }
+
+    @Override
+    protected void doStart() throws ElasticsearchException {
+    }
+
+    @Override
+    protected void doStop() throws ElasticsearchException {
+        for (RootTask rootTask : activeTasks.values()) {
+            rootTask.kill(JobKilledException.of("TasksService stopped"));
+        }
+    }
+
+    public void addListener(KillAllListener listener) {
+        killAllListeners.add(listener);
+    }
+
+    public Iterable<OperationContext> operations() {
+        return () -> activeTasks.values().stream()
+            .flatMap(rootTask ->
+                rootTask.tasks().stream()
+                    .map(task -> new OperationContext(
+                        task.id(),
+                        rootTask.jobId(),
+                        task.name(),
+                        rootTask.started(),
+                        task.bytesUsed()
+                    ))
+            )
+            .iterator();
+    }
+
+    @Override
+    protected void doClose() throws ElasticsearchException {
+    }
+
+    public RootTask getTask(UUID jobId) {
+        RootTask rootTask = activeTasks.get(jobId);
+        if (rootTask == null) {
+            throw new TaskMissing(TaskMissing.Type.ROOT, jobId);
+        }
+        return rootTask;
+    }
+
+    @Override
+    public void onNodeDisconnected(DiscoveryNode node, Connection connection) {
+        nodeLimits.nodeDisconnected(node.getId());
+        for (var task : activeTasks.values()) {
+            if (task.participatingNodes().contains(node.getId())) {
+                task.kill(JobKilledException.of("Participating node " + node.getId() + " disconnected"));
+            } else if (task.coordinatorNodeId().equals(node.getId())) {
+                task.kill(JobKilledException.of("Coordinator node " + node.getId() + " disconnected"));
+            }
+        }
+    }
+
+    @VisibleForTesting
+    public Stream<UUID> getJobIdsByParticipatingNodes(final String nodeId) {
+        return activeTasks.values().stream()
+            .filter(i -> i.participatingNodes().contains(nodeId))
+            .map(RootTask::jobId);
+    }
+
+    @Nullable
+    public RootTask getTaskOrNull(UUID jobId) {
+        return activeTasks.get(jobId);
+    }
+
+    @VisibleForTesting
+    public RootTask.Builder newBuilder(UUID jobId) {
+        return new RootTask.Builder(
+            LOGGER,
+            jobId,
+            Role.CRATE_USER.name(),
+            clusterService.localNode().getId(),
+            Collections.emptySet(),
+            jobsLogs);
+    }
+
+    public RootTask.Builder newBuilder(UUID jobId,
+                                       String user,
+                                       Collection<String> participatingNodes) {
+        String localNodeId = clusterService.localNode().getId();
+        return new RootTask.Builder(LOGGER, jobId, user, localNodeId, participatingNodes, jobsLogs);
+    }
+
+    public int numActive() {
+        return activeTasks.size();
+    }
+
+    /// Create and run a task for a single async function
+    ///
+    /// @return result of the async function
+    public <T> CompletableFuture<T> runAsyncFnTask(UUID jobId,
+                                                   String user,
+                                                   String name,
+                                                   Callable<CompletableFuture<T>> run,
+                                                   Consumer<Throwable> kill) {
+        var task = new AsyncFnTask<>(0, name, run, kill);
+        Builder builder = newBuilder(jobId, user, List.of());
+        builder.addTask(task);
+        try {
+            RootTask rootTask = createTask(builder);
+            rootTask.start();
+        } catch (Throwable t) {
+            return CompletableFuture.failedFuture(t);
+        }
+        return task.result();
+    }
+
+
+    public RootTask createTask(RootTask.Builder builder) throws Exception {
+        if (builder.isEmpty()) {
+            throw new IllegalArgumentException("RootTask.Builder must at least contain 1 Task");
+        }
+        final UUID jobId = builder.jobId();
+        RootTask newRootTask = builder.build();
+
+        TaskCallback taskCallback = new TaskCallback(jobId);
+        newRootTask.completionFuture().whenComplete(taskCallback);
+
+        RootTask existing = activeTasks.putIfAbsent(jobId, newRootTask);
+        if (existing != null) {
+            throw new IllegalArgumentException(
+                String.format(Locale.ENGLISH, "task for job %s already exists:%n%s", jobId, existing));
+        }
+
+        DiscoveryNodes nodes = clusterService.state().nodes();
+        for (String participatingNode : newRootTask.participatingNodes()) {
+            if (!nodes.nodeExists(participatingNode)) {
+                NoSuchNodeException noSuchNodeException = new NoSuchNodeException(participatingNode);
+                taskCallback.accept(null, noSuchNodeException);
+                throw noSuchNodeException;
+            }
+        }
+
+        if (LOGGER.isTraceEnabled()) {
+            LOGGER.trace(
+                "RootTask created for job={} tasks={} totalTasks={} node={}/{} participating={}",
+                jobId,
+                builder.size(),
+                activeTasks.size(),
+                nodes.getLocalNodeId(),
+                nodes.getLocalNode().getName(),
+                Lists.map(newRootTask.participatingNodes(), nodeId -> {
+                    DiscoveryNode node = nodes.get(nodeId);
+                    return node == null ? nodeId : nodeId + "/" + node.getName();
+                })
+            );
+        }
+        return newRootTask;
+    }
+
+
+    /**
+     * kills all tasks which the user is allowed to kill and are active at the time of the call of this method.
+     * The super-user can kill any tasks, other users can only kill their own tasks.
+     *
+     * @return a future holding the number of tasks kill was called on, the future is finished when all tasks
+     * are completed and never fails.
+     */
+    public CompletableFuture<Integer> killAll(String userName) {
+        boolean isSuperUser = userName.equals(Role.CRATE_USER.name());
+        if (isSuperUser) {
+            for (KillAllListener killAllListener : killAllListeners) {
+                try {
+                    killAllListener.killAllJobs();
+                } catch (Throwable t) {
+                    LOGGER.error("Failed to call killAllJobs on listener={} error={}", killAllListener, t);
+                }
+            }
+        }
+        Collection<UUID> toKill = List.copyOf(activeTasks.keySet());
+        if (toKill.isEmpty()) {
+            return CompletableFuture.completedFuture(0);
+        }
+        return killTasks(toKill, userName, JobKilledException.of(null));
+    }
+
+    private CompletableFuture<Integer> killTasks(Collection<UUID> toKill, String userName, @NonNull Throwable reason) {
+        assert !toKill.isEmpty() : "toKill must not be empty";
+        int numKilled = 0;
+        CountdownFuture countDownFuture = new CountdownFuture(toKill.size());
+        boolean isSuperUser = userName.equals(Role.CRATE_USER.name());
+        for (UUID jobId : toKill) {
+            RootTask ctx = activeTasks.get(jobId);
+            if (ctx == null) {
+                recentlyFailed.put(jobId, failedSentinel);
+                // no kill but we need to count down
+                countDownFuture.onSuccess();
+                continue;
+            }
+            // superuser can always kill jobs; normal users only their own jobs
+            if (isSuperUser || ctx.userName().equals(userName)) {
+                ctx.completionFuture().whenComplete(countDownFuture);
+                ctx.kill(reason);
+                numKilled++;
+            } else {
+                // no kill but we need to count down
+                countDownFuture.onSuccess();
+            }
+        }
+        final int finalNumKilled = numKilled;
+        return countDownFuture.handle((r, f) -> finalNumKilled);
+    }
+
+    public CompletableFuture<Integer> killJobs(Collection<UUID> toKill, String userName, @NonNull Throwable reason) {
+        boolean isSuperUser = userName.equals(Role.CRATE_USER.name());
+        if (isSuperUser) {
+            for (KillAllListener killAllListener : killAllListeners) {
+                for (UUID job : toKill) {
+                    try {
+                        killAllListener.killJob(job);
+                    } catch (Throwable t) {
+                        LOGGER.error("Failed to call killJob on listener={}, err={}", killAllListener, t);
+                    }
+                }
+            }
+        }
+        return killTasks(toKill, userName, reason);
+    }
+
+    /**
+     * @return true if the job has been recently removed due to a failure (e.g. has been killed).
+     *         false if it is UNKNOWN if it failed.
+     *
+     *         This may return false negatives, but never false positives.
+     */
+    public boolean recentlyFailed(UUID jobId) {
+        return recentlyFailed.getIfPresent(jobId) == failedSentinel;
+    }
+
+    private class TaskCallback implements BiConsumer<Void, Throwable> {
+
+        private final UUID jobId;
+
+        TaskCallback(UUID jobId) {
+            this.jobId = jobId;
+        }
+
+        @Override
+        public void accept(Void aVoid, Throwable throwable) {
+            activeTasks.remove(jobId);
+            if (throwable != null) {
+                recentlyFailed.put(jobId, failedSentinel);
+            }
+            if (LOGGER.isTraceEnabled()) {
+                LOGGER.trace("RootTask removed from active tasks: jobId={} remainingTasks={} failure={}",
+                             jobId, activeTasks.size(), throwable);
+            }
+        }
+    }
+
+    @VisibleForTesting
+    public void logActiveTasksToError() {
+        if (LOGGER.isErrorEnabled()) {
+            String localNodeId = clusterService.localNode().getId();
+            for (var entry : activeTasks.entrySet()) {
+                LOGGER.error("Active task node={} jobId={}, task={}", localNodeId, entry.getKey(), entry.getValue());
+            }
+        }
+    }
+
+    @Nullable
+    public UUID topConsumer() {
+        record TaskUsage(RootTask task, long totalBytesUsed) {
+        }
+
+        Optional<TaskUsage> topTask = activeTasks.values().stream()
+            .map(rootTask -> new TaskUsage(
+                rootTask,
+                rootTask.tasks().stream().mapToLong(Task::bytesUsed).sum()
+            ))
+            .max(Comparator.comparingLong(TaskUsage::totalBytesUsed));
+
+        return topTask.map(x -> x.task.jobId()).orElse(null);
+    }
+}

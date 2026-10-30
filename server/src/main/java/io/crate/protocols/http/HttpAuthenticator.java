@@ -1,0 +1,240 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.protocols.http;
+
+import static io.crate.auth.AuthSettings.AUTH_HOST_BASED_JWT_ISS_SETTING;
+import static io.crate.protocols.SSL.getSession;
+import static io.netty.buffer.Unpooled.copiedBuffer;
+
+import java.net.InetAddress;
+import java.nio.charset.StandardCharsets;
+import java.security.cert.Certificate;
+import java.util.Locale;
+import java.util.function.Predicate;
+
+import javax.net.ssl.SSLPeerUnverifiedException;
+import javax.net.ssl.SSLSession;
+
+import org.elasticsearch.common.network.InetAddresses;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.http.netty4.Netty4HttpServerTransport;
+import org.jspecify.annotations.Nullable;
+
+import io.crate.auth.AuthSettings;
+import io.crate.auth.Authentication;
+import io.crate.auth.AuthenticationMethod;
+import io.crate.auth.AuthenticationMethod.AuthToken;
+import io.crate.auth.Credentials;
+import io.crate.auth.Protocol;
+import io.crate.common.annotations.VisibleForTesting;
+import io.crate.protocols.SSL;
+import io.crate.protocols.postgres.ConnectionProperties;
+import io.crate.role.Role;
+import io.crate.role.Roles;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFutureListener;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.handler.codec.http.DefaultFullHttpResponse;
+import io.netty.handler.codec.http.HttpHeaderNames;
+import io.netty.handler.codec.http.HttpRequest;
+import io.netty.handler.codec.http.HttpResponse;
+import io.netty.handler.codec.http.HttpResponseStatus;
+import io.netty.handler.codec.http.HttpUtil;
+import io.netty.handler.codec.http.HttpVersion;
+import io.netty.handler.codec.http.LastHttpContent;
+import io.netty.util.AttributeKey;
+import io.netty.util.ReferenceCountUtil;
+
+/**
+ * Authenticates requests based on their headers.
+ * <p>
+ * On success the authenticated role is stored as a channel attribute, which the request handlers
+ * further down the pipeline ({@link io.crate.rest.action.SqlHttpHandler}, {@link HttpBlobHandler},
+ * {@link MainAndStaticFileHandler}) look up via {@link #authenticatedRole(Channel)}.
+ * On failure a {@code 401} is sent, the connection is closed and the request is discarded.
+ * <p>
+ * Must not be shared across channels, since the last {@link AuthToken} is not thread safe.
+ */
+public final class HttpAuthenticator extends ChannelInboundHandlerAdapter {
+
+    @VisibleForTesting
+    // realm-value should not contain any special characters
+    static final String WWW_AUTHENTICATE_REALM_MESSAGE = "Basic realm=\"CrateDB Authenticator\"";
+
+    private static final AttributeKey<Role> AUTHENTICATED_ROLE = AttributeKey.valueOf("crate.http.authenticated_role");
+
+    private final Authentication authService;
+    private final boolean checkJwtProperties;
+    private final boolean supportXRealIp;
+    private final String defaultUser;
+    private final Roles roles;
+
+    @Nullable
+    private AuthToken lastAuthToken;
+    private boolean discarding = false;
+
+    public HttpAuthenticator(Settings settings, Authentication authService, Roles roles) {
+        this.checkJwtProperties = settings.get(AUTH_HOST_BASED_JWT_ISS_SETTING.getKey()) == null;
+        this.supportXRealIp = AuthSettings.AUTH_TRUST_HTTP_SUPPORT_X_REAL_IP.get(settings);
+        this.defaultUser = AuthSettings.AUTH_TRUST_HTTP_DEFAULT_HEADER.get(settings);
+        this.authService = authService;
+        this.roles = roles;
+    }
+
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+        if (msg instanceof HttpRequest request) {
+            discarding = false;
+            Role role = authenticate(request, ctx.channel());
+            ctx.channel().attr(AUTHENTICATED_ROLE).set(role);
+            if (role == null) {
+                discarding = !(msg instanceof LastHttpContent);
+                ReferenceCountUtil.release(msg);
+                return;
+            }
+        } else if (discarding) {
+            if (msg instanceof LastHttpContent) {
+                discarding = false;
+            }
+            ReferenceCountUtil.release(msg);
+            return;
+        }
+        ctx.fireChannelRead(msg);
+    }
+
+    /**
+     * Returns the role authenticated for the current request of the channel.
+     * If there is none, a {@code 401} is sent, the connection is closed and {@code null}
+     * is returned, so the caller has to stop processing the request.
+     */
+    @Nullable
+    public static Role authenticatedRole(Channel channel) {
+        Role role = channel.attr(AUTHENTICATED_ROLE).get();
+        if (role == null) {
+            sendUnauthorized(channel, null);
+        }
+        return role;
+    }
+
+    /**
+     * On success the authenticated user is returned. On failure a {@code 401} response
+     * is written to {@code channel}, the connection is closed and {@code null} is returned,
+     * so the caller has to stop processing the request.
+     */
+    @VisibleForTesting
+    @Nullable
+    Role authenticate(HttpRequest request, Channel channel) {
+        SSLSession session = getSession(channel);
+        // The password object is released when the credentials are closed.
+        try (Credentials credentials = credentialsFromRequest(request, session, defaultUser)) {
+            Predicate<Role> rolePredicate = credentials.matchByToken(checkJwtProperties);
+            if (rolePredicate != null) {
+                Role role = roles.findUser(rolePredicate);
+                if (role != null) {
+                    credentials.setUsername(role.name());
+                }
+            }
+            String username = credentials.username();
+            InetAddress address = addressFromRequestOrChannel(request, channel);
+            ConnectionProperties connectionProperties =
+                new ConnectionProperties(credentials, address, Protocol.HTTP, session);
+
+            AuthenticationMethod authMethod = authService.resolveAuthenticationType(username, connectionProperties);
+            if (authMethod == null) {
+                throw new RuntimeException(String.format(
+                    Locale.ENGLISH,
+                    "No valid auth.host_based.config entry found for host \"%s\", user \"%s\", protocol \"%s\". Did you enable TLS in your client?",
+                    address.getHostAddress(), username, Protocol.HTTP));
+            }
+
+            if (lastAuthToken != null) {
+                lastAuthToken = authMethod.renew(lastAuthToken, credentials);
+                if (lastAuthToken != null) {
+                    return lastAuthToken.role();
+                }
+            }
+            lastAuthToken = authMethod.authenticate(credentials, connectionProperties);
+            return lastAuthToken.role();
+        } catch (Exception e) {
+            sendUnauthorized(channel, e.getMessage());
+            return null;
+        }
+    }
+
+    static void sendUnauthorized(Channel channel, @Nullable String body) {
+        HttpResponse response;
+        if (body != null) {
+            if (!body.endsWith("\n")) {
+                body += "\n";
+            }
+            response = new DefaultFullHttpResponse(
+                HttpVersion.HTTP_1_1, HttpResponseStatus.UNAUTHORIZED, copiedBuffer(body, StandardCharsets.UTF_8));
+            HttpUtil.setContentLength(response, body.length());
+        } else {
+            response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.UNAUTHORIZED);
+        }
+        // "Tell" the browser to open the credentials popup.
+        // It helps to avoid custom login page in AdminUI.
+        response.headers().set(HttpHeaderNames.WWW_AUTHENTICATE, WWW_AUTHENTICATE_REALM_MESSAGE);
+        channel.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE);
+    }
+
+    @VisibleForTesting
+    static Credentials credentialsFromRequest(HttpRequest request, @Nullable SSLSession session, String defaultUser) {
+        String username = null;
+        String authHeader = request.headers().get(HttpHeaderNames.AUTHORIZATION);
+        if (authHeader != null) {
+            // Prefer Http Auth (Basic or JWT, depending on header).
+            return Headers.extractCredentialsFromHttpAuthHeader(authHeader);
+        } else {
+            // prefer commonName as userName over AUTH_TRUST_HTTP_DEFAULT_HEADER user
+            if (session != null) {
+                try {
+                    Certificate certificate = session.getPeerCertificates()[0];
+                    username = SSL.extractCN(certificate);
+                } catch (ArrayIndexOutOfBoundsException | SSLPeerUnverifiedException ignored) {
+                    // client cert is optional
+                }
+            }
+            if (username == null) {
+                username = defaultUser;
+            }
+        }
+        return new Credentials(username, null);
+    }
+
+    private InetAddress addressFromRequestOrChannel(HttpRequest request, Channel channel) {
+        if (supportXRealIp) {
+            String realIPHeader = request.headers().get(AuthSettings.HTTP_HEADER_REAL_IP);
+            if (realIPHeader == null) {
+                return Netty4HttpServerTransport.getRemoteAddress(channel);
+            }
+            InetAddress realIP = InetAddresses.forString(realIPHeader);
+            if (realIP.isLoopbackAddress() || realIP.isAnyLocalAddress() || realIP.isLinkLocalAddress()) {
+                return Netty4HttpServerTransport.getRemoteAddress(channel);
+            }
+            return realIP;
+        }
+        return Netty4HttpServerTransport.getRemoteAddress(channel);
+    }
+}

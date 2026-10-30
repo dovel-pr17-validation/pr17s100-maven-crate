@@ -1,0 +1,141 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.planner.optimizer;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
+import java.util.function.Supplier;
+import java.util.function.UnaryOperator;
+
+import org.elasticsearch.Version;
+import org.jspecify.annotations.Nullable;
+
+import io.crate.common.collections.Lists;
+import io.crate.metadata.CoordinatorTxnCtx;
+import io.crate.metadata.NodeContext;
+import io.crate.metadata.TransactionContext;
+import io.crate.planner.operators.LogicalPlan;
+import io.crate.planner.optimizer.costs.PlanStats;
+import io.crate.planner.optimizer.matcher.Captures;
+import io.crate.planner.optimizer.matcher.Match;
+import io.crate.planner.optimizer.tracer.OptimizerTracer;
+import io.crate.session.Session;
+
+public class Optimizer {
+
+    private final List<Rule<?>> rules;
+    private final Supplier<Version> minNodeVersionInCluster;
+    private final NodeContext nodeCtx;
+
+    public Optimizer(NodeContext nodeCtx,
+                     Supplier<Version> minNodeVersionInCluster,
+                     List<Rule<?>> rules) {
+        this.rules = rules;
+        this.minNodeVersionInCluster = minNodeVersionInCluster;
+        this.nodeCtx = nodeCtx;
+    }
+
+    public LogicalPlan optimize(LogicalPlan plan,
+                                PlanStats planStats,
+                                CoordinatorTxnCtx txnCtx,
+                                OptimizerTracer tracer,
+                                Session.TimeoutToken timeoutToken) {
+        var applicableRules = removeExcludedRules(rules, txnCtx.sessionSettings().excludedOptimizerRules());
+        LogicalPlan optimizedRoot = tryApplyRules(applicableRules, plan, planStats, txnCtx, tracer, timeoutToken);
+        var optimizedSources = Lists.mapIfChange(optimizedRoot.sources(), x -> optimize(x, planStats, txnCtx, tracer, timeoutToken));
+        return tryApplyRules(
+            applicableRules,
+            optimizedSources == optimizedRoot.sources() ? optimizedRoot : optimizedRoot.replaceSources(optimizedSources),
+            planStats,
+            txnCtx,
+            tracer,
+            timeoutToken
+        );
+    }
+
+    public static List<Rule<?>> removeExcludedRules(List<Rule<?>> rules, Set<Class<? extends Rule<?>>> excludedRules) {
+        if (excludedRules.isEmpty()) {
+            return rules;
+        }
+        var result = new ArrayList<Rule<?>>(rules.size());
+        for (var rule : rules) {
+            if (rule.mandatory() == false &&
+                excludedRules.contains(rule.getClass())) {
+                continue;
+            }
+            result.add(rule);
+        }
+        return result;
+    }
+
+    private LogicalPlan tryApplyRules(List<Rule<?>> rules,
+                                      LogicalPlan plan,
+                                      PlanStats planStats,
+                                      TransactionContext txnCtx,
+                                      OptimizerTracer tracer,
+                                      Session.TimeoutToken timeoutToken) {
+        LogicalPlan node = plan;
+        // Some rules may only become applicable after another rule triggered, so we keep
+        // trying to re-apply the rules as long as at least one plan was transformed.
+        boolean done = false;
+        int numIterations = 0;
+        Rule.Context ruleContext = new Rule.Context(planStats, txnCtx, nodeCtx, UnaryOperator.identity(), timeoutToken);
+        Version minVersion = minNodeVersionInCluster.get();
+        while (!done && numIterations < 10_000) {
+            if (numIterations % 100 == 0) {
+                // Intermediate check to throw early.
+                // Overall planning time is checked one more time right before execute once plan is created
+                timeoutToken.check("Optimizer");
+            }
+            done = true;
+            for (Rule<?> rule : rules) {
+                if (minVersion.before(rule.requiredVersion())) {
+                    continue;
+                }
+                LogicalPlan transformedPlan = tryMatchAndApply(rule, node, ruleContext, tracer);
+                if (transformedPlan != null) {
+                    tracer.ruleApplied(rule, transformedPlan, ruleContext.planStats());
+                    node = transformedPlan;
+                    done = false;
+                }
+            }
+            numIterations++;
+        }
+        assert numIterations < 10_000
+            : "Optimizer reached 10_000 iterations safety guard. This is an indication of a broken rule that matches again and again";
+        return node;
+    }
+
+    @Nullable
+    public static <T> LogicalPlan tryMatchAndApply(Rule<T> rule,
+                                                   LogicalPlan node,
+                                                   Rule.Context ruleContext,
+                                                   OptimizerTracer tracer) {
+        Match<T> match = rule.pattern().accept(node, Captures.empty(), ruleContext.resolvePlan());
+        if (match.isPresent()) {
+            tracer.ruleMatched(rule);
+            return rule.apply(match.value(), match.captures(), ruleContext);
+        }
+        return null;
+    }
+}

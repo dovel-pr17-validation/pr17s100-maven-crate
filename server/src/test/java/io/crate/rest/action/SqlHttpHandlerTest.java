@@ -1,0 +1,331 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.rest.action;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import java.net.InetAddress;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+
+import org.elasticsearch.common.breaker.CircuitBreakingException;
+import org.elasticsearch.common.breaker.NoopCircuitBreaker;
+import org.elasticsearch.common.settings.Settings;
+import org.junit.Test;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mockito;
+
+import io.crate.auth.AlwaysOKAuthentication;
+import io.crate.auth.Authentication;
+import io.crate.auth.AuthenticationMethod;
+import io.crate.auth.AuthenticationMethod.AuthToken;
+import io.crate.auth.Credentials;
+import io.crate.auth.Protocol;
+import io.crate.metadata.settings.CoordinatorSessionSettings;
+import io.crate.protocols.http.HttpAuthenticator;
+import io.crate.protocols.http.MainAndStaticFileHandler;
+import io.crate.protocols.postgres.ConnectionProperties;
+import io.crate.role.Role;
+import io.crate.role.Roles;
+import io.crate.role.metadata.RolesHelper;
+import io.crate.session.Session;
+import io.crate.session.Sessions;
+import io.crate.test.integration.CrateDummyClusterServiceUnitTest;
+import io.crate.testing.SQLExecutor;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelPromise;
+import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.handler.codec.http.DefaultFullHttpRequest;
+import io.netty.handler.codec.http.DefaultHttpHeaders;
+import io.netty.handler.codec.http.FullHttpRequest;
+import io.netty.handler.codec.http.FullHttpResponse;
+import io.netty.handler.codec.http.HttpMethod;
+import io.netty.handler.codec.http.HttpResponseStatus;
+import io.netty.handler.codec.http.HttpVersion;
+
+@SuppressWarnings("resource")
+public class SqlHttpHandlerTest extends CrateDummyClusterServiceUnitTest {
+
+    private static HttpAuthenticator authenticator(Roles roles) {
+        return new HttpAuthenticator(Settings.EMPTY, new AlwaysOKAuthentication(roles), roles);
+    }
+
+    @Test
+    public void testSessionSettingsArePreservedAcrossRequests() {
+        Role dummyUser = RolesHelper.userOf("crate");
+        var sessionSettings = new CoordinatorSessionSettings(dummyUser);
+
+        var mockedSession = mock(Session.class);
+        when(mockedSession.sessionSettings()).thenReturn(sessionSettings);
+
+        var mockedClientAddress = mock(InetAddress.class);
+        var mockedSqlOperations = mock(Sessions.class);
+        var connectionProperties = new ConnectionProperties(null, mockedClientAddress, Protocol.HTTP, null);
+        when(mockedSqlOperations.newSession(connectionProperties, null, dummyUser)).thenReturn(mockedSession);
+
+        var mockedRequest = mock(FullHttpRequest.class);
+        when(mockedRequest.headers()).thenReturn(new DefaultHttpHeaders());
+
+        Roles roles = () -> List.of(dummyUser);
+        SqlHttpHandler handler = new SqlHttpHandler(
+            mockedSqlOperations,
+            _ -> new NoopCircuitBreaker("dummy"),
+            roles
+        );
+
+        // 1st call to ensureSession creates a session instance bound to 'dummyUser'
+        var session = handler.ensureSession(dummyUser, connectionProperties, mockedRequest);
+        verify(mockedRequest, Mockito.atLeast(1)).headers();
+        assertThat(session.sessionSettings().authenticatedUser()).isEqualTo(dummyUser);
+        assertThat(session.sessionSettings().searchPath().currentSchema()).contains("doc");
+        assertThat(session.sessionSettings().hashJoinsEnabled()).isTrue();
+
+        // modify the session settings
+        session.sessionSettings().setSearchPath("dummy_path");
+        session.sessionSettings().setHashJoinEnabled(false);
+
+        // test that the 2nd call to ensureSession will retrieve the session settings modified previously
+        session = handler.ensureSession(dummyUser, connectionProperties, mockedRequest);
+        assertThat(session.sessionSettings().hashJoinsEnabled()).isFalse();
+        assertThat(session.sessionSettings().searchPath().currentSchema()).contains("dummy_path");
+    }
+
+    @Test
+    public void test_partial_result_is_cleared_when_sending_an_error() {
+        Role dummyUser = RolesHelper.userOf("crate");
+        var sessionSettings = new CoordinatorSessionSettings(dummyUser);
+        var mockedSession = mock(Session.class);
+        when(mockedSession.sessionSettings()).thenReturn(sessionSettings);
+
+        var sessions = mock(Sessions.class);
+        when(sessions.newSession(any(), any(), any())).thenReturn(mockedSession);
+
+        Roles roles = () -> List.of(Role.CRATE_USER);
+        SqlHttpHandler handler = new SqlHttpHandler(
+            sessions,
+            _ -> new NoopCircuitBreaker("dummy"),
+            roles
+        );
+
+        // Imitate buffer holding results of partial success.
+        // For example, result set construction can be interrupted by CBE.
+        ByteBuf resultBuffer = Unpooled.buffer();
+        resultBuffer.writeBytes("dummy data written before it was interrupted".getBytes(StandardCharsets.UTF_8));
+
+        var request = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.POST, "http://localhost:4200/sql");
+
+        ChannelHandlerContext ctx = mock(ChannelHandlerContext.class);
+        ChannelPromise promise = mock(ChannelPromise.class);
+        when(ctx.newPromise()).thenReturn(promise);
+        ArgumentCaptor<FullHttpResponse> responseCaptor = ArgumentCaptor.forClass(FullHttpResponse.class);
+        when(ctx.writeAndFlush(responseCaptor.capture(), eq(promise))).thenReturn(promise);
+
+        // Create internal session as it shouldn't be null for the test.
+        var session = handler.ensureSession(dummyUser, null, request);
+        handler.sendResponse(session.sessionSettings(), ctx, request, Map.of(), resultBuffer, new CircuitBreakingException("CBE"));
+
+        FullHttpResponse response = responseCaptor.getValue();
+        ByteBuf responseContent = response.content();
+        String responseBody = responseContent.toString(StandardCharsets.UTF_8);
+        assertThat(responseBody).doesNotContain("dummy data written before it was interrupted");
+        assertThat(responseBody).contains("CBE");
+        assertThat(response.status()).isEqualTo(HttpResponseStatus.INTERNAL_SERVER_ERROR);
+    }
+
+    @Test
+    public void session_creation_failure_does_not_leak_request() {
+        Role dummyUser = RolesHelper.userOf("crate");
+        var sessionSettings = new CoordinatorSessionSettings(dummyUser);
+        var mockedSession = mock(Session.class);
+        when(mockedSession.sessionSettings()).thenReturn(sessionSettings);
+
+        var sessions = mock(Sessions.class);
+        when(sessions.newSession(any(), any(), any())).thenThrow(new RuntimeException("dummy"));
+
+        Roles roles = () -> List.of(Role.CRATE_USER);
+        SqlHttpHandler sqlHttpHandler = new SqlHttpHandler(
+            sessions,
+            _ -> new NoopCircuitBreaker("dummy"),
+            roles
+        );
+
+        EmbeddedChannel channel = new EmbeddedChannel(authenticator(roles), sqlHttpHandler);
+        var request = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.POST, "/_sql");
+        try {
+            channel.writeInbound(request);
+        } catch (Exception ignored) { }
+        assertThat(request.refCnt()).isEqualTo(0);
+    }
+
+    @Test
+    public void test_unauthenticated_request_is_rejected_with_401_and_released() {
+        var sessions = mock(Sessions.class);
+        Roles roles = List::of;
+        SqlHttpHandler handler = new SqlHttpHandler(
+            sessions,
+            _ -> new NoopCircuitBreaker("dummy"),
+            roles
+        );
+
+        EmbeddedChannel channel = new EmbeddedChannel(authenticator(roles), handler);
+        var request = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.POST, "/_sql");
+        channel.writeInbound(request);
+
+        verify(sessions, never()).newSession(any(), any(), any());
+        assertThat(request.refCnt()).isEqualTo(0);
+        FullHttpResponse response = channel.readOutbound();
+        try {
+            assertThat(response.status()).isEqualTo(HttpResponseStatus.UNAUTHORIZED);
+        } finally {
+            response.release();
+        }
+    }
+
+    @Test
+    public void test_session_uses_user_resolved_by_authenticator_not_the_trusted_default_user() {
+        Role limitedUser = RolesHelper.userOf("limited_user");
+        AuthenticationMethod certAuth = mock(AuthenticationMethod.class);
+        when(certAuth.authenticate(any(Credentials.class), any(ConnectionProperties.class)))
+            .thenReturn(AuthToken.of(limitedUser));
+        Authentication authentication = mock(Authentication.class);
+        when(authentication.resolveAuthenticationType(any(), any(ConnectionProperties.class))).thenReturn(certAuth);
+
+        var sessions = mock(Sessions.class);
+        when(sessions.newSession(any(), any(), any())).thenThrow(new RuntimeException("stop after session creation"));
+
+        Roles roles = () -> List.of(Role.CRATE_USER, limitedUser);
+        SqlHttpHandler handler = new SqlHttpHandler(
+            sessions,
+            _ -> new NoopCircuitBreaker("dummy"),
+            roles
+        );
+
+        EmbeddedChannel channel = new EmbeddedChannel(
+            new HttpAuthenticator(Settings.EMPTY, authentication, roles),
+            handler
+        );
+        var request = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.POST, "/_sql");
+        try {
+            channel.writeInbound(request);
+        } catch (Exception ignored) { }
+
+        verify(sessions).newSession(any(), any(), eq(limitedUser));
+        verify(sessions, never()).newSession(any(), any(), eq(Role.CRATE_USER));
+        assertThat(request.refCnt()).isEqualTo(0);
+    }
+
+    @Test
+    public void test_send_response_failure_sent_to_a_client() throws Exception {
+        var mockedSession = mock(Session.class);
+        // Imitate that sendResponse failed for whatever reason
+        when(mockedSession.sessionSettings()).thenThrow(new RuntimeException("dummy"));
+        var sessions = mock(Sessions.class);
+        when(sessions.newSession(any(), any(), any())).thenReturn(mockedSession);
+
+        Roles roles = () -> List.of(RolesHelper.userOf("crate"));
+        SqlHttpHandler handler = new SqlHttpHandler(
+            sessions,
+            _ -> new NoopCircuitBreaker("dummy"),
+            roles
+        );
+
+        EmbeddedChannel channel = new EmbeddedChannel(
+            authenticator(roles),
+            handler,
+            // Last handler that is catching all exceptions and sending error back to the client.
+            new MainAndStaticFileHandler("node", Path.of("a", "b"), null)
+        );
+        var request = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.POST, "/_sql");
+
+        channel.writeInbound(request);
+
+        assertThat(request.refCnt()).isEqualTo(0);
+        FullHttpResponse response = null;
+        try {
+            response = channel.readOutbound();
+            assertThat(response).isNotNull();
+            assertThat(response.status()).isEqualTo(HttpResponseStatus.INTERNAL_SERVER_ERROR);
+            assertThat(response.content().toString(StandardCharsets.UTF_8)).contains("dummy");
+        } finally {
+            if (response != null) {
+                // EmbeddedChannel.doWrite retains buffer written in MainAndStaticFileHandler.send500().
+                // After readOutbound() call, test gets an ownership of the buffer, need to release it explicitly.
+                response.release();
+            }
+
+        }
+    }
+
+    @Test
+    public void test_channel_unregistered_during_execution_can_send_response() throws Exception {
+        var sessions = SQLExecutor.of(clusterService).sqlOperations;
+        Roles roles = () -> List.of(Role.CRATE_USER);
+        SqlHttpHandler handler = spy(new SqlHttpHandler(
+            sessions,
+            _ -> new NoopCircuitBreaker("dummy"),
+            roles
+        ));
+
+        doAnswer(invocation -> {
+            // Imitate that session was set to null via channelUnregistered
+            // during execution that failed with some exception.
+            // sendResponse should be safe from NPE regardless
+            handler.session = null;
+            return CompletableFuture.failedFuture(new RuntimeException("dummy"));
+        }).when(handler).handleSQLRequest(any(), any(), any(), anyBoolean());
+        EmbeddedChannel channel = new EmbeddedChannel(authenticator(roles), handler);
+
+        var request = new DefaultFullHttpRequest(
+            HttpVersion.HTTP_1_1, HttpMethod.POST,
+            "/_sql",
+            Unpooled.copiedBuffer("{\"stmt\":\"select 1\"}", StandardCharsets.UTF_8)
+        );
+
+        channel.writeInbound(request);
+
+        FullHttpResponse response = null;
+        try {
+            response = channel.readOutbound();
+            assertThat(response).isNotNull();
+            assertThat(response.status()).isEqualTo(HttpResponseStatus.INTERNAL_SERVER_ERROR);
+            assertThat(response.content().toString(StandardCharsets.UTF_8)).contains("dummy");
+        } finally {
+            if (response != null) {
+                response.release();
+            }
+        }
+    }
+}

@@ -1,0 +1,159 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.execution.dsl.projection;
+
+import java.io.IOException;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+
+import org.elasticsearch.common.io.stream.StreamInput;
+import org.elasticsearch.common.io.stream.StreamOutput;
+import org.jspecify.annotations.Nullable;
+
+import io.crate.expression.symbol.SelectSymbol;
+import io.crate.expression.symbol.Symbol;
+import io.crate.metadata.Reference;
+import io.crate.metadata.RowGranularity;
+
+public class SysUpdateProjection extends Projection {
+
+    private final Symbol uidSymbol;
+
+    private Map<Reference, Symbol> assignments;
+
+    private Symbol[] outputs;
+
+    @Nullable
+    private Symbol[] returnValues;
+
+    public SysUpdateProjection(Symbol uidSymbol,
+                               Map<Reference, Symbol> assignments,
+                               Symbol[] outputs,
+                               @Nullable Symbol[] returnValues
+    ) {
+        this.uidSymbol = uidSymbol;
+        this.assignments = assignments;
+        this.returnValues = returnValues;
+        assert Arrays.stream(outputs).noneMatch(s -> s.any(Symbol.IS_COLUMN.or(x -> x instanceof SelectSymbol)))
+            : "Cannot operate on Reference, Field or SelectSymbol symbols: " + outputs;
+        this.outputs = outputs;
+    }
+
+    public SysUpdateProjection(StreamInput in) throws IOException {
+        uidSymbol = Symbol.fromStream(in);
+        int numAssignments = in.readVInt();
+        assignments = new HashMap<>(numAssignments, 1.0f);
+        for (int i = 0; i < numAssignments; i++) {
+            assignments.put(Reference.fromStream(in), Symbol.fromStream(in));
+        }
+        int outputSize = in.readVInt();
+        outputs = new Symbol[outputSize];
+        for (int i = 0; i < outputSize; i++) {
+            outputs[i] = Symbol.fromStream(in);
+        }
+        int returnValuesSize = in.readVInt();
+        if (returnValuesSize > 0) {
+            returnValues = new Symbol[returnValuesSize];
+            for (int i = 0; i < returnValuesSize; i++) {
+                returnValues[i] = Symbol.fromStream(in);
+            }
+        }
+    }
+
+    @Override
+    public void writeTo(StreamOutput out) throws IOException {
+        Symbol.toStream(uidSymbol, out);
+        out.writeVInt(assignments.size());
+        for (Map.Entry<Reference, Symbol> e : assignments.entrySet()) {
+            Reference.toStream(out, e.getKey());
+            Symbol.toStream(e.getValue(), out);
+        }
+
+        out.writeVInt(outputs.length);
+        for (int i = 0; i < outputs.length; i++) {
+            Symbol.toStream(outputs[i], out);
+        }
+        if (returnValues != null) {
+            out.writeVInt(returnValues.length);
+            for (int i = 0; i < returnValues.length; i++) {
+                Symbol.toStream(returnValues[i], out);
+            }
+        } else {
+            out.writeVInt(0);
+        }
+    }
+
+    @Override
+    public ProjectionType projectionType() {
+        return ProjectionType.SYS_UPDATE;
+    }
+
+    @Nullable
+    public Symbol[] returnValues() {
+        return returnValues;
+    }
+
+    @Override
+    public List<? extends Symbol> outputs() {
+        return List.of(outputs);
+    }
+
+    @Override
+    public <C, R> R accept(ProjectionVisitor<C, R> visitor, C context) {
+        return visitor.visitSysUpdateProjection(this, context);
+    }
+
+    public Map<Reference, Symbol> assignments() {
+        return assignments;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+        SysUpdateProjection that = (SysUpdateProjection) o;
+        return Objects.equals(uidSymbol, that.uidSymbol) &&
+               Objects.equals(assignments, that.assignments) &&
+               Arrays.equals(outputs, that.outputs) &&
+               Arrays.equals(returnValues, that.returnValues);
+    }
+
+    @Override
+    public int hashCode() {
+        int result = Objects.hash(super.hashCode(), uidSymbol, assignments);
+        result = 31 * result + Arrays.hashCode(outputs);
+        result = 31 * result + Arrays.hashCode(returnValues);
+        return result;
+    }
+
+    @Override
+    public RowGranularity requiredGranularity() {
+        return RowGranularity.NODE;
+    }
+}

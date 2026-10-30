@@ -1,0 +1,95 @@
+.. _version_6.4.2:
+
+=============
+Version 6.4.2
+=============
+
+Released on 2026-08-04.
+
+.. NOTE::
+
+    If you are upgrading a cluster, you must be running CrateDB 5.0.0 or higher
+    before you upgrade to 6.4.2.
+
+    We recommend that you upgrade to the latest 6.3 release before moving to
+    6.4.2.
+
+    A rolling upgrade from >= 6.3.0 to 6.4.2 is supported.
+    Before upgrading, you should `back up your data`_.
+
+.. WARNING::
+
+    Tables that were created before CrateDB 5.x will not function with 6.x
+    and must be recreated before moving to 6.x.x.
+
+    You can recreate tables using ``COPY TO`` and ``COPY FROM`` or by
+    `inserting the data into a new table`_.
+
+.. _back up your data: https://cratedb.com/docs/crate/reference/en/latest/admin/snapshots.html
+.. _inserting the data into a new table: https://cratedb.com/docs/crate/reference/en/latest/admin/system-information.html#tables-need-to-be-recreated
+
+.. rubric:: Table of contents
+
+.. contents::
+   :local:
+
+
+See the :ref:`version_6.4.0` release notes for a full list of changes in the 6.4
+series.
+
+Fixes
+=====
+
+- Fixed a rare issue where ``INSERT`` statements running concurrently with
+  ``SWAP TABLE`` could insert data into the wrong table.
+
+- Fixed an issue that could cause a :ref:`CREATE ANALYZER <ref-create-analyzer>`
+  statement to not preserve the order of ``TOKEN_FILTERS`` and ``CHAR_FILTERS``.
+  As the filters are applied as an ordered chain, this could silently change
+  analysis results.
+
+- Fixed an issue that could cause ``SUM`` over ``DOUBLE PRECISION`` or ``FLOAT``
+  values to return ``NaN`` instead of ``Infinity`` for a grouped result, when a
+  different group in the same query overflowed the floating point range. The
+  result of ``SUM`` no longer depends on the order in which groups are
+  processed.
+
+- Fixed a rare issue that causes queries involving foreign tables to throw
+  ``UnsupportedOperationException``.
+
+- Fixed an issue that caused casts of tables created before ``6.3`` to
+  ``REGCLASS`` to incorrectly return ``0``.
+
+- Bumped the PostgreSQL JDBC driver used by the
+  :ref:`JDBC foreign data wrapper <administration-fdw-jdbc>` to ``42.7.13``
+  because of `CVE-2026-54291 <https://nvd.nist.gov/vuln/detail/CVE-2026-54291>`_,
+  a SCRAM channel-binding downgrade in the driver. CrateDB isn't affected by
+  default, since a foreign server only uses channel binding if a user
+  explicitly sets ``channelBinding=require`` on its JDBC URL.
+
+- Fixed an issue that caused
+  :ref:`pg_table_is_visible <scalar-pg_table_is_visible>` and
+  :ref:`has_table_privilege <scalar-has-table-priv>` to return incorrect
+  results for OID ``0`` and for OIDs of tables created before
+  :ref:`version_6.3.0`.
+
+- `Dhruv Patel <https://github.com/DHRUV6029>`_  fixed an issue that caused
+  :ref:`stddev_pop() <aggregation-stddev-pop>`, :ref:`stddev_samp()
+  <aggregation-stddev-samp>`, :ref:`stddev() <aggregation-stddev>` and
+  :ref:`variance() <aggregation-variance>` to return ``NULL`` (or, for
+  ``variance``, a negative number) instead of ``0`` when aggregating
+  large-magnitude values with little or no spread, such as a constant ``DATE``
+  or ``TIMESTAMP``.
+
+- Fixed an issue that led to ``NullPointerException`` being thrown when
+  :ref:`creating an S3 repository <sql-create-repo-s3>` on Linux ARM64. Special
+  thanks to `Robert Palmer <https://github.com/robd003>`_ for fixing the issue
+  on the upstream project.
+
+- Fixed an optimizer bug that could drop filters on aliased bare boolean
+  columns in join queries.
+
+- Fixed an issue that caused a ``SELECT`` with ``LIMIT`` and ``ORDER BY`` on a
+  :ref:`view <ddl-views>` column that aliases a column of a joined relation to
+  contain duplicate entries of the column (plain & aliased) in the fetch list,
+  or fail with ```Must have an orderByPosition for each symbol``.

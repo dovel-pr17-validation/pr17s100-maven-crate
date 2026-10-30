@@ -1,0 +1,54 @@
+.. _version_6.3.6:
+
+=============
+Version 6.3.6
+=============
+
+Released on 2026-07-20.
+
+.. NOTE::
+
+    If you are upgrading a cluster, you must be running CrateDB 5.0.0 or higher
+    before you upgrade to 6.3.6.
+
+    We recommend that you upgrade to the latest 6.2 release before moving to
+    6.3.6.
+
+    A rolling upgrade from >= 6.2.0 to 6.3.6 is supported.
+    Before upgrading, you should `back up your data`_.
+
+.. WARNING::
+
+    Tables that were created before CrateDB 5.x will not function with 6.x
+    and must be recreated before moving to 6.x.x.
+
+    You can recreate tables using ``COPY TO`` and ``COPY FROM`` or by
+    `inserting the data into a new table`_.
+
+.. _back up your data: https://cratedb.com/docs/crate/reference/en/latest/admin/snapshots.html
+.. _inserting the data into a new table: https://cratedb.com/docs/crate/reference/en/latest/admin/system-information.html#tables-need-to-be-recreated
+
+.. rubric:: Table of contents
+
+.. contents::
+   :local:
+
+
+See the :ref:`version_6.3.0` release notes for a full list of changes in the 6.3
+series.
+
+Fixes
+=====
+
+- Changed swap table and rename table operations to reallocate shards again -
+  reverting the change from 6.3.0. This will cause swap and rename operations to
+  interrupt in-progress snapshots again but solves an issue where creating
+  partitions on a previously swapped table could lead to duplicate index names
+  in the cluster, breaking snapshot functionality until a duplicate partition
+  was deleted again.
+
+- Fixed an issue that would throw an error when using :ref:`pg_sleep()
+  <scalar-pg_sleep>` function in the ``SELECT`` clause.
+
+- Fixed an issue that caused casts of foreign tables to ``REGCLASS`` to
+  incorrectly return ``0``.

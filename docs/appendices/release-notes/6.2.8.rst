@@ -1,0 +1,67 @@
+.. _version_6.2.8:
+
+=============
+Version 6.2.8
+=============
+
+Released on 2026-05-13.
+
+.. NOTE::
+
+    If you are upgrading a cluster, you must be running CrateDB 5.0.0 or higher
+    before you upgrade to 6.2.8.
+
+    We recommend that you upgrade to the latest 6.1 release before moving to
+    6.2.8.
+
+    A rolling upgrade from >= 6.1.2 to 6.2.8 is supported. Doing a rolling
+    upgrade from an earlier version than 6.1.2 can cause runtime errors when
+    executing statements relying on implicit casts.
+
+    Before upgrading, you should `back up your data`_.
+
+.. WARNING::
+
+    Tables that were created before CrateDB 5.x will not function with 6.x
+    and must be recreated before moving to 6.x.x.
+
+    You can recreate tables using ``COPY TO`` and ``COPY FROM`` or by
+    `inserting the data into a new table`_.
+
+.. _back up your data: https://cratedb.com/docs/crate/reference/en/latest/admin/snapshots.html
+.. _inserting the data into a new table: https://cratedb.com/docs/crate/reference/en/latest/admin/system-information.html#tables-need-to-be-recreated
+
+.. rubric:: Table of contents
+
+.. contents::
+   :local:
+
+
+See the :ref:`version_6.2.0` release notes for a full list of changes in the 6.2
+series.
+
+Fixes
+=====
+
+- Fixed an issue that could cause queries against ``sys.allocations`` to fail if
+  concurrently resizing the shards of a table.
+
+- Fixed a performance regression introduced in 6.0.0 that could cause ``INSERT
+  INTO <table> VALUES (...)`` bulk statements that hit many shards to be less
+  aggressive than possible, taking longer than necessary.
+
+  To mitigate the issue in earlier versions it is also possible to increase the
+  size of the :ref:`write thread pool <thread_pool.<name>.queue_size>`.
+
+- Fixed an issue that lead to a ``NullPointerException`` error on selects from
+  the :ref:`sys.snapshots <sys-snapshots>` table and simultaneously deleting
+  tables or partitions and running ``CREATE SNAPSHOT``
+
+- Fixed an issue that could lead to an ``OutOfMemoryError`` when running a
+  distributed query with aggregations or joins under memory pressure.
+
+- Fixed an authorization issue for ``_blobs`` HTTP endpoint. For more details
+  please the `Security advisory`_.
+
+
+.. _Security advisory: https://github.com/crate/crate/security/advisories/GHSA-2xv8-gjwh-fv8p

@@ -1,0 +1,1028 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.session;
+
+import static io.crate.role.metadata.RolesHelper.roleOf;
+import static io.crate.role.metadata.RolesHelper.userOf;
+import static io.crate.session.Session.UNNAMED;
+import static io.crate.testing.Asserts.assertThat;
+import static java.util.concurrent.CompletableFuture.completedFuture;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+
+import org.elasticsearch.client.Client;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.metadata.Metadata;
+import org.elasticsearch.common.breaker.NoopCircuitBreaker;
+import org.elasticsearch.test.ClusterServiceUtils;
+import org.elasticsearch.threadpool.ThreadPool;
+import org.junit.Test;
+import org.mockito.Answers;
+import org.mockito.Mockito;
+import org.mockito.invocation.InvocationOnMock;
+import org.mockito.stubbing.Answer;
+
+import io.crate.analyze.AnalyzedStatement;
+import io.crate.analyze.where.EqualityExtractorTest;
+import io.crate.auth.Protocol;
+import io.crate.common.collections.BlockingEvictingQueue;
+import io.crate.common.unit.TimeValue;
+import io.crate.data.InMemoryBatchIterator;
+import io.crate.data.Row;
+import io.crate.data.RowConsumer;
+import io.crate.data.testing.TestingBatchIterators;
+import io.crate.exceptions.JobKilledException;
+import io.crate.exceptions.MissingPrivilegeException;
+import io.crate.execution.dml.BulkResponse;
+import io.crate.execution.engine.collect.stats.QueueSink;
+import io.crate.execution.jobs.kill.KillJobsNodeAction;
+import io.crate.execution.jobs.kill.KillJobsNodeRequest;
+import io.crate.metadata.settings.CoordinatorSessionSettings;
+import io.crate.metadata.sys.SysShardsTableInfo;
+import io.crate.planner.DependencyCarrier;
+import io.crate.planner.Plan;
+import io.crate.planner.Planner;
+import io.crate.planner.PlannerContext;
+import io.crate.planner.operators.SubQueryResults;
+import io.crate.protocols.postgres.ConnectionProperties;
+import io.crate.protocols.postgres.FormatCodes.FormatCode;
+import io.crate.protocols.postgres.Portal;
+import io.crate.role.GrantedRole;
+import io.crate.role.Permission;
+import io.crate.role.Policy;
+import io.crate.role.Privilege;
+import io.crate.role.Role;
+import io.crate.role.Securable;
+import io.crate.role.StubRoleManager;
+import io.crate.role.metadata.RolesMetadata;
+import io.crate.sql.parser.ParsingException;
+import io.crate.sql.tree.Declare.Hold;
+import io.crate.test.integration.CrateDummyClusterServiceUnitTest;
+import io.crate.testing.SQLExecutor;
+import io.crate.types.DataType;
+import io.crate.types.DataTypes;
+
+public class SessionTest extends CrateDummyClusterServiceUnitTest {
+
+    @Test
+    public void test_parse_fails_with_multiple_statements() {
+        SQLExecutor sqlExecutor = SQLExecutor.builder(clusterService).build();
+        try (Session session = sqlExecutor.createSession()) {
+            assertThatThrownBy(() -> session.parse("S_1", "select 1; select 2;", Collections.emptyList()))
+                .isExactlyInstanceOf(ParsingException.class)
+                .hasMessage("line 1:11: mismatched input 'select' expecting <EOF>");
+        }
+    }
+
+    @Test
+    public void test_out_of_bounds_getParamType_fails() throws Exception {
+        SQLExecutor sqlExecutor = SQLExecutor.builder(clusterService).build();
+        try (Session session = sqlExecutor.createSession()) {
+            session.parse("S_1", "Select 1 + ? + ?;", Collections.emptyList());
+            assertThatThrownBy(() -> session.getParamType("S_1", 3))
+                .isExactlyInstanceOf(IllegalArgumentException.class)
+                .hasMessage("Requested parameter index exceeds the number of parameters: 3");
+        }
+    }
+
+    @Test
+    public void test_getParamType_returns_types_infered_from_statement() {
+        SQLExecutor sqlExecutor = SQLExecutor.builder(clusterService).build();
+        try (Session session = sqlExecutor.createSession()) {
+
+            session.parse("S_1", "Select 1 + ? + ?;", Collections.emptyList());
+            assertThat(session.getParamType("S_1", 0)).isEqualTo(DataTypes.INTEGER);
+            assertThat(session.getParamType("S_1", 1)).isEqualTo(DataTypes.INTEGER);
+
+            DescribeResult describe = session.describe('S', "S_1");
+            assertThat(describe.getParameters()).isEqualTo(new DataType[]{DataTypes.INTEGER, DataTypes.INTEGER});
+
+            assertThat(session.getParamType("S_1", 0)).isEqualTo(DataTypes.INTEGER);
+            assertThat(session.getParamType("S_1", 1)).isEqualTo(DataTypes.INTEGER);
+        }
+    }
+
+    @Test
+    public void test_select_query_executed_on_session_execute_method() {
+        SQLExecutor sqlExecutor = SQLExecutor.builder(clusterService).build();
+        Session session = spy(sqlExecutor.createSession());
+
+        var activeExecutionFuture = CompletableFuture.completedFuture(null);
+        doReturn(activeExecutionFuture)
+            .when(session)
+            .singleExec(any(Portal.class), any(ResultReceiver.class), anyInt());
+
+        session.parse("S_1", "select name from sys.cluster;", List.of());
+        session.bind("Portal", "S_1", Collections.emptyList(), null);
+        session.describe('S', "S_1");
+        session.execute("Portal", 1, new BaseResultReceiver());
+
+        assertThat(session.portals).hasSize(1);
+        assertThat(session.preparedStatements).hasSize(1);
+        assertThat(session.deferredExecutionsByStmt).hasSize(0);
+
+        session.close();
+
+        assertThat(session.portals).hasSize(0);
+        assertThat(session.preparedStatements).hasSize(0);
+        assertThat(session.deferredExecutionsByStmt).hasSize(0);
+    }
+
+    @Test
+    public void test_flush_triggers_deferred_executions_and_sets_active_execution() throws Exception {
+        Planner planner = mock(Planner.class, Answers.RETURNS_MOCKS);
+        SQLExecutor sqlExecutor = SQLExecutor.builder(clusterService).setPlanner(planner)
+            .build()
+            .addTable("create table users (name text)");
+        Session session = spy(sqlExecutor.createSession());
+        session.parse("", "insert into users (name) values (?)", List.of());
+        session.bind("", "", List.of("Arthur"), null);
+        session.execute("", -1, new BaseResultReceiver());
+        assertThat(session.deferredExecutionsByStmt).hasSize(1);
+        session.flush();
+        assertThat(session.deferredExecutionsByStmt).hasSize(0);
+    }
+
+    @Test
+    public void testProperCleanupOnSessionClose() {
+        SQLExecutor sqlExecutor = SQLExecutor.builder(clusterService).build();
+
+        Session session = sqlExecutor.createSession();
+
+        session.parse("S_1", "select name from sys.cluster;", Collections.emptyList());
+        session.bind("Portal", "S_1", Collections.emptyList(), null);
+        session.describe('S', "S_1");
+
+        session.parse("S_2", "select id from sys.cluster", Collections.emptyList());
+        session.bind("", "S_2", Collections.emptyList(), null);
+        session.describe('S', "S_2");
+
+        assertThat(session.portals).hasSize(2);
+        assertThat(session.preparedStatements).hasSize(2);
+        assertThat(session.deferredExecutionsByStmt).hasSize(0);
+
+        session.close();
+
+        assertThat(session.portals).hasSize(0);
+        assertThat(session.preparedStatements).hasSize(0);
+        assertThat(session.deferredExecutionsByStmt).hasSize(0);
+    }
+
+    @Test
+    public void testDeallocateAllClearsAllPortalsAndPreparedStatements() {
+        SQLExecutor sqlExecutor = SQLExecutor.builder(clusterService).build();
+
+        DependencyCarrier executor = mock(DependencyCarrier.class);
+        when(executor.threadPool()).thenReturn(mock(ThreadPool.class));
+        Session session = sqlExecutor.createSession();
+
+        session.parse("S_1", "select * from sys.cluster;", Collections.emptyList());
+        session.bind("Portal", "S_1", Collections.emptyList(), null);
+        session.describe('S', "S_1");
+
+        session.parse("S_2", "DEALLOCATE ALL;", Collections.emptyList());
+        session.bind("", "S_2", Collections.emptyList(), null);
+        session.execute("", 0, new BaseResultReceiver());
+
+        assertThat(session.portals).hasSizeGreaterThan(0);
+        assertThat(session.preparedStatements).isEmpty();
+    }
+
+    @Test
+    public void testDeallocatePreparedStatementClearsPreparedStatement() {
+        SQLExecutor sqlExecutor = SQLExecutor.builder(clusterService).build();
+
+        DependencyCarrier executor = mock(DependencyCarrier.class);
+        when(executor.threadPool()).thenReturn(mock(ThreadPool.class));
+        Session session = sqlExecutor.createSession();
+
+        session.parse("test_prep_stmt", "select * from sys.cluster;", Collections.emptyList());
+        session.bind("Portal", "test_prep_stmt", Collections.emptyList(), null);
+        session.describe('S', "test_prep_stmt");
+
+        session.parse("stmt", "DEALLOCATE test_prep_stmt;", Collections.emptyList());
+        session.bind("", "stmt", Collections.emptyList(), null);
+        session.execute("", 0, new BaseResultReceiver());
+
+        assertThat(session.portals).hasSizeGreaterThan(0);
+        assertThat(session.preparedStatements).hasSize(1);
+        assertThat(session.preparedStatements.get("stmt").rawStatement()).isEqualTo("DEALLOCATE test_prep_stmt;");
+    }
+
+    @Test
+    public void test_closing_a_statement_closes_related_portals() {
+        SQLExecutor sqlExecutor = SQLExecutor.builder(clusterService).build();
+        Session session = sqlExecutor.createSession();
+
+        session.parse("S_1", "SELECT 1", List.of());
+        session.bind("P_1", "S_1", List.of(), null);
+
+        assertThat(session.portals).hasSize(1);
+        assertThat(session.preparedStatements).hasSize(1);
+
+        session.close((byte) 'S', "S_1");
+        assertThat(session.portals).isEmpty();
+        assertThat(session.preparedStatements).isEmpty();
+    }
+
+    @Test
+    public void test_can_describe_cursor_created_using_declare() throws Exception {
+        SQLExecutor sqlExecutor = SQLExecutor.builder(clusterService).build();
+        Session session = sqlExecutor.createSession();
+        session.parse("", "DECLARE c1 NO SCROLL CURSOR FOR select 1", List.of());
+        session.bind("", "", List.of(), null);
+        session.execute("", 0, new BaseResultReceiver());
+
+        DescribeResult describe = session.describe('P', "c1");
+        assertThat(describe.getFields()).satisfiesExactly(
+            x -> assertThat(x).isLiteral(1, DataTypes.INTEGER)
+        );
+
+        assertThat(session.portals).containsOnlyKeys("", "c1");
+
+        session.parse("", "CLOSE c1", List.of());
+        session.bind("", "", List.of(), null);
+        session.execute("", 0, new BaseResultReceiver());
+
+        assertThat(session.portals).containsOnlyKeys("");
+    }
+
+    @Test
+    public void test_discard_all_discards_all_portals_and_prepared_statements() throws Exception {
+        SQLExecutor sqlExecutor = SQLExecutor.builder(clusterService).build();
+        Session session = sqlExecutor.createSession();
+
+        session.parse("S_1", "SELECT 1", List.of());
+        session.bind("P_1", "S_1", List.of(), null);
+
+        assertThat(session.portals).hasSize(1);
+        assertThat(session.preparedStatements).hasSize(1);
+
+        session.parse("stmt", "DISCARD ALL", Collections.emptyList());
+        session.bind("", "stmt", Collections.emptyList(), null);
+        session.execute("", 0, new BaseResultReceiver());
+
+        assertThat(session.portals).isEmpty();
+        assertThat(session.preparedStatements).isEmpty();
+    }
+
+    @Test
+    public void test_bulk_operations_result_in_jobslog_entries() throws Exception {
+        Planner planner = mock(Planner.class, Answers.RETURNS_MOCKS);
+        SQLExecutor sqlExecutor = SQLExecutor.builder(clusterService)
+            .setPlanner(planner)
+            .build()
+            .addTable("create table t1 (x int)");
+        sqlExecutor.jobsLogs.setEnabled(true);
+        Session session = sqlExecutor.createSession();
+        when(planner.plan(any(AnalyzedStatement.class), any(PlannerContext.class)))
+            .thenReturn(
+                new Plan() {
+                    @Override
+                    public StatementType type() {
+                        return StatementType.INSERT;
+                    }
+
+                    @Override
+                    public void executeOrFail(DependencyCarrier dependencies,
+                                              PlannerContext plannerContext,
+                                              RowConsumer consumer,
+                                              Row params,
+                                              SubQueryResults subQueryResults) throws Exception {
+                        // Make sure `quickExec()` below completes, and its job is moved to jobs_log
+                        consumer.completionFuture().complete(null);
+                    }
+
+                    @Override
+                    public CompletableFuture<BulkResponse> executeBulk(DependencyCarrier executor,
+                                                                       PlannerContext plannerContext,
+                                                                       List<Row> bulkParams,
+                                                                       SubQueryResults subQueryResults) {
+                        // Do another execution to overwrite `mostRecentJobID`
+                        session.quickExec("SELECT 1", new BaseResultReceiver(), null);
+                        var response = new BulkResponse(2);
+                        response.update(0, 1L, null);
+                        response.update(1, 1L, null);
+                        return completedFuture(response);
+                    }
+                }
+            );
+
+        session.parse("S_1", "INSERT INTO t1 (x) VALUES (1)", List.of());
+        session.bind("P_1", "S_1", List.of(), null);
+        session.execute("P_1", 0, new BaseResultReceiver());
+
+        session.bind("P_1", "S_1", List.of(), null);
+        session.execute("P_1", 0, new BaseResultReceiver());
+
+        session.sync(false).get(5, TimeUnit.SECONDS);
+        assertThat(sqlExecutor.jobsLogs.metrics().iterator().next().totalCount()).isEqualTo(2L);
+        assertThat(sqlExecutor.jobsLogs.activeJobs().iterator().hasNext()).isFalse();
+    }
+
+    @Test
+    public void test_bulk_operation_execution_completes_receivers_in_order_on_async_all_finished() throws Exception {
+        Planner planner = mock(Planner.class, Answers.RETURNS_MOCKS);
+        SQLExecutor sqlExecutor = SQLExecutor.builder(clusterService)
+            .setPlanner(planner)
+            .build()
+            .addTable("create table t1 (x int)");
+        Session session = sqlExecutor.createSession();
+        when(planner.plan(any(AnalyzedStatement.class), any(PlannerContext.class)))
+            .thenReturn(
+                new Plan() {
+                    @Override
+                    public StatementType type() {
+                        return StatementType.INSERT;
+                    }
+
+                    @Override
+                    public void executeOrFail(DependencyCarrier dependencies,
+                                              PlannerContext plannerContext,
+                                              RowConsumer consumer,
+                                              Row params,
+                                              SubQueryResults subQueryResults) throws Exception {
+                        // Make sure `quickExec()` below completes, and its job is moved to jobs_log
+                        consumer.completionFuture().complete(null);
+                    }
+
+                    @Override
+                    public CompletableFuture<BulkResponse> executeBulk(DependencyCarrier executor,
+                                                                       PlannerContext plannerContext,
+                                                                       List<Row> bulkParams,
+                                                                       SubQueryResults subQueryResults) {
+                        var response = new BulkResponse(2);
+                        response.update(0, 1L, null);
+                        response.update(1, 1L, null);
+                        return completedFuture(response);
+                    }
+                }
+            );
+        session.parse("S_1", "INSERT INTO t1 (x) VALUES (1)", List.of());
+        session.bind("P_1", "S_1", List.of(), null);
+
+        ArrayList<Integer> completed = new ArrayList<>();
+        BaseResultReceiver receiver1 = new BaseResultReceiver() {
+            @Override
+            public void allFinished() {
+                Thread t = new Thread(() -> {
+                    try {
+                        Thread.sleep(200);
+                    } catch (InterruptedException e) {
+                        Thread.interrupted();
+                    }
+                    completed.add(1);
+                    super.allFinished();
+                });
+                t.start();
+            }
+        };
+        BaseResultReceiver receiver2 = new BaseResultReceiver() {
+            @Override
+            public void allFinished() {
+                completed.add(2);
+                super.allFinished();
+            }
+        };
+        session.execute("P_1", 0, receiver1);
+
+        session.bind("P_1", "S_1", List.of(), null);
+        session.execute("P_1", 0, receiver2);
+
+        assertThat(session.sync(true)).succeedsWithin(5, TimeUnit.SECONDS);
+        assertThat(receiver1.completionFuture()).isCompleted();
+        assertThat(receiver2.completionFuture()).isCompleted();
+        assertThat(completed).containsExactly(1, 2);
+    }
+
+    @Test
+    public void test_kills_query_if_not_completed_within_statement_timeout() throws Exception {
+        Planner planner = mock(Planner.class, Answers.RETURNS_MOCKS);
+        SQLExecutor sqlExecutor = SQLExecutor.builder(clusterService)
+            .setPlanner(planner)
+            .build();
+        when(planner.plan(any(AnalyzedStatement.class), any(PlannerContext.class)))
+            .thenReturn(
+                new Plan() {
+                    @Override
+                    public StatementType type() {
+                        return StatementType.INSERT;
+                    }
+
+                    @Override
+                    public void executeOrFail(DependencyCarrier dependencies,
+                                              PlannerContext plannerContext,
+                                              RowConsumer consumer,
+                                              Row params,
+                                              SubQueryResults subQueryResults) throws Exception {
+                    }
+
+                    @Override
+                    public CompletableFuture<BulkResponse> executeBulk(DependencyCarrier executor,
+                                                                       PlannerContext plannerContext,
+                                                                       List<Row> bulkParams,
+                                                                       SubQueryResults subQueryResults) {
+                        return new CompletableFuture<>();
+                    }
+                }
+            );
+
+        ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
+        DependencyCarrier dependencies = sqlExecutor.dependencyMock;
+        when(dependencies.scheduler()).thenReturn(scheduler);
+
+        Answer<ScheduledFuture<?>> triggerRunnable = new Answer<ScheduledFuture<?>>() {
+
+            @Override
+            public ScheduledFuture<?> answer(InvocationOnMock invocation) throws Throwable {
+                Runnable runnable = invocation.getArgument(0);
+                runnable.run();
+                return null;
+            }
+        };
+        when(scheduler.schedule(any(Runnable.class), Mockito.anyLong(), any(TimeUnit.class)))
+            .thenAnswer(triggerRunnable);
+        Client client = mock(Client.class);
+        when(dependencies.client()).thenReturn(client);
+
+        Session session = sqlExecutor.createSession();
+        // Using a bigger value for the timeout
+        // to ensure that parsing/analysis/planning doesn't timeout and only execute does.
+        session.sessionSettings().statementTimeout(TimeValue.timeValueMillis(1000));
+
+        session.parse("S_1", "SELECT 1", List.of());
+        session.bind("P_1", "S_1", List.of(), null);
+        session.execute("P_1", 0, new BaseResultReceiver());
+        session.sync(false);
+
+        verify(client, times(1))
+            .execute(eq(KillJobsNodeAction.INSTANCE), any(KillJobsNodeRequest.class));
+    }
+
+    @Test
+    public void test_statement_timeout_schedule_is_removed_for_finished_jobs() throws Exception {
+        Planner planner = mock(Planner.class, Answers.RETURNS_MOCKS);
+        Plan plan = new Plan() {
+            @Override
+            public StatementType type() {
+                return StatementType.INSERT;
+            }
+
+            @Override
+            public void executeOrFail(DependencyCarrier dependencies,
+                                      PlannerContext plannerContext,
+                                      RowConsumer consumer,
+                                      Row params,
+                                      SubQueryResults subQueryResults) throws Exception {
+                consumer.accept(InMemoryBatchIterator.empty(null), null);
+            }
+
+            @Override
+            public CompletableFuture<BulkResponse> executeBulk(DependencyCarrier executor,
+                                                               PlannerContext plannerContext,
+                                                               List<Row> bulkParams,
+                                                               SubQueryResults subQueryResults) {
+                return new CompletableFuture<>();
+            }
+        };
+        when(planner.plan(any(AnalyzedStatement.class), any(PlannerContext.class)))
+            .thenReturn(plan);
+        SQLExecutor sqlExecutor = SQLExecutor.builder(clusterService)
+            .setPlanner(planner)
+            .build();
+
+        DependencyCarrier dependencies = sqlExecutor.dependencyMock;
+        when(dependencies.scheduler()).thenReturn(THREAD_POOL.scheduler());
+        Session session = sqlExecutor.createSession();
+        session.sessionSettings().statementTimeout(TimeValue.timeValueMinutes(30));
+
+        for (int i = 0; i < 10; i++) {
+            session.parse("S_1", "SELECT 1", List.of());
+            session.bind("P_1", "S_1", List.of(), null);
+            session.execute("P_1", 0, new BaseResultReceiver());
+            session.sync(false);
+        }
+
+        BlockingQueue<Runnable> queue = ((ScheduledThreadPoolExecutor) THREAD_POOL.scheduler()).getQueue();
+        assertThat(queue).isEmpty();
+    }
+
+    @Test
+    public void test_parsing_throws_an_error_on_exceeding_statement_timeout() throws Exception {
+        Planner planner = mock(Planner.class, Answers.RETURNS_MOCKS);
+        SQLExecutor sqlExecutor = SQLExecutor.builder(clusterService)
+            .setPlanner(planner)
+            .build();
+        try (Session session = sqlExecutor.createSession()) {
+            session.sessionSettings().statementTimeout(TimeValue.timeValueMillis(10));
+            Session spy = spy(session);
+            when(spy.newTimeoutToken()).thenReturn(
+                new Session.TimeoutToken(
+                    session.sessionSettings().statementTimeout(),
+                    System.nanoTime() - TimeValue.timeValueMillis(11).nanos() // operation started 11 millis ago
+                )
+            );
+            assertThatThrownBy(() -> spy.parse(UNNAMED, "SELECT 1", List.of()))
+                .isExactlyInstanceOf(JobKilledException.class)
+                .hasMessage("Job killed. statement_timeout (10ms/parse)");
+        }
+    }
+
+    @Test
+    public void test_statement_timeout_previous_statement_time_is_not_accounted_for() throws Exception {
+        Planner planner = mock(Planner.class, Answers.RETURNS_MOCKS);
+        SQLExecutor sqlExecutor = SQLExecutor.builder(clusterService)
+            .setPlanner(planner)
+            .build();
+        try (Session session = sqlExecutor.createSession()) {
+            session.sessionSettings().statementTimeout(TimeValue.timeValueMillis(10));
+            Session spy = spy(session);
+            when(spy.newTimeoutToken()).thenReturn(
+                // max check 2 reflects the fact that we use a new token in the parse that calls analyze and they both check the token.
+                // For a new statement we issue a new token.
+                new EqualityExtractorTest.TestToken(TimeValue.timeValueMillis(10), 2),
+                // use new instance for the second parse, otherwise default mocking setup, creates a singleton and returns for all calls
+                new EqualityExtractorTest.TestToken(TimeValue.timeValueMillis(10), 2)
+            );
+            spy.parse(UNNAMED, "SELECT 1", List.of());
+
+            // New statement runs for 5 millis as well,  timeout must not be exceeded.
+            spy.parse(UNNAMED, "SELECT 2", List.of());
+        }
+    }
+
+    @Test
+    public void test_binding_with_removed_prepared_statement_throws_sstatement_not_found_and_logs_error() {
+        SQLExecutor sqlExecutor = SQLExecutor.of(clusterService);
+        sqlExecutor.jobsLogs.setEnabled(true);
+        sqlExecutor.jobsLogs.updateJobsLog(new QueueSink<>(new BlockingEvictingQueue<>(1), () -> {}));
+
+        try (Session session = sqlExecutor.createSession()) {
+            session.parse("S1", "SELECT 1", Collections.emptyList());
+            assertThat(sqlExecutor.jobsLogs.activeJobs()).isEmpty();
+            session.close((byte) 'S', "S1");
+            assertThatThrownBy(() -> session.bind("", "S1", List.of(), null))
+                .isExactlyInstanceOf(IllegalArgumentException.class)
+                .hasMessage("No statement found with name: S1");
+
+            assertThat(sqlExecutor.jobsLogs.activeJobs()).isEmpty();
+            assertThat(sqlExecutor.jobsLogs.jobsLog()).satisfiesExactly(
+                x -> {
+                    assertThat(x.statement()).isEqualTo("");
+                    assertThat(x.errorMessage()).isEqualTo("No statement found with name: S1");
+                }
+            );
+        }
+    }
+
+    @Test
+    public void test_timeout_doesnt_expire_between_parse_and_bind_execute() throws Exception {
+        SQLExecutor sqlExecutor = SQLExecutor.of(clusterService);
+        try (Session session = sqlExecutor.createSession()) {
+            session.sessionSettings().statementTimeout(TimeValue.timeValueMillis(100));
+            session.parse("S1", "SELECT 1", List.of());
+            Thread.sleep(100);
+            session.bind("", "S1", List.of(), new FormatCode[0]);
+
+            // .execute must not fail
+            session.execute("", 0, new BaseResultReceiver());
+        }
+    }
+
+    @Test
+    public void test_binding_portal_again_closes_suspended_consumers_eventually() throws Exception {
+        Planner planner = mock(Planner.class, Answers.RETURNS_MOCKS);
+        AtomicReference<RowConsumer> consumerRef = new AtomicReference<>();
+        Plan plan = new Plan() {
+            @Override
+            public StatementType type() {
+                return StatementType.INSERT;
+            }
+
+            @Override
+            public void executeOrFail(DependencyCarrier dependencies,
+                                      PlannerContext plannerContext,
+                                      RowConsumer consumer,
+                                      Row params,
+                                      SubQueryResults subQueryResults) throws Exception {
+                consumerRef.set(consumer);
+            }
+
+            @Override
+            public CompletableFuture<BulkResponse> executeBulk(DependencyCarrier executor,
+                                                               PlannerContext plannerContext,
+                                                               List<Row> bulkParams,
+                                                               SubQueryResults subQueryResults) {
+                return new CompletableFuture<>();
+            }
+        };
+        when(planner.plan(any(AnalyzedStatement.class), any(PlannerContext.class)))
+            .thenReturn(plan);
+        SQLExecutor sqlExecutor = SQLExecutor.builder(clusterService)
+            .setPlanner(planner)
+            .build();
+        try (Session session = sqlExecutor.createSession()) {
+            session.parse("S1", "SELECT 1", Collections.emptyList());
+            session.bind("", "S1", List.of(), new FormatCode[0]);
+            BaseResultReceiver baseResultReceiver = new BaseResultReceiver();
+            session.execute("", 5, baseResultReceiver);
+
+            assertThat(baseResultReceiver.completionFuture()).isNotDone();
+            Portal portal = session.portals.get("");
+            assertThat(portal.activeConsumer()).isNotNull();
+            assertThat(portal.activeConsumer().suspended()).isFalse();
+
+            session.bind("", "S1", List.of(), new FormatCode[0]);
+            assertThat(portal.activeConsumer().suspended()).isFalse();
+            consumerRef.get().accept(TestingBatchIterators.range(0, 10), null);
+            assertThat(portal.activeConsumer().completionFuture()).succeedsWithin(1, TimeUnit.SECONDS);
+        }
+
+    }
+
+    @Test
+    public void test_simple_query_parse_failure_is_logged() throws Exception {
+        // https://github.com/crate/crate/issues/17651
+        SQLExecutor sqlExecutor = SQLExecutor.of(clusterService);
+        sqlExecutor.jobsLogs.setEnabled(true);
+        sqlExecutor.jobsLogs.updateJobsLog(new QueueSink<>(new BlockingEvictingQueue<>(1), () -> {}));
+        try (Session session = sqlExecutor.createSession()) {
+            assertThatThrownBy(() -> session.simpleQuery("sele"))
+                .hasMessageContaining("extraneous input 'sele' expecting");
+
+            assertThat(sqlExecutor.jobsLogs.activeJobs()).isEmpty();
+            assertThat(sqlExecutor.jobsLogs.jobsLog()).satisfiesExactly(
+                x -> {
+                    assertThat(x.statement()).isEqualTo("sele");
+                }
+            );
+        }
+    }
+
+    @Test
+    public void test_bulk_operations_completed_exceptionally_sys_job_cleared() throws Exception {
+        Planner planner = mock(Planner.class, Answers.RETURNS_MOCKS);
+        SQLExecutor sqlExecutor = SQLExecutor.builder(clusterService)
+            .setPlanner(planner)
+            .build()
+            .addTable("create table t1 (x int)");
+        sqlExecutor.jobsLogs.setEnabled(true);
+        Session session = sqlExecutor.createSession();
+        when(planner.plan(any(AnalyzedStatement.class), any(PlannerContext.class)))
+            .thenReturn(
+                new Plan() {
+                    @Override
+                    public StatementType type() {
+                        return StatementType.INSERT;
+                    }
+
+                    @Override
+                    public void executeOrFail(DependencyCarrier dependencies,
+                                              PlannerContext plannerContext,
+                                              RowConsumer consumer,
+                                              Row params,
+                                              SubQueryResults subQueryResults) throws Exception {
+                    }
+
+                    @Override
+                    public CompletableFuture<BulkResponse> executeBulk(DependencyCarrier executor,
+                                                                       PlannerContext plannerContext,
+                                                                       List<Row> bulkParams,
+                                                                       SubQueryResults subQueryResults) {
+
+                        return CompletableFuture.failedFuture(new RuntimeException("dummy"));
+                    }
+                }
+            );
+
+
+        session.parse(UNNAMED, "INSERT INTO t1 (x) VALUES (?)", List.of());
+        // At least 2 execute() calls, so that we have >1 deferred executions and sync() hits bulkExec.
+        for (int i = 0; i < 2; i++) {
+            session.bind(UNNAMED, UNNAMED, List.of(i), null);
+            session.execute(UNNAMED, 0, new BaseResultReceiver());
+        }
+
+        session.sync(false);
+        assertThat(sqlExecutor.jobsLogs.activeJobs().iterator().hasNext()).isFalse();
+    }
+
+    private static final Role USER_WITH_PRIVILEGES = userOf(
+        "u1",
+        Set.of(
+            new Privilege(Policy.GRANT, Permission.DQL, Securable.TABLE, "doc.t1", "crate"),
+            new Privilege(Policy.GRANT, Permission.DML, Securable.TABLE, "doc.t1", "crate")
+        ),
+        null
+    );
+
+    /// Plan which keeps the consumer, so that the test controls the rows of the execution
+    private static class CapturingPlan implements Plan {
+
+        private final AtomicReference<RowConsumer> consumer = new AtomicReference<>();
+
+        @Override
+        public StatementType type() {
+            return StatementType.SELECT;
+        }
+
+        @Override
+        public void executeOrFail(DependencyCarrier dependencies,
+                                  PlannerContext plannerContext,
+                                  RowConsumer consumer,
+                                  Row params,
+                                  SubQueryResults subQueryResults) {
+            this.consumer.set(consumer);
+        }
+
+        @Override
+        public CompletableFuture<BulkResponse> executeBulk(DependencyCarrier executor,
+                                                           PlannerContext plannerContext,
+                                                           List<Row> bulkParams,
+                                                           SubQueryResults subQueryResults) {
+            return CompletableFuture.completedFuture(new BulkResponse(bulkParams.size()));
+        }
+    }
+
+    private Session createUserSession(List<Role> roles, Planner planner) throws Exception {
+        return createUserSession(roles, planner, USER_WITH_PRIVILEGES);
+    }
+
+    private Session createUserSession(List<Role> roles, Planner planner, Role user) throws Exception {
+        SQLExecutor sqlExecutor = SQLExecutor.builder(clusterService)
+            .setRoleManager(new StubRoleManager(roles, true))
+            .setPlanner(planner)
+            .build()
+            .addTable("CREATE TABLE doc.t1 (x INT)");
+        return sqlExecutor.sqlOperations.newSession(
+            new ConnectionProperties(null, null, Protocol.POSTGRES, null),
+            "doc",
+            user
+        );
+    }
+
+    private static Planner planner(Plan plan) {
+        Planner planner = mock(Planner.class, Answers.RETURNS_MOCKS);
+        when(planner.plan(any(AnalyzedStatement.class), any(PlannerContext.class))).thenReturn(plan);
+        return planner;
+    }
+
+    @Test
+    public void test_prepared_statement_is_executed_if_user_and_privileges_are_unchanged() throws Exception {
+        List<Role> roles = new ArrayList<>(List.of(Role.CRATE_USER, USER_WITH_PRIVILEGES));
+        Planner planner = planner(new CapturingPlan());
+        try (Session session = createUserSession(roles, planner)) {
+            session.parse("S1", "SELECT x FROM t1", List.of());
+            session.bind("P1", "S1", List.of(), null);
+            session.execute("P1", 0, new BaseResultReceiver());
+            verify(planner, times(1)).plan(any(AnalyzedStatement.class), any(PlannerContext.class));
+        }
+    }
+
+    @Test
+    public void test_prepared_statement_is_not_executed_after_user_is_dropped() throws Exception {
+        List<Role> roles = new ArrayList<>(List.of(Role.CRATE_USER, USER_WITH_PRIVILEGES));
+        Planner planner = planner(new CapturingPlan());
+        try (Session session = createUserSession(roles, planner)) {
+            session.parse("S1", "SELECT x FROM t1", List.of());
+            session.bind("P1", "S1", List.of(), null);
+
+            roles.remove(USER_WITH_PRIVILEGES);
+
+            assertThatThrownBy(() -> session.execute("P1", 0, new BaseResultReceiver()))
+                .isExactlyInstanceOf(IllegalStateException.class)
+                .hasMessage("User \"u1\" was dropped");
+            verify(planner, times(0)).plan(any(AnalyzedStatement.class), any(PlannerContext.class));
+        }
+    }
+
+    @Test
+    public void test_prepared_statement_is_not_executed_after_privilege_is_revoked() throws Exception {
+        List<Role> roles = new ArrayList<>(List.of(Role.CRATE_USER, USER_WITH_PRIVILEGES));
+        Planner planner = planner(new CapturingPlan());
+        try (Session session = createUserSession(roles, planner)) {
+            session.parse("S1", "SELECT x FROM t1", List.of());
+            session.bind("P1", "S1", List.of(), null);
+
+            // REVOKE DQL ON TABLE doc.t1 FROM u1
+            roles.set(1, userOf(
+                "u1",
+                Set.of(new Privilege(Policy.GRANT, Permission.DML, Securable.TABLE, "doc.t1", "crate")),
+                null
+            ));
+
+            assertThatThrownBy(() -> session.execute("P1", 0, new BaseResultReceiver()))
+                .isExactlyInstanceOf(MissingPrivilegeException.class)
+                .hasMessage("Missing 'DQL' privilege for user 'u1'");
+            verify(planner, times(0)).plan(any(AnalyzedStatement.class), any(PlannerContext.class));
+        }
+    }
+
+    @Test
+    public void test_prepared_statement_is_not_executed_after_role_membership_is_revoked() throws Exception {
+        Role role = roleOf(
+            "r1",
+            Set.of(new Privilege(Policy.GRANT, Permission.DQL, Securable.TABLE, "doc.t1", "crate"))
+        );
+        Set<Privilege> userPrivileges = Set.of(
+            new Privilege(Policy.GRANT, Permission.DML, Securable.TABLE, "doc.t1", "crate")
+        );
+        Role user = userOf("u1", userPrivileges, Set.of(new GrantedRole("r1", "crate")), null);
+        List<Role> roles = new ArrayList<>(List.of(Role.CRATE_USER, role, user));
+        Planner planner = planner(new CapturingPlan());
+        try (Session session = createUserSession(roles, planner, user)) {
+            session.parse("S1", "SELECT x FROM t1", List.of());
+            session.bind("P1", "S1", List.of(), null);
+
+            // REVOKE r1 FROM u1
+            roles.set(2, userOf("u1", userPrivileges, null));
+
+            assertThatThrownBy(() -> session.execute("P1", 0, new BaseResultReceiver()))
+                .isExactlyInstanceOf(MissingPrivilegeException.class)
+                .hasMessage("Missing 'DQL' privilege for user 'u1'");
+            assertThatThrownBy(() -> session.parse("S2", "SELECT x FROM t1", List.of()))
+                .isExactlyInstanceOf(MissingPrivilegeException.class)
+                .hasMessage("Missing 'DQL' privilege for user 'u1'");
+            verify(planner, times(0)).plan(any(AnalyzedStatement.class), any(PlannerContext.class));
+        }
+    }
+
+    @Test
+    public void test_deferred_bulk_execution_fails_after_user_is_dropped() throws Exception {
+        List<Role> roles = new ArrayList<>(List.of(Role.CRATE_USER, USER_WITH_PRIVILEGES));
+        Planner planner = planner(new CapturingPlan());
+        try (Session session = createUserSession(roles, planner)) {
+            session.parse(UNNAMED, "INSERT INTO t1 (x) VALUES (?)", List.of());
+            // At least 2 execute() calls, so that we have >1 deferred executions and sync() hits bulkExec.
+            for (int i = 0; i < 2; i++) {
+                session.bind(UNNAMED, UNNAMED, List.of(i), null);
+                session.execute(UNNAMED, 0, new BaseResultReceiver());
+            }
+
+            roles.remove(USER_WITH_PRIVILEGES);
+
+            assertThatThrownBy(() -> session.sync(false).get(5, TimeUnit.SECONDS))
+                .hasStackTraceContaining("User \"u1\" was dropped");
+            verify(planner, times(0)).plan(any(AnalyzedStatement.class), any(PlannerContext.class));
+        }
+    }
+
+    @Test
+    public void test_suspended_portal_is_not_resumed_after_user_is_dropped() throws Exception {
+        List<Role> roles = new ArrayList<>(List.of(Role.CRATE_USER, USER_WITH_PRIVILEGES));
+        CapturingPlan plan = new CapturingPlan();
+        try (Session session = createUserSession(roles, planner(plan))) {
+            session.parse("S1", "SELECT x FROM t1", List.of());
+            session.bind("P1", "S1", List.of(), null);
+            BaseResultReceiver resultReceiver = new BaseResultReceiver();
+            session.execute("P1", 1, resultReceiver);
+            plan.consumer.get().accept(TestingBatchIterators.range(0, 10), null);
+            Portal portal = session.portals.get("P1");
+            assertThat(portal.activeConsumer().suspended()).isTrue();
+
+            roles.remove(USER_WITH_PRIVILEGES);
+
+            assertThatThrownBy(() -> session.execute("P1", 1, new BaseResultReceiver()))
+                .isExactlyInstanceOf(IllegalStateException.class)
+                .hasMessage("User \"u1\" was dropped");
+            assertThat(portal.activeConsumer().suspended()).isTrue();
+        }
+    }
+
+    @Test
+    public void test_session_cannot_be_used_after_user_is_dropped_and_created_again() throws Exception {
+        // The roles used for authorization still contain the user, as if it was created again
+        List<Role> roles = new ArrayList<>(List.of(Role.CRATE_USER, USER_WITH_PRIVILEGES));
+        Planner planner = planner(new CapturingPlan());
+        try (Session session = createUserSession(roles, planner)) {
+            session.parse("S1", "SELECT x FROM t1", List.of());
+            session.bind("P1", "S1", List.of(), null);
+
+            // The roles metadata doesn't contain the user anymore, e.g. after DROP USER
+            ClusterState state = clusterService.state();
+            ClusterServiceUtils.setState(clusterService, ClusterState.builder(state)
+                .metadata(Metadata.builder(state.metadata()).putCustom(RolesMetadata.TYPE, new RolesMetadata(Map.of())))
+                .build());
+
+            assertThatThrownBy(() -> session.execute("P1", 0, new BaseResultReceiver()))
+                .isExactlyInstanceOf(IllegalStateException.class)
+                .hasMessage("User \"u1\" was dropped");
+            assertThatThrownBy(() -> session.parse("S2", "SELECT 1", List.of()))
+                .isExactlyInstanceOf(IllegalStateException.class)
+                .hasMessage("User \"u1\" was dropped");
+            verify(planner, times(0)).plan(any(AnalyzedStatement.class), any(PlannerContext.class));
+        }
+    }
+
+    @Test
+    public void test_sys_shards_routing_uses_current_privileges_of_session_user() throws Exception {
+        SQLExecutor.of(clusterService)
+            .addTable("CREATE TABLE doc.t1 (x INT)")
+            .startShards("doc.t1");
+        Role userWithPrivilege = userOf(
+            "u1",
+            Set.of(new Privilege(Policy.GRANT, Permission.DQL, Securable.TABLE, "doc.t1", "crate")),
+            null
+        );
+        List<Role> roles = new ArrayList<>(List.of(Role.CRATE_USER, userWithPrivilege));
+        var roleManager = new StubRoleManager(roles, true);
+        var sessionSettings = new CoordinatorSessionSettings(userWithPrivilege);
+
+        assertThat(SysShardsTableInfo.getRouting(clusterService.state(), sessionSettings, roleManager).containsShards())
+            .isTrue();
+
+        roles.set(1, userOf("u1"));
+        assertThat(SysShardsTableInfo.getRouting(clusterService.state(), sessionSettings, roleManager).containsShards())
+            .isFalse();
+
+        roles.remove(1);
+        assertThat(SysShardsTableInfo.getRouting(clusterService.state(), sessionSettings, roleManager).containsShards())
+            .isFalse();
+    }
+
+    @Test
+    public void test_fetch_from_cursor_fails_after_privilege_is_revoked() throws Exception {
+        List<Role> roles = new ArrayList<>(List.of(Role.CRATE_USER, USER_WITH_PRIVILEGES));
+        Planner planner = planner(new CapturingPlan());
+        SQLExecutor sqlExecutor = SQLExecutor.builder(clusterService)
+            .setRoleManager(new StubRoleManager(roles, true))
+            .setPlanner(planner)
+            .build()
+            .addTable("CREATE TABLE doc.t1 (x INT)");
+        try (Session session = sqlExecutor.sqlOperations.newSession(
+                new ConnectionProperties(null, null, Protocol.POSTGRES, null), "doc", USER_WITH_PRIVILEGES)) {
+            AnalyzedStatement query = sqlExecutor.analyze("SELECT x FROM t1");
+            session.cursors.add("c1", new Cursor(
+                new NoopCircuitBreaker("dummy"),
+                "c1",
+                "DECLARE c1 CURSOR WITH HOLD FOR SELECT x FROM t1",
+                false,
+                Hold.WITH,
+                completedFuture(InMemoryBatchIterator.empty(null)),
+                new CompletableFuture<>(),
+                query
+            ));
+            session.parse("S1", "FETCH NEXT FROM c1", List.of());
+            session.bind("P1", "S1", List.of(), null);
+
+            // REVOKE DQL ON TABLE doc.t1 FROM u1
+            roles.set(1, userOf(
+                "u1",
+                Set.of(new Privilege(Policy.GRANT, Permission.DML, Securable.TABLE, "doc.t1", "crate")),
+                null
+            ));
+
+            assertThatThrownBy(() -> session.execute("P1", 0, new BaseResultReceiver()))
+                .isExactlyInstanceOf(MissingPrivilegeException.class)
+                .hasMessage("Missing 'DQL' privilege for user 'u1'");
+            assertThatThrownBy(() -> session.parse("S2", "FETCH NEXT FROM c1", List.of()))
+                .isExactlyInstanceOf(MissingPrivilegeException.class)
+                .hasMessage("Missing 'DQL' privilege for user 'u1'");
+            verify(planner, times(0)).plan(any(AnalyzedStatement.class), any(PlannerContext.class));
+
+            // The cursor can still be closed
+            session.parse("S3", "CLOSE c1", List.of());
+        }
+    }
+}

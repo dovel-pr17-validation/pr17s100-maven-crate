@@ -1,0 +1,148 @@
+.. _version_6.0.4:
+
+=============
+Version 6.0.4
+=============
+
+Released on 2025-11-19.
+
+.. WARNING::
+
+    Do not use this version when upgrading from any previous version
+    containing tables created before :ref:`version_5.5.0` as this may result
+    in data loss!
+
+    If the cluster contains tables created before :ref:`version_5.5.0`, after
+    upgrading to :ref:`version_6.0.4` certain actions on such tables like
+    deleting partitions, changing settings, rename, swap, etc. can lead to
+    corrupted table which causes all the data of the columns created
+    in versions before :ref:`version_5.5.0` to be shown as ``NULL``. The bug
+    has been fixed in :ref:`version_6.0.6`, so we highly recommend to avoid
+    upgrading to any earlier 6.0.x version.
+
+    Once already affected by the bug, existing data may be lost forever, while
+    new data (via ``INSERT`` or ``UPDATE``) can be retrieved normally.
+
+.. NOTE::
+
+    If you are upgrading a cluster, you must be running CrateDB 5.0.0 or higher
+    before you upgrade to 6.0.4.
+
+    We recommend that you upgrade to the latest 5.10 release before moving to
+    6.0.4.
+
+    A rolling upgrade from >= 5.10.1 to 6.0.4 is supported.
+    Before upgrading, you should `back up your data`_.
+
+.. WARNING::
+
+    Tables that were created before CrateDB 5.x will not function with 6.x
+    and must be recreated before moving to 6.x.x.
+
+    You can recreate tables using ``COPY TO`` and ``COPY FROM`` or by
+    `inserting the data into a new table`_.
+
+.. _back up your data: https://cratedb.com/docs/crate/reference/en/latest/admin/snapshots.html
+.. _inserting the data into a new table: https://cratedb.com/docs/crate/reference/en/latest/admin/system-information.html#tables-need-to-be-recreated
+
+.. rubric:: Table of contents
+
+.. contents::
+   :local:
+
+
+See the :ref:`version_6.0.0` release notes for a full list of changes in the 6.0
+series.
+
+Fixes
+=====
+
+- Fixed a memory leak that could happen if running a query with a large result
+  set via a PostgreSQL client and then interrupting the connection.
+
+- Fixed an issue that allowed inserting values into ``ARRAY`` columns that
+  violated the array's inner type constraints. For example it was possible to
+  insert ``['aa']`` into a column of type ``ARRAY(VARCHAR(1))``.
+
+- Fixed an issue that could lead to incorrect results for window functions when
+  the window function used a ``PARTITION BY`` clause on an object subscript
+  coming from a view or CTE and if running in a cluster with more than one node.
+
+- Fixed an issue that could lead to a deadlock when executing a statement
+  containing a ``JOIN`` that got executed using a hash join algorithm on a
+  cluster with more than one node.
+
+- Fixed an issue that caused ``EXPLAIN ANALYZE`` on queries using a sub-query
+  returning multiple-rows (like with ``WHERE x IN (SELECT ...)``) to not release
+  the memory accounted within the query circuit breaker. This could later on
+  result in queries getting rejected with a circuit breaker exception, despite
+  having memory available.
+
+- Improved ``WHERE`` clause analysis for queries on tables with both ``PARTITION
+  BY`` and ``CLUSTERED BY`` clause to narrow the partitions and shards that are
+  hit if the query filters on the ``PARTITIONED BY`` and ``CLUSTERED BY``
+  columns. An example::
+
+    CREATE TABLE tbl (x int, c int, p int) clustered by (c) partitioned by (p);
+    SELECT * FROM tbl WHERE c = 1 and p = 1;
+
+  In this case the query will only search in the partition ``p=1`` and hit a
+  single shard depending on the routing for ``c=1``
+
+- Fixed a replication issue happening when an integral value, not fitting to
+  ``INT`` or ``LONG`` types, was stored in an OBJECT with policy ``IGNORED``.
+
+- Fixed an issue with ``crate.bat`` Windows startup script throwing error and
+  preventing bootstrap of CrateDB, if ``PowerShell`` was used instead of plain
+  ``CMD`` and parameters were passed with ``-C<key>=value`` command line
+  arguments.
+
+- Fixed a ``SQLParseException`` thrown when ``optimizer_equi_join_to_lookup_join``
+  was incorrectly applied to a complex equi-join query. The optimizer rule
+  currently supports only simple equi-join queries like ::
+
+    SELECT * FROM t INNER JOIN t2 ON t.a = t2.a;
+
+- Fixed an issue that caused RAM under-accounting, potentially leading to an
+  ``OutOfMemoryError`` when a large result set was returned by the ``HTTP``
+  endpoint.
+
+- Fixed an issue where generated and default sub-columns were missing from
+  results returned by the ``RETURNING`` clause.
+
+- Disallowed generated sub-columns within object arrays or referencing their
+  sub-columns, which is unsupported and leading to errors or wrong behavior.
+
+- Fixed an issue with ``atttypid`` column of the ``pg_attribute`` table not
+  being reset to ``0`` for dropped columns, which contradicts with the
+  PostgreSQL behavior.
+
+- Fixed an issue resulting in stuck :ref:`sys-jobs` entries when an
+  :ref:`sql-insert` statement using :ref:`ref-values` results in an execution
+  error, e.g. due to implicit cast or parsing issues.
+
+- Fixed an issue causing ``SELECT *`` or ``ANALYZE`` statements to fail with an
+  error ``unexpected docvalues type... Re-index with correct docvalues type.``
+  if a column was added to a  restored table.
+
+- Fixed a translog recovery issue, happening when a ``NULL`` value was stored
+  in an :ref:`type-object` with policy :ref:`type-object-columns-ignored` on
+  tables created before :ref:`version 5.5.0 <version_5.5.0>`.
+  To mitigate the issue, run CrateDB with a CLI option
+  ``-Des.xcontent.strict_duplicate_detection=false``. Please note, that this
+  flag has a global effect, and it's recommended to set it back to the default
+  value ``true`` once invalid records are processed. Issue can be considered
+  as mitigated when ``translog_stats['uncommitted_size']`` in the
+  :ref:`sys.shards <sys-shards>` table stops exceeding
+  :ref:`flush_threshold_size <sql-create-table-translog-flush-threshold-size>`.
+
+- Fixed an issue causing a ``GROUP BY ... LIMIT 0`` statement to not release
+  it's accounted memory on the ``QUERY`` circuit breaker.
+
+- Fixed an issue where certain join queries returned incorrect results when the
+  join condition referenced unknown object sub-columns coming from aliased CTEs
+  in nested joins.
+
+- Fixed an issue causing :ref:`sql-copy-from` statements to fail with an
+  ``CircuitBreakerException`` when no concrete ``bulk_size`` argument was
+  defined and the available memory is saturated on the first internal requests.

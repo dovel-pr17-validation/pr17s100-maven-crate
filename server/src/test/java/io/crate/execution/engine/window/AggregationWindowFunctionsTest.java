@@ -1,0 +1,1072 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.execution.engine.window;
+
+import static com.carrotsearch.randomizedtesting.RandomizedTest.$;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+import java.math.BigDecimal;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+
+import org.junit.Test;
+
+import io.crate.analyze.relations.AnalyzedRelation;
+import io.crate.analyze.relations.DocTableRelation;
+import io.crate.metadata.ColumnIdent;
+import io.crate.metadata.DocTableInfo;
+import io.crate.metadata.RelationName;
+import io.crate.role.Role;
+import io.crate.testing.SQLExecutor;
+import io.crate.testing.SqlExpressions;
+import io.crate.types.DataTypes;
+
+public class AggregationWindowFunctionsTest extends AbstractWindowFunctionTest {
+
+    private static final Object[][] INPUT_ROWS = {
+        new Object[]{1, 1},
+        new Object[]{2, 2},
+        new Object[]{2, 2},
+        new Object[]{3, 3},
+        new Object[]{4, 4},
+        new Object[]{5, 5},
+        new Object[]{null, null}
+    };
+
+    @Test
+    public void test_sum_remove_cumulative_with_null() throws Throwable {
+        assertEvaluate(
+            """
+            sum(x) over (order by x nulls first rows between 1 preceding and 1 following)
+            """,
+            new Object[] { 10L, 30L, 30L },
+            List.of(ColumnIdent.of("x")),
+            new Object[][] {
+                new Object[] { null },
+                new Object[] { 10 },
+                new Object[] { 20 },
+            }
+        );
+        assertEvaluate(
+            """
+            sum(x) over (order by x nulls first rows between 1 preceding and 1 following)
+            """,
+            new Object[] { null, null, null},
+            List.of(ColumnIdent.of("x")),
+            new Object[][] {
+                new Object[] { null },
+                new Object[] { null },
+                new Object[] { null },
+            }
+        );
+        assertEvaluate(
+            """
+            sum(x::text::interval) over (order by x nulls first rows between 1 preceding and 1 following)
+            """,
+            new Object[] { null, null, null},
+            List.of(ColumnIdent.of("x")),
+            new Object[][] {
+                new Object[] { null },
+                new Object[] { null },
+                new Object[] { null },
+            }
+        );
+    }
+
+    @Test
+    public void test_sum_remove_last_not_null_sets_state_to_null() throws Throwable {
+        assertEvaluate(
+            """
+            sum(x) over (order by x nulls last rows between current row and current row)
+            """,
+            new Object[] { 10L, null },
+            List.of(ColumnIdent.of("x")),
+            new Object[][] {
+                new Object[] { 10 },
+                new Object[] { null },
+            }
+        );
+    }
+
+    @Test
+    public void test_numeric_sum_remove_last_not_null_sets_state_to_null() throws Throwable {
+        assertEvaluate(
+            """
+            sum(x::numeric) over (order by x nulls last rows between current row and current row)
+            """,
+            new Object[] { BigDecimal.valueOf(10), null },
+            List.of(ColumnIdent.of("x")),
+            new Object[][] {
+                new Object[] { 10 },
+                new Object[] { null },
+            }
+        );
+    }
+
+    @Test
+    public void test_interval_sum_remove_last_not_null_sets_state_to_null() throws Throwable {
+        var oneDay = DataTypes.INTERVAL.implicitCast("1 day");
+        assertEvaluate(
+            """
+            sum(z::interval) over (order by x rows between current row and current row)
+            """,
+            new Object[] { oneDay, null },
+            List.of(ColumnIdent.of("x"), ColumnIdent.of("z")),
+            new Object[][] {
+                new Object[] { 1, "1 day" },
+                new Object[] { 2, null },
+            }
+        );
+    }
+
+    @Test
+    public void testSumOverUnboundedPrecedingToUnboundedFollowingFrames() throws Throwable {
+        Object[] expected = new Object[]{5L, 5L, 5L, 12L, 12L, 12L, null};
+        assertEvaluate("sum(x) OVER(" +
+                            "PARTITION BY x>2 ORDER BY x RANGE BETWEEN UNBOUNDED PRECEDING and UNBOUNDED FOLLOWING" +
+                       ")",
+            expected,
+            List.of(ColumnIdent.of("x")),
+            INPUT_ROWS
+        );
+    }
+
+    @Test
+    public void testCountOverUnboundedFollowingFrames() throws Throwable {
+        Object[] expected = new Object[]{3L, 2L, 2L, 3L, 2L, 1L, 0L};
+        assertEvaluate("count(x) OVER(" +
+                            "PARTITION BY x>2 ORDER BY x RANGE BETWEEN CURRENT ROW and UNBOUNDED FOLLOWING" +
+                       ")",
+            expected,
+            List.of(ColumnIdent.of("x")),
+            INPUT_ROWS
+        );
+    }
+
+    @Test
+    public void testAvgOverUnboundedFollowingFrames() throws Throwable {
+        Object[] expected = new Object[]{1.6666666666666667, 2.0, 2.0, 4.0, 4.5, 5.0, null};
+        assertEvaluate(
+            "avg(x) OVER(" +
+            "   PARTITION BY x>2 ORDER BY x RANGE BETWEEN CURRENT ROW and UNBOUNDED FOLLOWING" +
+            ")",
+            expected,
+            List.of(ColumnIdent.of("x")),
+            INPUT_ROWS);
+    }
+
+    @Test
+    public void testSumOverUnboundedFollowingFrames() throws Throwable {
+        Object[] expected = new Object[]{5L, 4L, 4L, 12L, 9L, 5L, null};
+        assertEvaluate(
+            "sum(x) OVER(" +
+            "   PARTITION BY x>2 ORDER BY x RANGE BETWEEN CURRENT ROW and UNBOUNDED FOLLOWING" +
+            ")",
+            expected,
+            List.of(ColumnIdent.of("x")),
+            INPUT_ROWS);
+    }
+
+    @Test
+    public void testVarianceOverUnboundedFollowingFrames() throws Throwable {
+        Object[] expected = new Object[]{0.22222222222222202, 0.0, 0.0, 0.6666666666666666, 0.25, 0.0, null};
+        assertEvaluate(
+            "variance(x) OVER(" +
+            "   PARTITION BY x>2 ORDER BY x RANGE BETWEEN CURRENT ROW and UNBOUNDED FOLLOWING" +
+            ")",
+            expected,
+            List.of(ColumnIdent.of("x")),
+            INPUT_ROWS);
+    }
+
+    @Test
+    public void testStdDevPopOverUnboundedFollowingFrames() throws Throwable {
+        Object[] expected = new Object[]{0.47140452079103146, 0.0, 0.0, 0.816496580927726, 0.5, 0.0, null};
+        assertEvaluate(
+            "stddev_pop(x) OVER(" +
+            "   PARTITION BY x>2 ORDER BY x RANGE BETWEEN CURRENT ROW and UNBOUNDED FOLLOWING" +
+            ")",
+            expected,
+            List.of(ColumnIdent.of("x")),
+            INPUT_ROWS);
+    }
+
+    @Test
+    public void testStringAggOverUnboundedFollowingFrames() throws Throwable {
+        Object[] expected = new Object[]{"a,b,b", "b,b", "b,b", "c,d,e", "d,e", "e", null};
+        assertEvaluate(
+            "string_agg(z, ',') OVER(" +
+            "   PARTITION BY z>'b' ORDER BY z RANGE BETWEEN CURRENT ROW and UNBOUNDED FOLLOWING" +
+            ")",
+            expected,
+            List.of(ColumnIdent.of("z")),
+            new Object[]{"a"},
+            new Object[]{"b"},
+            new Object[]{"b"},
+            new Object[]{"c"},
+            new Object[]{"d"},
+            new Object[]{"e"},
+            new Object[]{null});
+    }
+
+    @Test
+    public void testCollectSetOverUnboundedFollowingFrames() throws Throwable {
+        Object[] expected = new Object[]{
+            List.of(1, 2),
+            List.of(2),
+            List.of(2),
+            List.of(2),
+            List.of(2),
+            List.of(3, 4, 5),
+            List.of(4, 5),
+            List.of(5),
+            List.of()
+        };
+        assertEvaluate(
+            "collect_set(x) OVER(" +
+            "   PARTITION BY x>2 ORDER BY x RANGE BETWEEN CURRENT ROW and UNBOUNDED FOLLOWING" +
+            ")",
+            expected,
+            List.of(ColumnIdent.of("x")),
+            new Object[]{1},
+            new Object[]{2},
+            new Object[]{2},
+            new Object[]{2},
+            new Object[]{2},
+            new Object[]{3},
+            new Object[]{4},
+            new Object[]{5},
+            new Object[]{null});
+    }
+
+    @Test
+    public void testCollectSetOverRowsUnboundedPrecedingCurrentRowFrame() throws Throwable {
+        Object[] expected = new Object[]{
+            List.of(1),
+            List.of(1, 2),
+            List.of(1, 2),
+            List.of(1, 2),
+            List.of(3),
+            List.of(3, 4),
+            List.of(3, 4, 5),
+            List.of()
+        };
+        assertEvaluate("collect_set(x) OVER(" +
+                            "PARTITION BY x>2 ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING and CURRENT ROW" +
+                       ")",
+            expected,
+            List.of(ColumnIdent.of("x")),
+            new Object[]{1, 1},
+            new Object[]{2, 2},
+            new Object[]{2, 2},
+            new Object[]{2, 2},
+            new Object[]{3, 3},
+            new Object[]{4, 4},
+            new Object[]{5, 5},
+            new Object[]{null, null});
+    }
+
+    @Test
+    public void test_over_ordered_range_between_1_preceding_and_current_row_for_integral_types() throws Throwable {
+        for (var type : DataTypes.NUMERIC_PRIMITIVE_TYPES) {
+            DocTableInfo tableInfo = SQLExecutor.tableInfo(
+                new RelationName("doc", "t1"),
+                String.format(Locale.ENGLISH, "create table doc.t1 (x %s)", type.getName()),
+                clusterService);
+            DocTableRelation tableRelation = new DocTableRelation(tableInfo);
+            Map<RelationName, AnalyzedRelation> tableSources = Map.of(tableInfo.ident(), tableRelation);
+            sqlExpressions = new SqlExpressions(
+                tableSources,
+                tableRelation,
+                Role.CRATE_USER
+            );
+            Object[] expected = new Object[]{
+                1, 2, 3, 4, 5, 6, 7, 8
+            };
+            assertEvaluate(
+                "row_number() OVER (ORDER BY x RANGE BETWEEN 1 PRECEDING and CURRENT ROW)",
+                expected,
+                List.of(ColumnIdent.of("x")),
+                new Object[]{type.implicitCast(1)},
+                new Object[]{type.implicitCast(2)},
+                new Object[]{type.implicitCast(2)},
+                new Object[]{type.implicitCast(2)},
+                new Object[]{type.implicitCast(3)},
+                new Object[]{type.implicitCast(4)},
+                new Object[]{type.implicitCast(5)},
+                new Object[]{null});
+        }
+    }
+
+    @Test
+    public void test_agg_over_range_offset_preceding() throws Throwable {
+        Object[] expected = new Object[]{
+            2.5,
+            6.5,
+            11.5,
+            15.0,
+            18.5,
+            22.0,
+            26.0,
+            22.0
+        };
+        assertEvaluate("sum(d) OVER(" +
+                            "ORDER BY d RANGE BETWEEN 3 PRECEDING and CURRENT ROW" +
+                       ")",
+            expected,
+            List.of(ColumnIdent.of("d")),
+            new Object[]{2.5, 2.5},
+            new Object[]{4.0, 4.0},
+            new Object[]{5.0, 5.0},
+            new Object[]{6.0, 6.0},
+            new Object[]{7.5, 7.5},
+            new Object[]{8.5, 8.5},
+            new Object[]{10.0, 10.0},
+            new Object[]{12.0, 12.0});
+    }
+
+    @Test
+    public void test_agg_over_rows_offset_preceding() throws Throwable {
+        Object[] expected = new Object[]{
+            2.5,
+            6.5,
+            11.5,
+            17.5,
+            22.5,
+            27.0,
+            32.0,
+            38.0
+        };
+
+        assertEvaluate("sum(d) OVER(" +
+                            "ORDER BY d ROWS BETWEEN 3 PRECEDING and CURRENT ROW" +
+                       ")",
+            expected,
+            List.of(ColumnIdent.of("d")),
+            new Object[]{2.5, 2.5},
+            new Object[]{4.0, 4.0},
+            new Object[]{5.0, 5.0},
+            new Object[]{6.0, 6.0},
+            new Object[]{7.5, 7.5},
+            new Object[]{8.5, 8.5},
+            new Object[]{10.0, 10.0},
+            new Object[]{12.0, 12.0});
+    }
+
+    @Test
+    public void test_agg_over_range_asc_following_with_null_values() throws Throwable {
+        Object[] expected = new Object[]{ 3L, 3L, 3L, 2L, 2L, 1L, 0L};
+        assertEvaluate("count(x) OVER (" +
+             "ORDER BY x RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING)",
+            expected,
+            List.of(ColumnIdent.of("x")),
+            INPUT_ROWS
+        );
+    }
+
+    @Test
+    public void test_agg_over_range_desc_following_with_null_values() throws Throwable {
+        Object[] expected = new Object[]{ 0L, 2L, 2L, 3L, 3L, 3L, 1L};
+        assertEvaluate("count(x) OVER (" +
+             "ORDER BY x DESC RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING)",
+            expected,
+            List.of(ColumnIdent.of("x")),
+            INPUT_ROWS
+        );
+    }
+
+    @Test
+    public void test_agg_over_range_asc_preceding_with_null_values() throws Throwable {
+        Object[] expected = new Object[]{ 1L, 3L, 3L, 3L, 2L, 2L, 0L};
+        assertEvaluate("count(x) OVER (" +
+             "ORDER BY x RANGE BETWEEN 1 PRECEDING AND CURRENT ROW)",
+            expected,
+            List.of(ColumnIdent.of("x")),
+            INPUT_ROWS
+        );
+    }
+
+    @Test
+    public void test_agg_over_range_desc_preceding_with_null_values() throws Throwable {
+        Object[] expected = new Object[]{ 0L, 1L, 2L, 2L, 3L, 3L, 3L};
+        assertEvaluate("count(x) OVER (" +
+             "ORDER BY x DESC RANGE BETWEEN 1 PRECEDING AND CURRENT ROW)",
+            expected,
+            List.of(ColumnIdent.of("x")),
+            INPUT_ROWS
+        );
+    }
+
+    @Test
+    public void test_agg_over_range_with_integral_boundary_overflow() throws Throwable {
+        assertEvaluate(
+            "count(*) OVER (ORDER BY x RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING)",
+            new Object[] { 1L, 1L },
+            List.of(ColumnIdent.of("x")),
+            new Object[] { 0 },
+            new Object[] { Integer.MAX_VALUE }
+        );
+
+        assertEvaluate(
+            "count(*) OVER (ORDER BY x RANGE BETWEEN 1 PRECEDING AND CURRENT ROW)",
+            new Object[] { 1L, 1L },
+            List.of(ColumnIdent.of("x")),
+            new Object[] { Integer.MIN_VALUE },
+            new Object[] { 0 }
+        );
+
+        assertEvaluate(
+            "count(*) OVER (ORDER BY y RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING)",
+            new Object[] { 1L, 1L },
+            List.of(ColumnIdent.of("y")),
+            new Object[] { 0L },
+            new Object[] { Long.MAX_VALUE }
+        );
+
+        assertEvaluate(
+            "count(*) OVER (ORDER BY y RANGE BETWEEN 1 PRECEDING AND CURRENT ROW)",
+            new Object[] { 1L, 1L },
+            List.of(ColumnIdent.of("y")),
+            new Object[] { Long.MIN_VALUE },
+            new Object[] { 0L }
+        );
+    }
+
+    @Test
+    public void test_agg_over_range_with_wider_bounds() throws Throwable {
+        for (var type : DataTypes.NUMERIC_PRIMITIVE_TYPES) {
+            DocTableInfo tableInfo = SQLExecutor.tableInfo(
+                new RelationName("doc", "t1"),
+                "create table doc.t1 (x " + type.getName() + ")",
+                clusterService);
+            DocTableRelation tableRelation = new DocTableRelation(tableInfo);
+            sqlExpressions = new SqlExpressions(
+                Map.of(tableInfo.ident(), tableRelation), tableRelation, Role.CRATE_USER);
+            for (String bound : List.of(
+                "3000000000", // A BIGINT literal outside the INTEGER range.
+                "3000000000.0", // A NUMERIC literal exactly representable as BIGINT.
+                "9223372036854775807" // Long.MAX_VALUE.
+            )) {
+                for (String direction : List.of("ASC", "DESC")) {
+                    int first = direction.equals("ASC") ? -10 : 10;
+                    assertEvaluate(
+                        "count(*) OVER (ORDER BY x " + direction + " RANGE BETWEEN CURRENT ROW AND " + bound + " FOLLOWING)",
+                        new Object[] { 2L, 1L },
+                        List.of(ColumnIdent.of("x")),
+                        new Object[] { type.implicitCast(first) },
+                        new Object[] { type.implicitCast(-first) }
+                    );
+                    assertEvaluate(
+                        "count(*) OVER (ORDER BY x " + direction + " RANGE BETWEEN " + bound + " PRECEDING AND CURRENT ROW)",
+                        new Object[] { 1L, 2L },
+                        List.of(ColumnIdent.of("x")),
+                        new Object[] { type.implicitCast(first) },
+                        new Object[] { type.implicitCast(-first) }
+                    );
+                }
+            }
+        }
+    }
+
+    @Test
+    public void test_agg_over_rows_with_large_bounds() throws Throwable {
+        for (String bound : List.of(
+            "3000000000", // A BIGINT literal outside the INTEGER range.
+            "3000000000.0", // A NUMERIC literal exactly representable as BIGINT.
+            "9223372036854775807" // Long.MAX_VALUE.
+        )) {
+            for (String direction : List.of("ASC", "DESC")) {
+                int first = direction.equals("ASC") ? 0 : 10;
+                assertEvaluate(
+                    "count(*) OVER (ORDER BY x " + direction + " ROWS BETWEEN CURRENT ROW AND " + bound + " FOLLOWING)",
+                    new Object[] { 2L, 1L },
+                    List.of(ColumnIdent.of("x")),
+                    new Object[] { first },
+                    new Object[] { 10 - first }
+                );
+                assertEvaluate(
+                    "count(*) OVER (ORDER BY x " + direction + " ROWS BETWEEN " + bound + " PRECEDING AND CURRENT ROW)",
+                    new Object[] { 1L, 2L },
+                    List.of(ColumnIdent.of("x")),
+                    new Object[] { first },
+                    new Object[] { 10 - first }
+                );
+            }
+        }
+    }
+
+    @Test
+    public void test_rows_with_negative_bounds_are_rejected() {
+        assertThatThrownBy(() -> assertEvaluate(
+            "count(*) OVER (ORDER BY x ROWS BETWEEN -1 PRECEDING AND CURRENT ROW)",
+            new Object[] { 1L },
+            List.of(ColumnIdent.of("x")),
+            new Object[] { 0 }
+        ))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessage("Window frame offset must not be negative");
+        assertThatThrownBy(() -> assertEvaluate(
+            "count(*) OVER (ORDER BY x ROWS BETWEEN CURRENT ROW AND -1 FOLLOWING)",
+            new Object[] { 1L },
+            List.of(ColumnIdent.of("x")),
+            new Object[] { 0 }
+        ))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessage("Window frame offset must not be negative");
+    }
+
+    @Test
+    public void test_agg_over_range_with_floating_point_bounds() throws Throwable {
+        for (var type : List.of(DataTypes.FLOAT, DataTypes.DOUBLE)) {
+            DocTableInfo tableInfo = SQLExecutor.tableInfo(
+                new RelationName("doc", "t1"),
+                "create table doc.t1 (x " + type.getName() + ")",
+                clusterService);
+            DocTableRelation tableRelation = new DocTableRelation(tableInfo);
+            sqlExpressions = new SqlExpressions(
+                Map.of(tableInfo.ident(), tableRelation), tableRelation, Role.CRATE_USER);
+            for (String bound : List.of(
+                "3", // An INTEGER bound.
+                "1e40" // A DOUBLE bound outside the FLOAT range.
+            )) {
+                for (String direction : List.of("ASC", "DESC")) {
+                    int first = direction.equals("ASC") ? 0 : 2;
+                    assertEvaluate(
+                        "count(*) OVER (ORDER BY x " + direction + " RANGE BETWEEN CURRENT ROW AND " + bound + " FOLLOWING)",
+                        new Object[] { 2L, 1L },
+                        List.of(ColumnIdent.of("x")),
+                        new Object[] { type.implicitCast(first) },
+                        new Object[] { type.implicitCast(2 - first) }
+                    );
+                    assertEvaluate(
+                        "count(*) OVER (ORDER BY x " + direction + " RANGE BETWEEN " + bound + " PRECEDING AND CURRENT ROW)",
+                        new Object[] { 1L, 2L },
+                        List.of(ColumnIdent.of("x")),
+                        new Object[] { type.implicitCast(first) },
+                        new Object[] { type.implicitCast(2 - first) }
+                    );
+                }
+            }
+        }
+    }
+
+    @Test
+    public void test_agg_over_range_with_timestamp_and_large_bounds() throws Throwable {
+        DocTableInfo tableInfo = SQLExecutor.tableInfo(
+            new RelationName("doc", "t1"),
+            "create table doc.t1 (x timestamp with time zone)",
+            clusterService);
+        DocTableRelation tableRelation = new DocTableRelation(tableInfo);
+        sqlExpressions = new SqlExpressions(
+            Map.of(tableInfo.ident(), tableRelation), tableRelation, Role.CRATE_USER);
+        // Long.MAX_VALUE overflows when added to or subtracted from the timestamp values.
+        for (String direction : List.of("ASC", "DESC")) {
+            long first = direction.equals("ASC") ? -10L : 10L;
+            assertEvaluate(
+                "count(*) OVER (ORDER BY x " + direction + " RANGE BETWEEN CURRENT ROW AND 9223372036854775807 FOLLOWING)",
+                new Object[] { 2L, 1L },
+                List.of(ColumnIdent.of("x")),
+                new Object[] { first },
+                new Object[] { -first }
+            );
+            assertEvaluate(
+                "count(*) OVER (ORDER BY x " + direction + " RANGE BETWEEN 9223372036854775807 PRECEDING AND CURRENT ROW)",
+                new Object[] { 1L, 2L },
+                List.of(ColumnIdent.of("x")),
+                new Object[] { first },
+                new Object[] { -first }
+            );
+        }
+    }
+
+    @Test
+    public void test_numeric_window_frame_bounds_outside_long_range_are_rejected() {
+        assertThatThrownBy(() -> assertEvaluate(
+            "count(*) OVER (ORDER BY x RANGE BETWEEN 9223372036854775808 PRECEDING AND CURRENT ROW)",
+            new Object[] { 1L },
+            List.of(ColumnIdent.of("x")),
+            new Object[] { 0 }))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessage("The window frame bound 9223372036854775808 is not representable as a value of type bigint");
+        assertThatThrownBy(() -> assertEvaluate(
+            "count(*) OVER (ORDER BY x ROWS BETWEEN CURRENT ROW AND 9223372036854775808 FOLLOWING)",
+            new Object[] { 1L },
+            List.of(ColumnIdent.of("x")),
+            new Object[] { 0 }))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessage("The window frame bound 9223372036854775808 is not representable as a value of type bigint");
+    }
+
+    @Test
+    public void test_agg_over_range_following() throws Throwable {
+        Object[] expected = new Object[]{
+            11.5,
+            15.0,
+            18.5,
+            22.0,
+            26.0,
+            18.5,
+            22.0,
+            12.0
+        };
+
+        assertEvaluate("sum(d) OVER(" +
+                               "ORDER BY d RANGE BETWEEN CURRENT ROW and 3 FOLLOWING" +
+                       ")",
+                       expected,
+                       List.of(ColumnIdent.of("d")),
+                       new Object[]{2.5, 2.5},
+                       new Object[]{4.0, 4.0},
+                       new Object[]{5.0, 5.0},
+                       new Object[]{6.0, 6.0},
+                       new Object[]{7.5, 7.5},
+                       new Object[]{8.5, 8.5},
+                       new Object[]{10.0, 10.0},
+                       new Object[]{12.0, 12.0});
+    }
+
+    @Test
+    public void test_agg_over_rows_offset_following() throws Throwable {
+        Object[] expected = new Object[]{
+            17.5,
+            22.5,
+            27.0,
+            32.0,
+            38.0,
+            30.5,
+            22.0,
+            12.0
+        };
+
+        assertEvaluate("sum(d) OVER(" +
+                            "ORDER BY d ROWS BETWEEN CURRENT ROW and 3 FOLLOWING" +
+                       ")",
+                       expected,
+                       List.of(ColumnIdent.of("d")),
+                       new Object[]{2.5, 2.5},
+                       new Object[]{4.0, 4.0},
+                       new Object[]{5.0, 5.0},
+                       new Object[]{6.0, 6.0},
+                       new Object[]{7.5, 7.5},
+                       new Object[]{8.5, 8.5},
+                       new Object[]{10.0, 10.0},
+                       new Object[]{12.0, 12.0});
+    }
+
+    @Test
+    public void test_sum_with_range_offset_preceding_following_including_partitions() throws Throwable {
+        Object[][] rows = new Object[][] {
+            $("Male", 1000),
+            $("Male", 2000),
+            $("Female", 3000),
+            $("Female", 4000),
+            $("Male", 5000),
+            $("Female", 6000),
+            $("Male", 7000),
+            $("Female", 8000),
+            $("Male", 9000),
+            $("Male", 9500),
+        };
+        Object[] expected = new Object[] {
+            7000.0d,
+            7000.0d,
+            6000.0d,
+            8000.0d,
+            3000.0d,
+            3000.0d,
+            5000.0d,
+            7000.0d,
+            18500.0d,
+            18500.0d,
+        };
+        assertEvaluate(
+            "sum(d) over (partition by z order by d range between 1000 preceding and 1000 following)",
+            expected,
+            List.of(ColumnIdent.of("z"), ColumnIdent.of("d")),
+            rows
+        );
+    }
+
+    @Test
+    public void test_string_agg_with_rows_current_row_to_current_row() throws Throwable {
+        assertEvaluate(
+            """
+            string_agg(cast(x AS text), ',') OVER (ROWS BETWEEN CURRENT ROW AND CURRENT ROW)
+            """,
+            new Object[] { "1", "2" },
+            List.of(ColumnIdent.of("x")),
+            new Object[][] {
+                new Object[] { 1 },
+                new Object[] { 2 },
+            }
+        );
+    }
+
+    @Test
+    public void test_string_agg_with_per_row_delimiter_over_shrinking_frame() throws Throwable {
+        assertEvaluate(
+            """
+                string_agg(cast(x AS text), z) OVER(
+                   ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+                )
+            """,
+            new Object[]{"1", "1;2", "2/3", "3~4"},
+            List.of(ColumnIdent.of("x"), ColumnIdent.of("z")),
+            new Object[]{1, "|"},
+            new Object[]{2, ";"},
+            new Object[]{3, "/"},
+            new Object[]{4, "~"});
+    }
+
+    @Test
+    public void test_string_agg_with_per_row_delimiter_over_frame_of_three_rows() throws Throwable {
+        assertEvaluate(
+            """
+                string_agg(cast(x AS text), z) OVER(
+                   ORDER BY x ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+                )
+            """,
+            new Object[]{"1", "1;2", "1;2/3", "2/3~4"},
+            List.of(ColumnIdent.of("x"), ColumnIdent.of("z")),
+            new Object[]{1, "|"},
+            new Object[]{2, ";"},
+            new Object[]{3, "/"},
+            new Object[]{4, "~"});
+    }
+
+    @Test
+    public void test_string_agg_with_per_row_delimiter_over_sliding_frame() throws Throwable {
+        assertEvaluate(
+            """
+                string_agg(cast(x AS text), z) OVER(
+                   ORDER BY x ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING
+                )
+            """,
+            new Object[]{"1;2", "1;2/3", "2/3~4", "3~4"},
+            List.of(ColumnIdent.of("x"), ColumnIdent.of("z")),
+            new Object[]{1, "|"},
+            new Object[]{2, ";"},
+            new Object[]{3, "/"},
+            new Object[]{4, "~"});
+    }
+
+    @Test
+    public void test_string_agg_with_null_delimiter_in_the_middle_over_shrinking_frame() throws Throwable {
+        assertEvaluate(
+            """
+                string_agg(cast(x AS text), z) OVER(
+                   ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+                )
+            """,
+            new Object[]{"1", "1;2", "23", "3~4"},
+            List.of(ColumnIdent.of("x"), ColumnIdent.of("z")),
+            new Object[]{1, "|"},
+            new Object[]{2, ";"},
+            new Object[]{3, null},
+            new Object[]{4, "~"});
+    }
+
+    @Test
+    public void test_string_agg_with_null_delimiter_over_frame_of_three_rows() throws Throwable {
+        // the delimiter of x=2 is NULL, so that row contributes no separator to the state.
+        // Dropping x=1 from the frame must not consume x=2's value as if it were one.
+        assertEvaluate(
+            """
+                string_agg(cast(x AS text), z) OVER(
+                   ORDER BY x ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+                )
+            """,
+            new Object[]{"1", "12", "12~3", "2~3/4"},
+            List.of(ColumnIdent.of("x"), ColumnIdent.of("z")),
+            new Object[]{1, "|"},
+            new Object[]{2, null},
+            new Object[]{3, "~"},
+            new Object[]{4, "/"});
+    }
+
+    @Test
+    public void test_string_agg_with_only_null_delimiters_over_frame_of_three_rows() throws Throwable {
+        assertEvaluate(
+            """
+                string_agg(cast(x AS text), z) OVER(
+                   ORDER BY x ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+                )
+            """,
+            new Object[]{"1", "12", "123", "234"},
+            List.of(ColumnIdent.of("x"), ColumnIdent.of("z")),
+            new Object[]{1, null},
+            new Object[]{2, null},
+            new Object[]{3, null},
+            new Object[]{4, null});
+    }
+
+    @Test
+    public void test_string_agg_with_value_equal_to_a_delimiter_over_shrinking_frame() throws Throwable {
+        assertEvaluate(
+            """
+                string_agg(cast(x AS text), z) OVER(
+                   ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+                )
+            """,
+            new Object[]{"1", "112", "2-3", "3-4"},
+            List.of(ColumnIdent.of("x"), ColumnIdent.of("z")),
+            new Object[]{1, "-"},
+            new Object[]{2, "1"},
+            new Object[]{3, "-"},
+            new Object[]{4, "-"});
+    }
+
+    @Test
+    public void test_string_agg_over_shrinking_frame_with_duplicate_text_values() throws Throwable {
+        assertEvaluate(
+            """
+                string_agg(z, cast(x AS text)) OVER(
+                   ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+                )
+            """,
+            new Object[]{"a", "a2b", "b3a", "a4b"},
+            List.of(ColumnIdent.of("x"), ColumnIdent.of("z")),
+            new Object[]{1, "a"},
+            new Object[]{2, "b"},
+            new Object[]{3, "a"},
+            new Object[]{4, "b"});
+    }
+
+    @Test
+    public void test_string_agg_with_delimiters_differing_only_in_case_over_shrinking_frame() throws Throwable {
+        assertEvaluate(
+            """
+                string_agg(cast(x AS text), z) OVER(
+                   ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+                )
+            """,
+            new Object[]{"1", "1a2", "2A3", "3a4"},
+            List.of(ColumnIdent.of("x"), ColumnIdent.of("z")),
+            new Object[]{1, "A"},
+            new Object[]{2, "a"},
+            new Object[]{3, "A"},
+            new Object[]{4, "a"});
+    }
+
+    @Test
+    public void test_string_agg_with_constant_delimiter_over_shrinking_frame() throws Throwable {
+        assertEvaluate(
+            """
+                string_agg(z, ',') OVER(
+                   ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+                )
+            """,
+            new Object[]{"a", "a,b", "b,c", "c,d"},
+            List.of(ColumnIdent.of("x"), ColumnIdent.of("z")),
+            new Object[]{1, "a"},
+            new Object[]{2, "b"},
+            new Object[]{3, "c"},
+            new Object[]{4, "d"});
+    }
+
+    @Test
+    public void test_array_agg_over_rows_unbounded_preceding_current_row_frame() throws Throwable {
+        Object[] expected = new Object[]{
+            List.of(10),
+            List.of(10, 20),
+            List.of(10, 20, 30)
+        };
+        assertEvaluate(
+            """
+                array_agg(x) OVER(
+                    ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                )
+            """,
+            expected,
+            List.of(ColumnIdent.of("x")),
+            new Object[]{10},
+            new Object[]{20},
+            new Object[]{30});
+    }
+
+    @Test
+    public void test_array_agg_over_default_range_frame_includes_peers() throws Throwable {
+        Object[] expected = new Object[]{
+            List.of(10),
+            List.of(10, 20, 20),
+            List.of(10, 20, 20),
+            List.of(10, 20, 20, 30)
+        };
+        assertEvaluate(
+            "array_agg(x) OVER(ORDER BY x)",
+            expected,
+            List.of(ColumnIdent.of("x")),
+            new Object[]{10},
+            new Object[]{20},
+            new Object[]{20},
+            new Object[]{30});
+    }
+
+    @Test
+    public void test_array_agg_over_rows_1_preceding_current_row_frame() throws Throwable {
+        Object[] expected = new Object[]{
+            List.of(10),
+            List.of(10, 20),
+            List.of(20, 30)
+        };
+        assertEvaluate(
+            """
+                array_agg(x) OVER(
+                    ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+                )
+            """,
+            expected,
+            List.of(ColumnIdent.of("x")),
+            new Object[]{10},
+            new Object[]{20},
+            new Object[]{30});
+    }
+
+    @Test
+    public void test_array_agg_over_rows_current_row_unbounded_following_frame() throws Throwable {
+        Object[] expected = new Object[]{
+            List.of(10, 20, 30),
+            List.of(20, 30),
+            List.of(30)
+        };
+        assertEvaluate(
+            """
+                array_agg(x) OVER(
+                   ORDER BY x ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+                )
+            """,
+            expected,
+            List.of(ColumnIdent.of("x")),
+            new Object[]{10},
+            new Object[]{20},
+            new Object[]{30});
+    }
+
+    @Test
+    public void test_array_agg_over_partitioned_rows_unbounded_preceding_current_row_frame() throws Throwable {
+        Object[] expected = new Object[]{
+            List.of(10),
+            List.of(10, 20),
+            List.of(30),
+            List.of(30, 40)
+        };
+        assertEvaluate(
+            """
+                array_agg(x) OVER(
+                   PARTITION BY x > 20 ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                )
+            """,
+            expected,
+            List.of(ColumnIdent.of("x")),
+            new Object[]{10},
+            new Object[]{20},
+            new Object[]{30},
+            new Object[]{40});
+    }
+
+    @Test
+    public void test_array_agg_over_rows_unbounded_preceding_current_row_frame_keeps_nulls() throws Throwable {
+        Object[] expected = new Object[]{
+            List.of(10),
+            List.of(10, 20),
+            Arrays.asList(10, 20, null),
+        };
+        assertEvaluate(
+            """
+                array_agg(x) OVER(
+                   ORDER BY x NULLS LAST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                )
+            """,
+            expected,
+            List.of(ColumnIdent.of("x")),
+            new Object[]{10},
+            new Object[]{20},
+            new Object[]{null}
+        );
+    }
+
+    @Test
+    public void test_array_agg_over_rows_1_preceding_1_following_frame() throws Throwable {
+        Object[] expected = new Object[]{
+            List.of(10, 20),
+            List.of(10, 20, 30),
+            List.of(20, 30, 40),
+            List.of(30, 40)
+        };
+        assertEvaluate(
+            """
+                array_agg(x) OVER(
+                   ORDER BY x ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING
+                )
+            """,
+            expected,
+            List.of(ColumnIdent.of("x")),
+            new Object[]{10},
+            new Object[]{20},
+            new Object[]{30},
+            new Object[]{40});
+    }
+
+    @Test
+    public void test_array_agg_over_text_values_keeps_frame_order() throws Throwable {
+        Object[] expected = new Object[]{
+            List.of("c"),
+            List.of("c", "a"),
+            List.of("c", "a", "b")
+        };
+        assertEvaluate(
+            """
+                array_agg(z) OVER(
+                    ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                )
+            """,
+            expected,
+            List.of(ColumnIdent.of("x"), ColumnIdent.of("z")),
+            new Object[]{1, "c"},
+            new Object[]{2, "a"},
+            new Object[]{3, "b"});
+    }
+
+    @Test
+    public void test_array_agg_over_shrinking_frame_with_duplicate_text_values() throws Throwable {
+        Object[] expected = new Object[]{
+            List.of("b"),
+            List.of("b", "a"),
+            List.of("a", "b"),
+            List.of("b", "a")
+        };
+        assertEvaluate(
+            """
+                array_agg(z) OVER(
+                   ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+                )
+            """,
+            expected,
+            List.of(ColumnIdent.of("x"), ColumnIdent.of("z")),
+            new Object[]{1, "b"},
+            new Object[]{2, "a"},
+            new Object[]{3, "b"},
+            new Object[]{4, "a"});
+    }
+}

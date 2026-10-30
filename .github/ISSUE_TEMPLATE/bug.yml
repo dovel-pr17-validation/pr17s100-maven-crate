@@ -1,0 +1,65 @@
+name: 🐞 Bug Report
+description: Tell us about something that's not working the way you think it should
+labels:
+  - triage
+projects:
+  - crate/59
+body:
+  - type: input
+    id: cratedb_version
+    attributes:
+      label: CrateDB version
+      placeholder: 4.6.1
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: CrateDB setup information
+      description: Number of nodes, HEAP setting, and tell us if you're using special master/data/client node configuration
+      value: |-
+
+        Number of nodes: ?
+        CRATE_HEAP_SIZE: ?
+        CRATE_JAVA_OPTS: ?
+
+        crate.yml contents:
+
+  - type: textarea
+    id: problem_description
+    attributes:
+      label: Problem description and reproduction steps
+      description: |-
+        Concise description of the problem in your own words.
+        Please do NOT use any LLM tooling to analyze the problem but instead
+        focus on what you tried to do and what behavior you observed.
+
+        Please provide minimal but specific reproduction steps.
+        We'll need to be able to reproduce the problem - for that we typically
+        require a table schema, some sample records and the queries triggering
+        the issue. These should be as close to the original as possible with
+        any columns and expression that are not needed to reproduce the problem
+        removed.
+
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Result
+      description: Output? Logs? Enable `Show error trace` in the Admin Console or run ``crash --verbose` to get stack traces for the errors.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Result
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |-
+        ## Thanks 🙏

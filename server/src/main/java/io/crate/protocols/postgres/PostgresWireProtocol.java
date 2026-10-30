@@ -1,0 +1,981 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.protocols.postgres;
+
+import static io.crate.protocols.SSL.getSession;
+import static io.crate.protocols.postgres.FormatCodes.getFormatCode;
+import static io.crate.protocols.postgres.Messages.sendReadyForQuery;
+
+import java.net.InetAddress;
+import java.net.SocketException;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Locale;
+import java.util.Properties;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Supplier;
+
+import javax.net.ssl.SSLSession;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.elasticsearch.Version;
+import org.elasticsearch.http.netty4.Netty4HttpServerTransport;
+import org.jspecify.annotations.Nullable;
+
+import io.crate.auth.AccessControl;
+import io.crate.auth.Authentication;
+import io.crate.auth.AuthenticationMethod;
+import io.crate.auth.Credentials;
+import io.crate.auth.Protocol;
+import io.crate.common.annotations.VisibleForTesting;
+import io.crate.common.collections.Lists;
+import io.crate.exceptions.UnauthorizedException;
+import io.crate.expression.symbol.Literal;
+import io.crate.expression.symbol.Symbol;
+import io.crate.metadata.settings.CoordinatorSessionSettings;
+import io.crate.metadata.settings.session.SessionSetting;
+import io.crate.metadata.settings.session.SessionSettingRegistry;
+import io.crate.protocols.postgres.DelayableWriteChannel.DelayedWrites;
+import io.crate.protocols.postgres.PgDecoder.PgMsg;
+import io.crate.protocols.postgres.types.PGType;
+import io.crate.protocols.postgres.types.PGTypes;
+import io.crate.role.Role;
+import io.crate.role.Roles;
+import io.crate.session.DescribeResult;
+import io.crate.session.ResultReceiver;
+import io.crate.session.Session;
+import io.crate.session.Sessions;
+import io.crate.sql.tree.LocStmt;
+import io.crate.sql.tree.Statement;
+import io.crate.types.DataType;
+import io.netty.buffer.ByteBuf;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelConfig;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelPipeline;
+import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.handler.codec.DecoderException;
+import io.netty.handler.ssl.SslContext;
+import joptsimple.OptionParser;
+import joptsimple.OptionSet;
+
+
+/**
+ * Netty Handler/FrameDecoder for the Postgres wire protocol.<br />
+ * This class handles the message flow and dispatching
+ * <p>
+ * <p>
+ * <pre>
+ *      Client                              Server
+ *
+ *  (optional ssl negotiation)
+ *
+ *
+ *          |    SSLRequest                    |
+ *          |--------------------------------->|
+ *          |                                  |
+ *          |     'S' | 'N' | error            |   (supported in Enterprise version)
+ *          |<---------------------------------|
+ *
+ *
+ *  startup:
+ *  The authentication flow is handled by implementations of {@link AuthenticationMethod}.
+ *
+ *          |                                  |
+ *          |      StartupMessage              |
+ *          |--------------------------------->|
+ *          |                                  |
+ *          |      Authentication<Method>      |
+ *          |      or                          |
+ *          |      AuthenticationOK            |
+ *          |      or                          |
+ *          |      ErrorResponse               |
+ *          |<---------------------------------|
+ *          |                                  |
+ *          |       ParameterStatus            |
+ *          |<---------------------------------|
+ *          |                                  |
+ *          |       ReadyForQuery              |
+ *          |<---------------------------------|
+ *
+ *
+ * Simple Query:
+ *
+ *          +                                  +
+ *          |   Q (query)                      |
+ *          |--------------------------------->|
+ *          |                                  |
+ *          |     RowDescription               |
+ *          |<---------------------------------|
+ *          |                                  |
+ *          |     DataRow                      |
+ *          |<---------------------------------|
+ *          |     DataRow                      |
+ *          |<---------------------------------|
+ *          |     CommandComplete              |
+ *          |<---------------------------------|
+ *          |     ReadyForQuery                |
+ *          |<---------------------------------|
+ *
+ * Extended Query
+ *
+ *          +                                  +
+ *          |  Parse                           |
+ *          |--------------------------------->|
+ *          |                                  |
+ *          |  ParseComplete or ErrorResponse  |
+ *          |<---------------------------------|
+ *          |                                  |
+ *          |  Describe Statement (optional)   |
+ *          |--------------------------------->|
+ *          |                                  |
+ *          |  ParameterDescription (optional) |
+ *          |<-------------------------------- |
+ *          |                                  |
+ *          |  RowDescription (optional)       |
+ *          |<-------------------------------- |
+ *          |                                  |
+ *          |  Bind                            |
+ *          |--------------------------------->|
+ *          |                                  |
+ *          |  BindComplete or ErrorResponse   |
+ *          |<---------------------------------|
+ *          |                                  |
+ *          |  Describe Portal (optional)      |
+ *          |--------------------------------->|
+ *          |                                  |
+ *          |  RowDescription (optional)       |
+ *          |<-------------------------------- |
+ *          |                                  |
+ *          |  Execute                         |
+ *          |--------------------------------->|
+ *          |                                  |
+ *          |  DataRow |                       |
+ *          |  CommandComplete |               |
+ *          |  EmptyQueryResponse |            |
+ *          |  ErrorResponse                   |
+ *          |<---------------------------------|
+ *          |                                  |
+ *          |  Sync                            |
+ *          |--------------------------------->|
+ *          |                                  |
+ *          |  ReadyForQuery                   |
+ *          |<---------------------------------|
+ * </pre>
+ * <p>
+ * Take a look at {@link Messages} to see how the messages are structured.
+ * <p>
+ * See https://www.postgresql.org/docs/current/static/protocol-flow.html for a more detailed description of the message flow
+ */
+
+public class PostgresWireProtocol {
+
+    private static final Logger LOGGER = LogManager.getLogger(PostgresWireProtocol.class);
+    private static final String PASSWORD_AUTH_NAME = "password";
+    private static final int AUTH_TIMEOUT_SEC = 30;
+
+    public static final int SERVER_VERSION_NUM = 150000;
+    public static final String PG_SERVER_VERSION = "15.0";
+
+    public static final List<String> SUPPORTED_STARTUP_PROPERTIES = List.of(
+        "user",
+        "database",
+        "options",
+        "application_name",
+        "client_encoding",
+        "CrateDBTransport"
+    );
+
+    final PgDecoder decoder;
+    final MessageHandler handler;
+    private final Sessions sessions;
+    private final SessionSettingRegistry sessionSettingRegistry;
+    private final Function<CoordinatorSessionSettings, AccessControl> getAccessControl;
+    private final Authentication authService;
+    private final Roles roles;
+    private final Consumer<ChannelPipeline> addTransportHandler;
+
+    private DelayableWriteChannel channel;
+
+    /// Limits how long unauthenticated channels may remain alive to limit potential for DoS attacks
+    @Nullable
+    private Future<?> authTimeoutTask = null;
+    Session session;
+    private boolean ignoreTillSync = false;
+    private AuthenticationContext authContext;
+    private Properties properties;
+
+    PostgresWireProtocol(Sessions sessions,
+                         SessionSettingRegistry sessionSettingRegistry,
+                         Function<CoordinatorSessionSettings, AccessControl> getAcessControl,
+                         Consumer<ChannelPipeline> addTransportHandler,
+                         Authentication authService,
+                         Roles roles,
+                         Supplier<SslContext> getSslContext) {
+        this.sessions = sessions;
+        this.sessionSettingRegistry = sessionSettingRegistry;
+        this.getAccessControl = getAcessControl;
+        this.addTransportHandler = addTransportHandler;
+        this.authService = authService;
+        this.roles = roles;
+        this.decoder = new PgDecoder(getSslContext);
+        this.handler = new MessageHandler();
+    }
+
+    @Nullable
+    static String readCString(ByteBuf buffer) {
+        byte[] bytes = new byte[buffer.bytesBefore((byte) 0) + 1];
+        if (bytes.length == 0) {
+            return null;
+        }
+        buffer.readBytes(bytes);
+        return new String(bytes, 0, bytes.length - 1, StandardCharsets.UTF_8);
+    }
+
+    @Nullable
+    private static char[] readCharArray(ByteBuf buffer) {
+        byte[] bytes = new byte[buffer.bytesBefore((byte) 0) + 1];
+        if (bytes.length == 0) {
+            return null;
+        }
+        buffer.readBytes(bytes);
+        return StandardCharsets.UTF_8.decode(ByteBuffer.wrap(bytes)).array();
+    }
+
+    private static Properties readStartupMessage(ByteBuf buffer) {
+        Properties properties = new Properties();
+        while (true) {
+            String key = readCString(buffer);
+            if (key == null) {
+                break;
+            }
+            String value = readCString(buffer);
+            LOGGER.trace("payload: key={} value={}", key, value);
+            if (!key.isEmpty() && !"".equals(value)) {
+                properties.setProperty(key, value);
+            }
+        }
+        return properties;
+    }
+
+    private static class ReadyForQueryCallback implements BiConsumer<Object, Throwable> {
+        private final DelayableWriteChannel channel;
+        private final TransactionState transactionState;
+
+        private ReadyForQueryCallback(DelayableWriteChannel channel, TransactionState transactionState) {
+            this.channel = channel;
+            this.transactionState = transactionState;
+        }
+
+        @Override
+        public void accept(Object result, Throwable t) {
+            sendReadyForQuery(channel, transactionState);
+        }
+    }
+
+    private class MessageHandler extends SimpleChannelInboundHandler<PgMsg> {
+
+        private void interrupt(ChannelHandlerContext ctx) {
+            if (session == null) {
+                ctx.close();
+            }
+        }
+
+        @Override
+        public void channelRegistered(ChannelHandlerContext ctx) throws Exception {
+            decoder.setAuthenticated(false);
+            channel = new DelayableWriteChannel(ctx.channel());
+            authTimeoutTask = ctx.executor().schedule(() -> interrupt(ctx), AUTH_TIMEOUT_SEC, TimeUnit.SECONDS);
+        }
+
+        @Override
+        public boolean acceptInboundMessage(Object msg) throws Exception {
+            return true;
+        }
+
+        @Override
+        public void channelRead0(ChannelHandlerContext ctx, PgMsg msg) throws Exception {
+            assert channel != null : "Channel must be initialized";
+            try {
+                dispatchState(msg, channel);
+            } catch (Throwable t) {
+                ignoreTillSync = true;
+                try {
+                    AccessControl accessControl = session == null
+                        ? AccessControl.DISABLED
+                        : getAccessControl.apply(session.sessionSettings());
+                    Messages.sendErrorResponse(channel, accessControl, t);
+                } catch (Throwable ti) {
+                    LOGGER.error("Error trying to send error to client: {}", t, ti);
+                }
+            }
+        }
+
+        private void dispatchState(PgMsg msg, DelayableWriteChannel channel) {
+            switch (msg.state()) {
+                case STARTUP_VERSION_NEGOTIATE:
+                    properties = readStartupMessage(msg.buf());
+                    List<String> unsupportedProperties = properties.stringPropertyNames().stream()
+                        .filter(name -> !SUPPORTED_STARTUP_PROPERTIES.contains(name))
+                        .toList();
+                    Messages.sendNegotiateProtocolVersion(channel, unsupportedProperties);
+                    initAuthentication(channel);
+                    decoder.startupDone();
+                    return;
+
+                case STARTUP_PARAMETERS:
+                    handleStartupBody(msg.buf(), channel);
+                    decoder.startupDone();
+                    return;
+
+                case CANCEL:
+                    handleCancelRequestBody(msg.buf(), channel);
+                    return;
+
+                case MSG:
+                    if (ignoreTillSync && msg.type() != 'S') {
+                        msg.buf().skipBytes(msg.length());
+                        return;
+                    }
+                    dispatchMessage(msg, channel);
+                    return;
+                default:
+                    throw new IllegalStateException("Illegal state: " + msg.state());
+            }
+        }
+
+        private void dispatchMessage(PgMsg msg, DelayableWriteChannel channel) {
+            switch (msg.type()) {
+                case 'Q': // Query (simple)
+                    handleSimpleQuery(msg.buf(), channel);
+                    return;
+                case 'P':
+                    handleParseMessage(msg.buf(), channel);
+                    return;
+                case 'p':
+                    handlePassword(msg.buf(), channel);
+                    return;
+                case 'B':
+                    handleBindMessage(msg.buf(), channel);
+                    return;
+                case 'D':
+                    handleDescribeMessage(msg.buf(), channel);
+                    return;
+                case 'E':
+                    handleExecute(msg.buf(), channel);
+                    return;
+                case 'H':
+                    handleFlush(channel);
+                    return;
+                case 'S':
+                    handleSync(channel);
+                    return;
+                case 'C':
+                    handleClose(msg.buf(), channel);
+                    return;
+                case 'X': // Terminate (called when jdbc connection is closed)
+                    closeSession();
+                    channel.close();
+                    return;
+                default:
+                    Messages.sendErrorResponse(
+                        channel,
+                        session == null
+                            ? AccessControl.DISABLED
+                            : getAccessControl.apply(session.sessionSettings()),
+                        new UnsupportedOperationException("Unsupported messageType: " + msg.type()));
+            }
+        }
+
+        private void closeSession() {
+            decoder.setAuthenticated(false);
+            if (session != null) {
+                session.close();
+                session = null;
+            }
+        }
+
+        @Override
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable t) throws Exception {
+            if (t instanceof SocketException && t.getMessage().equals("Connection reset")) {
+                LOGGER.info("Connection reset. Client likely terminated connection");
+            } else if (t instanceof DecoderException) {
+                Messages.sendErrorResponse(
+                    channel,
+                    session == null
+                        ? AccessControl.DISABLED
+                        : getAccessControl.apply(session.sessionSettings()),
+                    t.getCause(),
+                    PGError.Severity.FATAL
+                );
+            } else {
+                LOGGER.error("Uncaught exception: ", t);
+            }
+            closeSession();
+            ctx.channel().close();
+        }
+
+        @Override
+        public void channelUnregistered(ChannelHandlerContext ctx) throws Exception {
+            LOGGER.trace("channelDisconnected");
+            channel = null;
+            closeSession();
+            super.channelUnregistered(ctx);
+        }
+    }
+
+    private void handleStartupBody(ByteBuf buffer, Channel channel) {
+        properties = readStartupMessage(buffer);
+        initAuthentication(channel);
+    }
+
+    private void initAuthentication(Channel channel) {
+        String userName = properties.getProperty("user");
+        InetAddress address = Netty4HttpServerTransport.getRemoteAddress(channel);
+
+        SSLSession sslSession = getSession(channel);
+        var credentials = new Credentials(userName, null);
+        ConnectionProperties connProperties = new ConnectionProperties(credentials, address, Protocol.POSTGRES, sslSession);
+
+        AuthenticationMethod authMethod = authService.resolveAuthenticationType(userName, connProperties);
+        if (authMethod == null) {
+            String errorMessage = String.format(
+                Locale.ENGLISH,
+                "No valid auth.host_based entry found for host \"%s\", user \"%s\". Did you enable TLS in your client?",
+                address.getHostAddress(), userName
+            );
+            Messages.sendAuthenticationError(channel, errorMessage);
+        } else {
+            authContext = new AuthenticationContext(
+                authMethod,
+                connProperties,
+                credentials,
+                LOGGER
+            );
+            if (PASSWORD_AUTH_NAME.equals(authMethod.name())) {
+                Messages.sendAuthenticationCleartextPassword(channel);
+                return;
+            }
+            finishAuthentication(channel);
+        }
+    }
+
+    private void finishAuthentication(Channel channel) {
+        assert authContext != null : "finishAuthentication() requires an authContext instance";
+        try {
+            Role authenticatedUser = authContext.authenticate();
+            if (properties.containsKey("CrateDBTransport") && !roles.hasALPrivileges(authenticatedUser)) {
+                throw new UnauthorizedException(String.format(
+                    Locale.ENGLISH,
+                    "User '%s' requested the pg_tunnel mode, but has no AL privileges.",
+                    authenticatedUser.name()
+                ));
+            }
+            String database = properties.getProperty("database");
+            session = sessions.newSession(authContext.connectionProperties(), database, authenticatedUser);
+            String options = properties.getProperty("options");
+            if (options != null) {
+                applyOptions(options);
+            }
+            decoder.setAuthenticated(true);
+            if (authTimeoutTask != null) {
+                authTimeoutTask.cancel(true);
+                authTimeoutTask = null;
+            }
+            Messages.sendAuthenticationOK(channel)
+                .addListener(f -> sendParams(channel, session.sessionSettings()))
+                .addListener(f -> Messages.sendKeyData(channel, session.id(), session.secret()))
+                .addListener(f -> {
+                    sendReadyForQuery(channel, TransactionState.IDLE);
+                    if (properties.containsKey("CrateDBTransport")) {
+                        switchToTransportProtocol(channel);
+                    }
+                });
+        } catch (Exception e) {
+            Messages.sendAuthenticationError(channel, e.getMessage());
+        } finally {
+            authContext.close();
+            authContext = null;
+        }
+    }
+
+    private void applyOptions(String options) {
+        OptionParser parser = new OptionParser();
+        var optionC = parser.accepts("c").withRequiredArg().ofType(String.class);
+        OptionSet parseResult = parser.parse(options.split(" "));
+        List<String> parsedOptions = parseResult.valuesOf(optionC);
+        for (String parsedOption : parsedOptions) {
+            String[] parts = parsedOption.split("=");
+            if (parts.length != 2) {
+                continue;
+            }
+            String key = parts[0].trim();
+            String value = parts[1].trim();
+            SessionSetting<?> sessionSetting = sessionSettingRegistry.settings().get(key);
+            if (sessionSetting == null) {
+                continue;
+            }
+            sessionSetting.apply(session.sessionSettings(), List.of(Literal.of(value)), symbol -> {
+                if (symbol instanceof Literal<?> literal) {
+                    return literal.value();
+                }
+                throw new IllegalStateException("Unexpected symbol: " + symbol);
+            });
+        }
+    }
+
+    private void switchToTransportProtocol(Channel channel) {
+        var pipeline = channel.pipeline();
+        pipeline.remove("frame-decoder");
+        pipeline.remove("flow-control");
+        pipeline.remove("handler");
+
+        // SSL is already done via PostgreSQL handshake/auth
+        addTransportHandler.accept(pipeline);
+    }
+
+    private void sendParams(Channel channel, CoordinatorSessionSettings sessionSettings) {
+        Messages.sendParameterStatus(channel, "crate_version", Version.CURRENT.externalNumber());
+        Messages.sendParameterStatus(channel, "server_version", PG_SERVER_VERSION);
+        Messages.sendParameterStatus(channel, "server_encoding", "UTF8");
+        Messages.sendParameterStatus(channel, "client_encoding", "UTF8");
+        Messages.sendParameterStatus(channel, "datestyle", sessionSettings.dateStyle());
+        Messages.sendParameterStatus(channel, "TimeZone", "UTC");
+        Messages.sendParameterStatus(channel, "integer_datetimes", "on");
+        Messages.sendParameterStatus(channel, "standard_conforming_strings", "on");
+    }
+
+    /**
+     * Flush Message
+     * | 'H' | int32 len
+     * <p>
+     * Flush forces the backend to deliver any data pending in it's output buffers.
+     */
+    private void handleFlush(Channel channel) {
+        try {
+            // If we have deferred any executions we need to trigger a sync now because the client is expecting data
+            // (That we've been holding back, as we don't eager react to `execute` requests. (We do that to optimize batch inserts))
+            // The sync will also trigger a flush eventually if there are deferred executions.
+            if (session.hasDeferredExecutions()) {
+                wait(channel, session.flush());
+            } else {
+                channel.flush();
+            }
+        } catch (Throwable t) {
+            Messages.sendErrorResponse(channel, getAccessControl.apply(session.sessionSettings()), t);
+        }
+    }
+
+    /**
+     * Parse Message
+     * header:
+     * | 'P' | int32 len
+     * <p>
+     * body:
+     * | string statementName | string query | int16 numParamTypes |
+     * foreach param:
+     * | int32 type_oid (zero = unspecified)
+     */
+    private void handleParseMessage(ByteBuf buffer, final Channel channel) {
+        String statementName = readCString(buffer);
+        final String query = readCString(buffer);
+        short numParams = buffer.readShort();
+        List<DataType<?>> paramTypes = new ArrayList<>(numParams);
+        for (int i = 0; i < numParams; i++) {
+            int oid = buffer.readInt();
+            DataType<?> dataType = PGTypes.fromOID(oid);
+            if (dataType == null) {
+                throw new IllegalArgumentException(
+                    String.format(Locale.ENGLISH, "Can't map PGType with oid=%d to Crate type", oid));
+            }
+            paramTypes.add(dataType);
+        }
+        session.parse(statementName, query, paramTypes);
+        Messages.sendParseComplete(channel);
+    }
+
+    private void handlePassword(ByteBuf buffer, final Channel channel) {
+        char[] passwd = readCharArray(buffer);
+        if (passwd != null) {
+            authContext.setSecurePassword(passwd);
+        }
+        finishAuthentication(channel);
+    }
+
+    /**
+     * Bind Message
+     * Header:
+     * | 'B' | int32 len
+     * <p>
+     * Body:
+     * <pre>
+     * | string portalName | string statementName
+     * | int16 numFormatCodes
+     *      foreach
+     *      | int16 formatCode
+     * | int16 numParams
+     *      foreach
+     *      | int32 valueLength
+     *      | byteN value
+     * | int16 numResultColumnFormatCodes
+     *      foreach
+     *      | int16 formatCode
+     * </pre>
+     */
+    private void handleBindMessage(ByteBuf buffer, Channel channel) {
+        String portalName = readCString(buffer);
+        String statementName = readCString(buffer);
+        assert portalName != null : "portalName cannot be null";
+        assert statementName != null : "statementName cannot be null";
+
+        FormatCodes.FormatCode[] formatCodes = FormatCodes.fromBuffer(buffer);
+
+        short numParams = buffer.readShort();
+        List<Object> params = createList(numParams);
+        for (int i = 0; i < numParams; i++) {
+            int valueLength = buffer.readInt();
+            if (valueLength == -1) {
+                params.add(null);
+            } else {
+                DataType<?> paramType = session.getParamType(statementName, i);
+                PGType<?> pgType = PGTypes.get(paramType);
+                FormatCodes.FormatCode formatCode = getFormatCode(formatCodes, i);
+                switch (formatCode) {
+                    case TEXT:
+                        params.add(pgType.readTextValue(buffer, valueLength, session.relationOidResolver()));
+                        break;
+
+                    case BINARY:
+                        params.add(pgType.readBinaryValue(buffer, valueLength));
+                        break;
+
+                    default:
+                        Messages.sendErrorResponse(
+                            channel,
+                            getAccessControl.apply(session.sessionSettings()),
+                            new UnsupportedOperationException(String.format(
+                                Locale.ENGLISH,
+                                "Unsupported format code '%d' for param '%s'",
+                                formatCode.ordinal(),
+                                paramType.getName())
+                            )
+                        );
+                        return;
+                }
+            }
+        }
+
+        FormatCodes.FormatCode[] resultFormatCodes = FormatCodes.fromBuffer(buffer);
+        session.bind(portalName, statementName, params, resultFormatCodes);
+        Messages.sendBindComplete(channel);
+    }
+
+    private <T> List<T> createList(short size) {
+        return size == 0 ? Collections.emptyList() : new ArrayList<>(size);
+    }
+
+
+    /**
+     * Describe Message
+     * Header:
+     * | 'D' | int32 len
+     * <p>
+     * Body:
+     * | 'S' = prepared statement or 'P' = portal
+     * | string nameOfPortalOrStatement
+     */
+    private void handleDescribeMessage(ByteBuf buffer, Channel channel) {
+        byte type = buffer.readByte();
+        String portalOrStatement = readCString(buffer);
+        DescribeResult describeResult = session.describe((char) type, portalOrStatement);
+        Collection<Symbol> fields = describeResult.getFields();
+        if (type == 'S') {
+            Messages.sendParameterDescription(channel, describeResult.getParameters());
+        }
+        if (fields == null) {
+            Messages.sendNoData(channel);
+        } else {
+            var resultFormatCodes = type == 'P' ? session.getResultFormatCodes(portalOrStatement) : null;
+            Messages.sendRowDescription(
+                channel,
+                fields,
+                describeResult.getFieldNames(),
+                resultFormatCodes,
+                describeResult.relation()
+            );
+        }
+    }
+
+    /**
+     * Execute Message
+     * Header:
+     * | 'E' | int32 len
+     * <p>
+     * Body:
+     * | string portalName
+     * | int32 maxRows (0 = unlimited)
+     */
+    private void handleExecute(ByteBuf buffer, DelayableWriteChannel channel) {
+        String portalName = readCString(buffer);
+        int maxRows = buffer.readInt();
+        String query = session.getQuery(portalName);
+        if (query.isEmpty()) {
+            // remove portal so that it doesn't stick around and no attempt to batch it with follow up statement is made
+            session.close((byte) 'P', portalName);
+            Messages.sendEmptyQueryResponse(channel);
+            return;
+        }
+        List<? extends DataType<?>> outputTypes = session.getOutputTypes(portalName);
+
+        // .execute is going async and may execute the query in another thread-pool.
+        // The results are later sent to the clients via the `ResultReceiver` created
+        // above, The `channel.write` calls - which the `ResultReceiver` makes - may
+        // happen in a thread which is *not* a netty thread.
+        // If that is the case, netty schedules the writes instead of running them
+        // immediately. A consequence of that is that *this* thread can continue
+        // processing other messages from the client, and if this thread then sends messages to the
+        // client, these are sent immediately, overtaking the result messages of the
+        // execute that is triggered here.
+        //
+        // This would lead to out-of-order messages. For example, we could send a
+        // `parseComplete` before the `commandComplete` of the previous statement has
+        // been transmitted.
+        //
+        // To ensure clients receive messages in the correct order we delay all writes
+        // The "finish" logic of the ResultReceivers writes out all pending writes/unblocks the channel
+
+        DelayedWrites delayedWrites = channel.delayWrites();
+        ResultReceiver<?> resultReceiver;
+        if (outputTypes == null) {
+            // this is a DML query
+            maxRows = 0;
+            resultReceiver = new RowCountReceiver(
+                query,
+                channel,
+                delayedWrites,
+                getAccessControl.apply(session.sessionSettings())
+            );
+        } else {
+            // query with resultSet
+            resultReceiver = new ResultSetReceiver(
+                query,
+                channel,
+                delayedWrites,
+                getAccessControl.apply(session.sessionSettings()),
+                Lists.map(outputTypes, PGTypes::get),
+                session.getResultFormatCodes(portalName)
+            );
+        }
+        CompletableFuture<?> result = session.execute(portalName, maxRows, resultReceiver);
+        if (result == null) {
+            return;
+        }
+        if (result.isDone()) {
+            ignoreTillSync = ignoreTillSync || result.isCompletedExceptionally();
+            return;
+        }
+        channel.config().setAutoRead(false);
+        result.whenComplete((_, f) -> {
+            if (f != null) {
+                LOGGER.trace("ignoreTillSync=true", f);
+                ignoreTillSync = true;
+            }
+            channel.config().setAutoRead(true);
+        });
+    }
+
+    private void handleSync(DelayableWriteChannel channel) {
+        if (ignoreTillSync) {
+            ignoreTillSync = false;
+            // If an error happens all sub-sequent messages can be ignored until the client sends a sync message
+            // We need to discard any deferred executions to make sure that the *next* sync isn't executing
+            // something we had previously deferred.
+            // E.g. JDBC client:
+            //  1) `addBatch` -> success (results in bind+execute -> we defer execution)
+            //  2) `addBatch` -> failure (ignoreTillSync=true; we stop after bind, no execute, etc..)
+            //  3) `sync`     -> sendReadyForQuery (this if branch)
+            //  4) p, b, e    -> We've a new query deferred.
+            //  5) `sync`     -> We must execute the query from 4, but not 1)
+            session.resetDeferredExecutions();
+            channel.writePendingMessages();
+            sendReadyForQuery(channel, TransactionState.FAILED_TRANSACTION);
+            return;
+        }
+        try {
+            CompletableFuture<?> sync = session.sync(false);
+            // The readyForQuery msg must only be sent _after_ an operation
+            // started in a prior E(execute) msg is completed.
+            //
+            // We ensure this via the DelayWritableChannel mechanism
+            // (The ResultReceiver triggers the delayed writes after its
+            // commandComplete/errorResponse).
+            //
+            // This ensures the readyForQuery message is in the correct order
+            // if the sync is immediately followed by more messages like Parse
+            // or Bind which would have a synchronous response too. Examples:
+            //
+            // P (insert) D S -> B E S -> P (select) D S
+            //
+            // Or
+            //
+            // P (insert) B D E S -> P (select) B D E S -> S
+            sendReadyForQuery(channel, session.transactionState());
+            wait(channel, sync);
+        } catch (Throwable t) {
+            channel.discardDelayedWrites();
+            Messages.sendErrorResponse(channel, getAccessControl.apply(session.sessionSettings()), t);
+            sendReadyForQuery(channel, TransactionState.FAILED_TRANSACTION);
+        }
+    }
+
+    /**
+     * | 'C' | int32 len | byte portalOrStatement | string portalOrStatementName |
+     */
+    private void handleClose(ByteBuf buffer, Channel channel) {
+        byte b = buffer.readByte();
+        String portalOrStatementName = readCString(buffer);
+        session.close(b, portalOrStatementName);
+        Messages.sendCloseComplete(channel);
+    }
+
+    /// Disable autoRead until future is completed to avoid processing pipelined messages in the meantime
+    private static CompletableFuture<?> wait(Channel channel, CompletableFuture<?> future) {
+        if (future.isDone()) {
+            return future;
+        }
+        ChannelConfig config = channel.config();
+        config.setAutoRead(false);
+        return future.whenComplete((_, f) -> {
+            config.setAutoRead(true);
+        });
+    }
+
+    @VisibleForTesting
+    void handleSimpleQuery(ByteBuf buffer, final DelayableWriteChannel channel) {
+        assert session != null : "Session must be created when running a simple query";
+        Session.TimeoutToken timeoutToken = session.newTimeoutToken();
+        String queryString = readCString(buffer);
+        assert queryString != null : "query must not be nulL";
+
+        List<LocStmt> statements;
+        try {
+            statements = session.simpleQuery(queryString);
+        } catch (Exception ex) {
+            Messages.sendErrorResponse(channel, getAccessControl.apply(session.sessionSettings()), ex);
+            sendReadyForQuery(channel, TransactionState.IDLE);
+            return;
+        }
+        if (statements.isEmpty()) {
+            Messages.sendEmptyQueryResponse(channel);
+            sendReadyForQuery(channel, TransactionState.IDLE);
+            return;
+        }
+        timeoutToken.check("handleSimpleQuery");
+        CompletableFuture<?> composedFuture = CompletableFuture.completedFuture(null);
+        for (var locStmt : statements) {
+            Statement stmt = locStmt.stmt();
+            String query = locStmt.querySubset(queryString);
+            composedFuture = composedFuture.thenCompose(_ -> handleSingleQuery(stmt, query, channel, timeoutToken));
+        }
+        wait(
+            channel,
+            composedFuture.whenComplete(new ReadyForQueryCallback(channel, session.transactionState())));
+    }
+
+    private CompletableFuture<?> handleSingleQuery(Statement statement,
+                                                   String query,
+                                                   DelayableWriteChannel channel,
+                                                   Session.TimeoutToken timeoutToken) {
+        AccessControl accessControl = getAccessControl.apply(session.sessionSettings());
+        try {
+
+            session.analyze(
+                "",
+                statement,
+                Collections.emptyList(),
+                query,
+                timeoutToken
+            );
+            session.bind("", "", Collections.emptyList(), null);
+            DescribeResult describeResult = session.describe('P', "");
+            List<Symbol> fields = describeResult.getFields();
+
+            CompletableFuture<?> executeResult;
+            if (fields == null) {
+                DelayedWrites delayedWrites = channel.delayWrites();
+                RowCountReceiver rowCountReceiver = new RowCountReceiver(
+                    query,
+                    channel,
+                    delayedWrites,
+                    accessControl
+                );
+                executeResult = session.execute("", 0, rowCountReceiver);
+            } else {
+                Messages.sendRowDescription(
+                    channel,
+                    fields,
+                    describeResult.getFieldNames(),
+                    null,
+                    describeResult.relation()
+                );
+                DelayedWrites delayedWrites = channel.delayWrites();
+                ResultSetReceiver resultSetReceiver = new ResultSetReceiver(
+                    query,
+                    channel,
+                    delayedWrites,
+                    accessControl,
+                    Lists.map(fields, x -> PGTypes.get(x.valueType())),
+                    null
+                );
+                executeResult = session.execute("", 0, resultSetReceiver);
+            }
+            return executeResult == null
+                ? session.sync(false)
+                : executeResult.thenCompose(_ -> session.sync(false));
+        } catch (Throwable t) {
+            channel.discardDelayedWrites();
+            Messages.sendErrorResponse(channel, accessControl, t);
+            return CompletableFuture.failedFuture(t);
+        }
+    }
+
+    private void handleCancelRequestBody(ByteBuf buffer, Channel channel) {
+        var keyData = KeyData.of(buffer);
+
+        sessions.cancel(keyData);
+
+        // Cancel request is sent by the client over a new connection.
+        // This closes the new connection, not the one running the query.
+        handler.closeSession();
+        channel.close();
+    }
+}

@@ -1,0 +1,434 @@
+/*
+ * Licensed to Elasticsearch under one or more contributor
+ * license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright
+ * ownership. Elasticsearch licenses this file to you under
+ * the Apache License, Version 2.0 (the "License"); you may
+ * not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.elasticsearch.cluster;
+
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.apache.logging.log4j.message.ParameterizedMessage;
+import org.elasticsearch.action.admin.cluster.node.stats.NodeStats;
+import org.elasticsearch.action.admin.cluster.node.stats.NodesStatsRequest;
+import org.elasticsearch.action.admin.cluster.node.stats.NodesStatsResponse;
+import org.elasticsearch.action.admin.indices.stats.IndicesStatsRequest;
+import org.elasticsearch.action.admin.indices.stats.IndicesStatsResponse;
+import org.elasticsearch.action.admin.indices.stats.ShardStats;
+import org.elasticsearch.client.Client;
+import org.elasticsearch.cluster.block.ClusterBlockException;
+import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.cluster.routing.ShardRouting;
+import org.elasticsearch.cluster.routing.allocation.DiskThresholdSettings;
+import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.settings.ClusterSettings;
+import org.elasticsearch.common.settings.Setting;
+import org.elasticsearch.common.settings.Setting.Property;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.util.concurrent.RejectableRunnable;
+import org.elasticsearch.index.store.StoreStats;
+import org.elasticsearch.monitor.fs.FsInfo;
+import org.elasticsearch.threadpool.ThreadPool;
+
+import com.carrotsearch.hppc.ObjectLongHashMap;
+import com.carrotsearch.hppc.ObjectLongMap;
+
+import io.crate.common.collections.MapBuilder;
+import io.crate.common.unit.TimeValue;
+import io.crate.exceptions.SQLExceptions;
+
+/**
+ * InternalClusterInfoService provides the ClusterInfoService interface,
+ * routinely updated on a timer. The timer can be dynamically changed by
+ * setting the <code>cluster.info.update.interval</code> setting (defaulting
+ * to 30 seconds). The InternalClusterInfoService only runs on the master node.
+ * Listens for changes in the number of data nodes and immediately submits a
+ * ClusterInfoUpdateJob if a node has been added.
+ *
+ * Every time the timer runs, gathers information about the disk usage and
+ * shard sizes across the cluster.
+ */
+public class InternalClusterInfoService implements ClusterInfoService, ClusterStateListener {
+
+    private static final Logger LOGGER = LogManager.getLogger(InternalClusterInfoService.class);
+
+    private static final String REFRESH_EXECUTOR = ThreadPool.Names.MANAGEMENT;
+
+    public static final Setting<TimeValue> INTERNAL_CLUSTER_INFO_UPDATE_INTERVAL_SETTING =
+        Setting.timeSetting("cluster.info.update.interval", TimeValue.timeValueSeconds(30), TimeValue.timeValueSeconds(10),
+            Property.Dynamic, Property.NodeScope, Property.Exposed);
+    public static final Setting<TimeValue> INTERNAL_CLUSTER_INFO_TIMEOUT_SETTING =
+        Setting.positiveTimeSetting("cluster.info.update.timeout", TimeValue.timeValueSeconds(15),
+            Property.Dynamic, Property.NodeScope);
+
+    private volatile TimeValue updateFrequency;
+
+    volatile Map<String, DiskUsage> leastAvailableSpaceUsages;
+    volatile Map<String, DiskUsage> mostAvailableSpaceUsages;
+    private volatile IndicesStatsSummary indicesStatsSummary;
+    private final AtomicReference<RefreshAndRescheduleRunnable> refreshAndRescheduleRunnable = new AtomicReference<>();
+    private volatile boolean enabled;
+    private volatile TimeValue fetchTimeout;
+    private ClusterService clusterService;
+    private final ThreadPool threadPool;
+    private final Client client;
+    private final List<Consumer<ClusterInfo>> listeners = new CopyOnWriteArrayList<>();
+
+
+    public InternalClusterInfoService(Settings settings, ClusterService clusterService, ThreadPool threadPool, Client client) {
+        this.leastAvailableSpaceUsages = Map.of();
+        this.mostAvailableSpaceUsages = Map.of();
+        this.indicesStatsSummary = IndicesStatsSummary.EMPTY;
+        this.clusterService = clusterService;
+        this.threadPool = threadPool;
+        this.client = client;
+        this.updateFrequency = INTERNAL_CLUSTER_INFO_UPDATE_INTERVAL_SETTING.get(settings);
+        this.fetchTimeout = INTERNAL_CLUSTER_INFO_TIMEOUT_SETTING.get(settings);
+        this.enabled = DiskThresholdSettings.CLUSTER_ROUTING_ALLOCATION_DISK_THRESHOLD_ENABLED_SETTING.get(settings);
+        ClusterSettings clusterSettings = clusterService.getClusterSettings();
+        clusterSettings.addSettingsUpdateConsumer(INTERNAL_CLUSTER_INFO_UPDATE_INTERVAL_SETTING, this::setUpdateFrequency);
+        clusterSettings.addSettingsUpdateConsumer(DiskThresholdSettings.CLUSTER_ROUTING_ALLOCATION_DISK_THRESHOLD_ENABLED_SETTING, this::setEnabled);
+    }
+
+    private void setEnabled(boolean enabled) {
+        this.enabled = enabled;
+    }
+
+    void setUpdateFrequency(TimeValue updateFrequency) {
+        this.updateFrequency = updateFrequency;
+    }
+
+    @Override
+    public void clusterChanged(ClusterChangedEvent event) {
+        boolean refreshed = false;
+        if (event.localNodeMaster() && refreshAndRescheduleRunnable.get() == null) {
+            LOGGER.trace("elected as master, scheduling cluster info update tasks");
+
+            if (event.state().nodes().getDataNodes().size() > 1) {
+                LOGGER.trace("refreshing cluster info in background [became master]");
+                refreshed = true;
+                refresh().whenComplete((r, t) -> {
+                    final RefreshAndRescheduleRunnable newRunnable = new RefreshAndRescheduleRunnable();
+                    refreshAndRescheduleRunnable.set(newRunnable);
+                    threadPool.scheduleUnlessShuttingDown(updateFrequency, REFRESH_EXECUTOR, newRunnable);
+                });
+            } else {
+                final RefreshAndRescheduleRunnable newRunnable = new RefreshAndRescheduleRunnable();
+                refreshAndRescheduleRunnable.set(newRunnable);
+                threadPool.scheduleUnlessShuttingDown(updateFrequency, REFRESH_EXECUTOR, newRunnable);
+            }
+
+        } else if (event.localNodeMaster() == false) {
+            refreshAndRescheduleRunnable.set(null);
+            return;
+        }
+
+        if (enabled == false) {
+            return;
+        }
+
+        // Refresh if a data node was added
+        if (!refreshed) {
+            for (DiscoveryNode addedNode : event.nodesDelta().addedNodes()) {
+                if (addedNode.isDataNode()) {
+                    LOGGER.trace("refreshing cluster info in background [data node added]");
+                    refresh();
+                    break;
+                }
+            }
+        }
+
+        // Clean up info for any removed nodes
+        for (DiscoveryNode removedNode : event.nodesDelta().removedNodes()) {
+            if (removedNode.isDataNode()) {
+                LOGGER.trace("Removing node from cluster info: {}", removedNode.getId());
+                if (leastAvailableSpaceUsages.containsKey(removedNode.getId())) {
+                    MapBuilder<String, DiskUsage> newMaxUsages = MapBuilder.newMapBuilder(leastAvailableSpaceUsages);
+                    newMaxUsages.remove(removedNode.getId());
+                    leastAvailableSpaceUsages = newMaxUsages.immutableMap();
+                }
+                if (mostAvailableSpaceUsages.containsKey(removedNode.getId())) {
+                    MapBuilder<String, DiskUsage> newMinUsages = MapBuilder.newMapBuilder(mostAvailableSpaceUsages);
+                    newMinUsages.remove(removedNode.getId());
+                    mostAvailableSpaceUsages = newMinUsages.immutableMap();
+                }
+            }
+        }
+    }
+
+    @Override
+    public ClusterInfo getClusterInfo() {
+        final IndicesStatsSummary indicesStatsSummary = this.indicesStatsSummary; // single volatile read
+        return new ClusterInfo(
+            leastAvailableSpaceUsages,
+            mostAvailableSpaceUsages,
+            indicesStatsSummary.shardSizes,
+            indicesStatsSummary.shardRoutingToDataPath,
+            indicesStatsSummary.reservedSpace
+        );
+    }
+
+
+    /**
+     * Retrieve the latest nodes stats, calling the listener when complete
+     * @return a latch that can be used to wait for the nodes stats to complete if desired
+     */
+    protected CompletableFuture<NodesStatsResponse> updateNodeStats() {
+        var allDataNodes = clusterService.state().nodes().getDataNodes().values();
+        final NodesStatsRequest nodesStatsRequest = new NodesStatsRequest(allDataNodes.toArray(DiscoveryNode[]::new));
+        nodesStatsRequest.timeout(fetchTimeout);
+        return client.nodesStats(nodesStatsRequest);
+    }
+
+    /**
+     * Retrieve the latest indices stats, calling the listener when complete
+     * @return a latch that can be used to wait for the indices stats to complete if desired
+     */
+    private CompletableFuture<IndicesStatsResponse> updateIndicesStats() {
+        final IndicesStatsRequest indicesStatsRequest = new IndicesStatsRequest();
+        indicesStatsRequest.clear();
+        indicesStatsRequest.store(true);
+
+        return client.stats(indicesStatsRequest);
+    }
+
+    // allow tests to adjust the node stats on receipt
+    List<NodeStats> adjustNodesStats(List<NodeStats> nodeStats) {
+        return nodeStats;
+    }
+
+    /**
+     * Refreshes the ClusterInfo
+     */
+    public final CompletableFuture<ClusterInfo> refresh() {
+        if (LOGGER.isTraceEnabled()) {
+            LOGGER.trace("refreshing cluster info");
+        }
+        CompletableFuture<NodesStatsResponse> nodesStatsResponse = updateNodeStats();
+        CompletableFuture<IndicesStatsResponse> indicesStatsResponse = updateIndicesStats();
+        return CompletableFuture.allOf(nodesStatsResponse, indicesStatsResponse)
+            .thenApplyAsync(
+                aVoid -> rebuildClusterInfo(nodesStatsResponse.join(), indicesStatsResponse.join()),
+                threadPool.executor(REFRESH_EXECUTOR)
+            );
+    }
+
+    private ClusterInfo rebuildClusterInfo(NodesStatsResponse nodesStats, IndicesStatsResponse indicesStats) {
+        try {
+            MapBuilder<String, DiskUsage> leastAvailableUsagesBuilder = MapBuilder.newMapBuilder();
+            MapBuilder<String, DiskUsage> mostAvailableUsagesBuilder = MapBuilder.newMapBuilder();
+            fillDiskUsagePerNode(
+                LOGGER,
+                adjustNodesStats(nodesStats.getNodes()),
+                leastAvailableUsagesBuilder,
+                mostAvailableUsagesBuilder
+            );
+            leastAvailableSpaceUsages = leastAvailableUsagesBuilder.immutableMap();
+            mostAvailableSpaceUsages = mostAvailableUsagesBuilder.immutableMap();
+        } catch (Throwable err) {
+            Throwable e = SQLExceptions.unwrap(err);
+            if (e instanceof ClusterBlockException) {
+                if (LOGGER.isTraceEnabled()) {
+                    LOGGER.trace("Failed to execute NodeStatsAction for ClusterInfoUpdateJob", e);
+                }
+            } else {
+                LOGGER.warn("Failed to execute NodeStatsAction for ClusterInfoUpdateJob", e);
+            }
+            // we empty the usages list, to be safe - we don't know what's going on.
+            leastAvailableSpaceUsages = Map.of();
+            mostAvailableSpaceUsages = Map.of();
+        }
+
+
+        try {
+            indicesStatsSummary = buildStatsSummary(indicesStats.getShards());
+        } catch (Throwable err) {
+            Throwable e = SQLExceptions.unwrap(err);
+            if (e instanceof ClusterBlockException) {
+                if (LOGGER.isTraceEnabled()) {
+                    LOGGER.trace("Failed to execute IndicesStatsAction for ClusterInfoUpdateJob", e);
+                }
+            } else {
+                LOGGER.warn("Failed to execute IndicesStatsAction for ClusterInfoUpdateJob", e);
+            }
+            // we empty the usages list, to be safe - we don't know what's going on.
+            indicesStatsSummary = IndicesStatsSummary.EMPTY;
+        }
+
+        ClusterInfo clusterInfo = getClusterInfo();
+        boolean anyListeners = false;
+        for (final Consumer<ClusterInfo> listener : listeners) {
+            anyListeners = true;
+            try {
+                LOGGER.trace("notifying [{}] of new cluster info", listener);
+                listener.accept(clusterInfo);
+            } catch (Exception e) {
+                LOGGER.info(new ParameterizedMessage("failed to notify [{}] of new cluster info", listener), e);
+            }
+        }
+        assert anyListeners : "expected to notify at least one listener";
+        return clusterInfo;
+    }
+
+    @Override
+    public void addListener(Consumer<ClusterInfo> clusterInfoConsumer) {
+        listeners.add(clusterInfoConsumer);
+    }
+
+    static IndicesStatsSummary buildStatsSummary(ShardStats[] stats) {
+        final ObjectLongHashMap<String> shardSizeByIdentifier = new ObjectLongHashMap<>();
+        final HashMap<ShardRouting, String> dataPathByShardRouting = new HashMap<>();
+        final HashMap<ClusterInfo.NodeAndPath, ClusterInfo.ReservedSpace.Builder> reservedSpaceBuilders = new HashMap<>();
+        for (ShardStats s : stats) {
+            final ShardRouting shardRouting = s.getShardRouting();
+            dataPathByShardRouting.put(shardRouting, s.getDataPath());
+
+            final StoreStats storeStats = s.getStats().getStore();
+            if (storeStats == null) {
+                continue;
+            }
+            final long size = storeStats.sizeInBytes();
+            final long reserved = storeStats.getReservedSize().getBytes();
+
+            final String shardIdentifier = ClusterInfo.shardIdentifierFromRouting(shardRouting);
+            LOGGER.trace("shard: {} size: {} reserved: {}", shardIdentifier, size, reserved);
+            shardSizeByIdentifier.put(shardIdentifier, size);
+
+            if (reserved != StoreStats.UNKNOWN_RESERVED_BYTES) {
+                final ClusterInfo.ReservedSpace.Builder reservedSpaceBuilder = reservedSpaceBuilders.computeIfAbsent(
+                    new ClusterInfo.NodeAndPath(shardRouting.currentNodeId(), s.getDataPath()),
+                    t -> new ClusterInfo.ReservedSpace.Builder());
+                reservedSpaceBuilder.add(shardRouting.shardId(), reserved);
+            }
+        }
+
+        final HashMap<ClusterInfo.NodeAndPath, ClusterInfo.ReservedSpace> rsrvdSpace = new HashMap<>();
+        reservedSpaceBuilders.forEach((nodeAndPath, builder) -> rsrvdSpace.put(nodeAndPath, builder.build()));
+
+        return new IndicesStatsSummary(
+            shardSizeByIdentifier,
+            Collections.unmodifiableMap(dataPathByShardRouting),
+            Collections.unmodifiableMap(rsrvdSpace)
+        );
+    }
+
+    static void fillDiskUsagePerNode(Logger logger,
+                                     List<NodeStats> nodeStatsArray,
+                                     MapBuilder<String, DiskUsage> newLeastAvaiableUsages,
+                                     MapBuilder<String, DiskUsage> newMostAvaiableUsages) {
+        boolean traceEnabled = logger.isTraceEnabled();
+        for (NodeStats nodeStats : nodeStatsArray) {
+            if (nodeStats.getFs() == null) {
+                logger.warn("Unable to retrieve node FS stats for {}", nodeStats.getNode().getName());
+            } else {
+                FsInfo.Path leastAvailablePath = null;
+                FsInfo.Path mostAvailablePath = null;
+                for (FsInfo.Path info : nodeStats.getFs()) {
+                    if (leastAvailablePath == null) {
+                        assert mostAvailablePath == null;
+                        mostAvailablePath = leastAvailablePath = info;
+                    } else if (leastAvailablePath.getAvailable().getBytes() > info.getAvailable().getBytes()) {
+                        leastAvailablePath = info;
+                    } else if (mostAvailablePath.getAvailable().getBytes() < info.getAvailable().getBytes()) {
+                        mostAvailablePath = info;
+                    }
+                }
+                String nodeId = nodeStats.getNode().getId();
+                String nodeName = nodeStats.getNode().getName();
+                if (logger.isTraceEnabled()) {
+                    logger.trace("node: [{}], most available: total disk: {}," +
+                            " available disk: {} / least available: total disk: {}, available disk: {}",
+                            nodeId, mostAvailablePath.getTotal(), mostAvailablePath.getAvailable(),
+                            leastAvailablePath.getTotal(), leastAvailablePath.getAvailable());
+                }
+                if (leastAvailablePath.getTotal().getBytes() < 0) {
+                    if (traceEnabled) {
+                        logger.trace(
+                            "node: [{}] least available path has less than 0 total bytes of disk [{}], skipping",
+                            nodeId, leastAvailablePath.getTotal().getBytes());
+                    }
+                } else {
+                    newLeastAvaiableUsages.put(
+                        nodeId, new DiskUsage(
+                            nodeId,
+                            nodeName,
+                            leastAvailablePath.getPath(),
+                            leastAvailablePath.getTotal().getBytes(),
+                            leastAvailablePath.getAvailable().getBytes()));
+                }
+                if (mostAvailablePath.getTotal().getBytes() < 0) {
+                    if (traceEnabled) {
+                        logger.trace(
+                            "node: [{}] most available path has less than 0 total bytes of disk [{}], skipping",
+                            nodeId, mostAvailablePath.getTotal().getBytes());
+                    }
+                } else {
+                    newMostAvaiableUsages.put(
+                        nodeId,
+                        new DiskUsage(
+                            nodeId,
+                            nodeName,
+                            mostAvailablePath.getPath(),
+                            mostAvailablePath.getTotal().getBytes(),
+                            mostAvailablePath.getAvailable().getBytes()));
+                }
+            }
+        }
+    }
+
+    private record IndicesStatsSummary(ObjectLongMap<String> shardSizes,
+                                       Map<ShardRouting, String> shardRoutingToDataPath,
+                                       Map<ClusterInfo.NodeAndPath, ClusterInfo.ReservedSpace> reservedSpace) {
+
+        static final IndicesStatsSummary EMPTY = new IndicesStatsSummary(new ObjectLongHashMap<>(), Map.of(), Map.of());
+    }
+
+
+    /**
+     * Runs {@link InternalClusterInfoService#refresh()}, logging failures/rejections appropriately, and reschedules itself on completion.
+     */
+    private class RefreshAndRescheduleRunnable implements RejectableRunnable {
+
+        RefreshAndRescheduleRunnable() {
+        }
+
+        @Override
+        public void doRun() {
+            if (this == refreshAndRescheduleRunnable.get()) {
+                refresh().whenComplete((r, e) -> {
+                    LOGGER.trace("scheduling next cluster info refresh in [{}]", updateFrequency);
+                    threadPool.scheduleUnlessShuttingDown(updateFrequency, REFRESH_EXECUTOR, this);
+                });
+            } else {
+                LOGGER.trace("master changed, scheduled refresh job is stale");
+            }
+        }
+
+        @Override
+        public void onFailure(Exception e) {
+            LOGGER.warn("refreshing cluster info failed", e);
+        }
+    }
+}

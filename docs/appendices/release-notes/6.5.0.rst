@@ -1,0 +1,263 @@
+.. _version_6.5.0:
+
+=============
+Version 6.5.0
+=============
+
+Released on 2026-10-13.
+
+.. NOTE::
+
+    If you are upgrading a cluster, you must be running CrateDB 5.0.0 or higher
+    before you upgrade to 6.5.0.
+
+    We recommend that you upgrade to the latest 6.4 release before moving to
+    6.5.0.
+
+    A rolling upgrade from >= 6.4.0 to 6.5.0 is supported.
+    Before upgrading, you should `back up your data`_.
+
+.. WARNING::
+
+    Tables that were created before CrateDB 5.x will not function with 6.x
+    and must be recreated before moving to 6.x.x.
+
+    You can recreate tables using ``COPY TO`` and ``COPY FROM`` or by
+    `inserting the data into a new table`_.
+
+.. _back up your data: https://cratedb.com/docs/crate/reference/en/latest/admin/snapshots.html
+.. _inserting the data into a new table: https://cratedb.com/docs/crate/reference/en/latest/admin/system-information.html#tables-need-to-be-recreated
+
+.. rubric:: Table of contents
+
+.. contents::
+   :local:
+
+.. _version_6.5.0_breaking_changes:
+
+Breaking Changes
+================
+
+- The PostgreSQL type mapping of CrateDB's ``byte`` type changed from ``"char"``
+  (OID 18) to ``int2`` (OID 21). Clients now receive ``byte`` columns as
+  ``int2`` in both text and binary formats.
+
+  Most clients reading data determine the type of a column dynamically, and are
+  largely unaffected. With ``pgjdbc``, ``ResultSet``'s ``getString()`` and
+  ``getByte()`` return the same results as before. ``getObject()`` now returns a
+  ``Short`` instead of a ``String``.
+
+  The CrateDB JDBC driver is unaffected: ``getObject()`` returns an ``Integer``
+  as it did before.
+
+- Changed the type mapping of PostgreSQL's ``"char"`` type from ``byte``
+  to :ref:`character(1) <data-type-character>`.
+
+  Before:
+
+    ``CREATE TABLE tbl (col "char");`` was equal to ``CREATE TABLE tbl (col byte);``
+
+  After:
+
+    ``CREATE TABLE tbl (col "char");`` is equal to ``CREATE TABLE tbl (col character(1));``
+
+  Existing tables are not affected.
+  For new tables the ``character(1)`` column will reject byte values, which are valid for a ``byte`` column:
+
+      INSERT INTO tbl (col) VALUES (65);
+      SQLParseException['65' is too long for the character type of length: 1]
+
+  This improves compatibility with PostgreSQL: In cases where a PostgreSQL
+  client sets the parameter type hint to OID 18 (``"char"``), and casts the
+  value to ``character`` or ``varchar``, the byte encoded ``"char"`` value is
+  now correctly interpreted as ASCII decimal 65, resulting in ``"A"``. Before
+  it interpreted ``65`` as a character sequence, resulting in a ``"65"``
+  string.
+
+- The query plan that :ref:`EXPLAIN <ref-explain>` displays no longer shows
+  operands in the order as written in the query. This is because operands are
+  now normalized to be in lexicographic order. This enables deduplication of
+  symmetrical join conditions (i.e. ``a = b`` is identical to ``b = a``).
+  Query results are not affected.
+
+- Removed the ``USERS`` and ``PRIVILEGES`` keywords for the
+  :ref:`RESTORE SNAPSHOT <sql-restore-snapshot>` statement, which have been
+  deprecated since :ref:`5.6.0 <version_6.5.0>`. Use ``USERMANAGEMENT`` instead.
+
+
+- Added :ref:`copy_from.http.redirects` and :ref:`copy_from.http.blocked_hosts`
+  settings to allow CrateDB administrators to prevent users from accessing HTTP
+  resources from hosts reachable on an internal network or other arbitrary hosts
+  using :ref:`COPY FROM <sql-copy-from>`. For more information see the relevant
+  `security advisory <https://github.com/crate/crate/security/advisories/GHSA-pfv7-m2fh-6g4v>`__.
+
+  The ``crate.yml`` shipped with the CrateDB tarball sets the blocked hosts to
+  ``_local_,_site_,_link_`` and disables redirects by default. On new
+  installations ``COPY FROM`` statements trying to access these blocked hosts
+  will therefore fail.
+
+  Existing installations aren't affected unless the ``crate.yml`` configuration
+  file is changed as part of the update - which we do recommend for improved
+  security.
+
+
+Deprecations
+============
+
+None
+
+
+Changes
+=======
+
+SQL Statements
+--------------
+
+- `Manish Singh <https://github.com/manish9363>`_ added support for dropping
+  multiple tables with a single :ref:`DROP TABLE <drop-table>` statement, e.g.
+  ``DROP TABLE t1, t2, t3``.
+
+SQL Standard and PostgreSQL Compatibility
+-----------------------------------------
+
+- `Manish Singh <https://github.com/manish9363>`_ added the
+  ``pg_is_in_recovery()`` scalar function for improved compatibility with
+  PostgreSQL tools. It returns ``true`` when the cluster health is ``RED``
+  and ``false`` otherwise.
+
+Data Types
+----------
+
+- `Dhruv Patel <https://github.com/DHRUV6029>`_ added support for using
+  :ref:`date <type-date>` as a column type in ``CREATE TABLE`` statements,
+  enabling migration of PostgreSQL schemas containing ``DATE`` columns
+  without DDL modification.
+
+Scalar and Aggregation Functions
+--------------------------------
+
+- `Gaurav K Ohri <https://github.com/gohri81-tech>`_ added support for the
+  :ref:`regexp_match <scalar-regexp_match>` scalar.
+
+Performance and Resilience Improvements
+---------------------------------------
+
+- `Dhruv Patel <https://github.com/DHRUV6029>`_ improved query planning by
+  normalizing a double negation to the predicate it negates, so that
+  ``NOT NOT <predicate>`` is now optimized the same way as ``<predicate>``.
+  Previously the redundant negation made the predicate opaque to the optimizer.
+  For example, in ``WHERE NOT NOT (a = 1 AND b = 2)`` the ``AND`` was no longer
+  visible, so neither part could be pushed down to the relation it belongs to.
+
+- Re-added the change to :ref:`swapping <alter_cluster_swap_table>` and
+  :ref:`renaming <sql-alter-table-rename-to>` of tables to no longer re-allocate
+  the shards of the swapped/renamed table, so that in-progress snapshots can
+  finish successfully. Previously, the in-progress snapshots would fail and
+  remain in ``PARTIAL`` state, with an ``ABORTED`` failure message showing in
+  the :ref:`sys.snapshots <sys-snapshots>` system table.
+
+- `Bing O'Dowd <https://github.com/bodowd>`_ improved query planning by
+  deduplicating identical join conditions joined by the ``AND`` operator.
+
+- Improved the performance of ``GROUP BY`` queries on ``STRING`` columns
+  with doc values enabled: aggregation values are now read directly from doc
+  values where possible. Benchmarks showed a performance increase that can
+  exceed 100%, but this depends on the number of such columns in the
+  ``GROUP BY`` clause and by their combined cardinality in the table.
+
+- `Somil Jain <https://github.com/somiljain2006>`_ improved metadata query
+  performance by caching analyzed ``ViewInfo`` instances, reducing repeated
+  analysis of view definitions when accessing ``information_schema`` views.
+
+- Improved :ref:`DELETE <sql_reference_delete>`,
+  :ref:`DROP TABLE <drop-table>`,
+  :ref:`DROP COLUMN <sql-alter-table-drop-column>`,
+  :ref:`ADD COLUMN <sql-alter-table-add-column>`,
+  :ref:`RENAME COLUMN <sql-alter-table-rename-column>`,
+  :ref:`SET/DROP DEFAULT <SQL-alter-table-alter-column-default>`,
+  :ref:`DROP CONSTRAINT <sql-alter-drop-constraint>`,
+  :ref:`SET/RESET <sql-alter-table-set-reset>` and
+  :ref:`REROUTE <sql-alter-table-reroute>`
+  such that concurrent :ref:`SWAP TABLE <alter_cluster_swap_table>`
+  cannot affect aforementioned queries already in progress.
+
+- Improved :ref:`RENAME TABLE <sql-alter-table-rename-to>` to fail if the
+  source relation name points to a different table while the statement is being
+  executed.
+
+- Improved :ref:`SWAP TABLE <alter_cluster_swap_table>` to fail if the source or
+  target relation name points to a different table while the statement is being
+  executed.
+
+- Added an optimization for ``count(DISTINCT col)`` queries without a
+  ``GROUP BY``, where ``col`` is a string column. Such a query is now rewritten
+  to group by ``col``, so that it is executed like::
+
+      SELECT count(col) FROM (SELECT col FROM tbl GROUP BY col) tmp
+
+  In our benchmarks this improvement made certain queries up to 21x
+  faster. The amount of improvement you'll see depends on the column's
+  cardinality.
+
+  If multiple such aggregates reference different columns, each one is
+  deduplicated on its own, e.g.::
+
+      SELECT count(DISTINCT "cCode"), count(DISTINCT "sourceIP")
+      FROM uservisits
+
+  is executed like::
+
+      SELECT a.c, b.c
+      FROM (SELECT count("cCode")   AS c
+            FROM (SELECT "cCode"   FROM uservisits GROUP BY "cCode")   d1) a
+      CROSS JOIN
+           (SELECT count("sourceIP") AS c
+            FROM (SELECT "sourceIP" FROM uservisits GROUP BY "sourceIP") d2) b
+
+  Our benchmarks have shown a decrease of 36% in query time for a mix of
+  low-cardinality and high-cardinality columns. The rule currently applies
+  based on table size (up to 6.6 million rows) rather than column
+  cardinality.
+
+- `Somil Jain <https://github.com/somiljain2006>`_ added support for collecting
+  table-level statistics for foreign tables during ``ANALYZE``, enabling the
+  query planner to make better decisions based on estimated row counts and table
+  sizes.
+
+- Optimized keys-only ``GROUP BY`` queries for text columns without a filter
+  (e.g. ``SELECT text_column from tbl GROUP BY text_column``) by utilizing
+  Lucene's term dictionary. Such queries now take 41% less time to complete in
+  our benchmark for high-cardinality columns.
+
+Administration and Operations
+-----------------------------
+
+- Added support for `OpenID Connect Discovery
+  <https://openid.net/specs/openid-connect-discovery-1_0.html>`_ to the
+  :ref:`JWT authentication method <auth_jwt>`. The ``iss`` value of a
+  :ref:`user's JWT properties <create-user-jwt>` or of the
+  :ref:`jwt_defaults` can now be the issuer identifier of a standard OpenID
+  Connect provider, instead of the URL of its JWK endpoint. CrateDB then
+  requests ``<iss>/.well-known/openid-configuration`` and reads the JWK
+  endpoint URL from the ``jwks_uri`` field of the discovery document.
+
+  Issuers that do not serve a discovery document are unaffected: CrateDB
+  falls back to using ``iss`` as the JWK endpoint URL directly.
+
+Client interfaces
+-----------------
+
+- Increased the PostgreSQL wire protocol version announced to clients from
+  ``14`` to ``15``, since ``14`` is being deprecated in November.
+
+
+SQL Standard and PostgreSQL Compatibility
+-----------------------------------------
+
+- `Somil Jain <https://github.com/somiljain2006>`_ added the
+  ``information_schema.constraint_column_usage`` view to improve PostgreSQL
+  compatibility with tools that introspect database metadata.
+
+- `Somil Jain <https://github.com/somiljain2006>`_ added support for
+  concatenating :ref:`bitstrings <data-types-bit-strings>` using the
+  :ref:`concat function <scalar-concat>` or the ``||`` operator.

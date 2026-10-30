@@ -1,0 +1,141 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.expression.symbol;
+
+import static com.carrotsearch.randomizedtesting.RandomizedTest.randomAsciiLettersOfLength;
+import static io.crate.testing.TestingHelpers.createReference;
+import static org.assertj.core.api.Assertions.assertThat;
+
+import java.io.IOException;
+import java.util.EnumSet;
+import java.util.List;
+import java.util.Set;
+
+import org.elasticsearch.Version;
+import org.elasticsearch.common.io.stream.BytesStreamOutput;
+import org.elasticsearch.common.io.stream.StreamInput;
+import org.elasticsearch.test.ESTestCase;
+import org.junit.Test;
+
+import io.crate.metadata.FunctionType;
+import io.crate.metadata.functions.Signature;
+import io.crate.metadata.functions.Signature.Feature;
+import io.crate.testing.TestingHelpers;
+import io.crate.types.DataType;
+import io.crate.types.DataTypes;
+
+public class FunctionTest extends ESTestCase {
+
+    private DataType<?> returnType = TestingHelpers.randomPrimitiveType();
+
+    private Signature signature = Signature.builder(randomAsciiLettersOfLength(10), FunctionType.SCALAR)
+        .argumentTypes(DataTypes.BOOLEAN.getTypeSignature())
+        .returnType(returnType.getTypeSignature())
+        .features(EnumSet.of(Feature.DETERMINISTIC, randomFeatures().toArray(Signature.Feature[]::new)))
+        .build();
+
+
+    @Test
+    public void test_serialization_without_filter() throws Exception {
+        Function fn = new Function(
+            signature,
+            List.of(createReference(randomAsciiLettersOfLength(2), DataTypes.BOOLEAN)),
+            returnType
+        );
+
+        BytesStreamOutput output = new BytesStreamOutput();
+        Symbol.toStream(fn, output);
+
+        StreamInput input = output.bytes().streamInput();
+        Function fn2 = (Function) Symbol.fromStream(input);
+
+        assertThat(fn).isEqualTo(fn2);
+    }
+
+    @Test
+    public void test_serialization_with_filter() throws Exception {
+        Function fn = new Function(
+            signature,
+            List.of(createReference(randomAsciiLettersOfLength(2), DataTypes.BOOLEAN)),
+            returnType,
+            Literal.of(true)
+        );
+
+        BytesStreamOutput output = new BytesStreamOutput();
+        Symbol.toStream(fn, output);
+
+        StreamInput input = output.bytes().streamInput();
+        Function fn2 = (Function) Symbol.fromStream(input);
+
+        assertThat(fn2.filter()).isNotNull();
+        assertThat(fn).isEqualTo(fn2);
+    }
+
+    @Test
+    public void test_serialization_distinct_field() throws IOException {
+        Function fn = new Function(
+            signature,
+            List.of(createReference(randomAsciiLettersOfLength(2), DataTypes.BOOLEAN)),
+            returnType,
+            Literal.of(true),
+            true
+        );
+
+        BytesStreamOutput out = new BytesStreamOutput();
+        Symbol.toStream(fn, out);
+
+        // read in older version, distinct defaults to false
+        StreamInput in = out.bytes().streamInput();
+        in.setVersion(Version.V_6_4_0);
+
+        Function expected = new Function(fn.signature(), fn.arguments(), fn.valueType(), fn.filter(), false);
+        assertThat(Symbol.fromStream(in)).isEqualTo(expected);
+
+        // read current version
+        in = out.bytes().streamInput();
+        assertThat(Symbol.fromStream(in)).isEqualTo(fn);
+        assertThat(in.available()).isZero();
+
+        // write to older version
+        out = new BytesStreamOutput();
+        out.setVersion(Version.V_6_4_0);
+        Symbol.toStream(fn, out);
+
+        in = out.bytes().streamInput();
+        in.setVersion(Version.V_6_4_0);
+
+        assertThat(Symbol.fromStream(in)).isEqualTo(expected);
+        // The flag must not be written for older versions, otherwise the leftover byte
+        // shifts everything that is read from the stream after this symbol.
+        assertThat(in.available()).isZero();
+    }
+
+    private static Set<Signature.Feature> randomFeatures() {
+        Set<Signature.Feature> features = EnumSet.noneOf(Feature.class);
+        for (Signature.Feature feature : Feature.values()) {
+            if (randomBoolean()) {
+                features.add(feature);
+            }
+        }
+        return features;
+    }
+}

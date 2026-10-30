@@ -1,0 +1,132 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.planner;
+
+import static io.crate.testing.Asserts.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+import java.io.IOException;
+
+import org.junit.Test;
+
+import io.crate.exceptions.OperationOnInaccessibleRelationException;
+import io.crate.metadata.RelationName;
+import io.crate.test.integration.CrateDummyClusterServiceUnitTest;
+import io.crate.testing.SQLExecutor;
+
+public class ViewPlannerTest extends CrateDummyClusterServiceUnitTest {
+
+    @Test
+    public void test_view_of_join_condition_containing_subscript_expressions() throws IOException {
+        var e = SQLExecutor.of(clusterService)
+            .addTable("CREATE TABLE doc.t1 (id int, o object as (i int))")
+            .addView(new RelationName("doc", "v1"),
+                """
+                SELECT b.id, b.o['i']
+                FROM t1 g1
+                LEFT JOIN t1 b ON b.o['i'] = g1.o['i']
+                """);
+
+        var logicalPlan = e.logicalPlan("SELECT id FROM v1");
+        var expectedPlan =
+            """
+            Rename[id] AS doc.v1
+              └ Eval[id]
+                └ HashJoin[LEFT | (o['i'] = o['i'])]
+                  ├ Rename[o['i']] AS g1
+                  │  └ Collect[doc.t1 | [o['i']] | true]
+                  └ Rename[id, o['i']] AS b
+                    └ Collect[doc.t1 | [id, o['i']] | true]
+            """;
+        assertThat(logicalPlan).isEqualTo(expectedPlan);
+    }
+
+    @Test
+    public void test_doc_table_operations_raise_helpful_error_on_views() throws Exception {
+        var e = SQLExecutor.of(clusterService)
+            .addView(new RelationName("doc", "v1"), "select * from sys.summits");
+
+        assertThatThrownBy(() -> e.plan("optimize table doc.v1"))
+            .isExactlyInstanceOf(OperationOnInaccessibleRelationException.class)
+            .hasMessage("The relation \"doc.v1\" doesn't support or allow OPTIMIZE operations");
+
+        assertThatThrownBy(() -> e.plan("refresh table doc.v1"))
+            .isExactlyInstanceOf(OperationOnInaccessibleRelationException.class)
+            .hasMessage("The relation \"doc.v1\" doesn't support or allow REFRESH operations");
+    }
+
+    /**
+     * https://github.com/crate/crate/issues/17427
+     */
+    @Test
+    public void test_push_filter_beyond_view_with_aliased_column() throws Exception {
+        var e = SQLExecutor.of(clusterService)
+            .addTable("CREATE TABLE doc.t1 (field1 INT, arr ARRAY(OBJECT))")
+            .addView(new RelationName("doc", "v"),
+                "SELECT field1 as tableid, unnest(arr) FROM doc.t1");
+
+        var logicalPlan = e.logicalPlan(" SELECT * FROM doc.v WHERE tableid=1;");
+
+        assertThat(logicalPlan).hasOperators(
+            "Rename[tableid, \"unnest(arr)\"] AS doc.v",
+            "  └ Eval[field1 AS tableid, unnest(arr)]",
+            "    └ ProjectSet[unnest(arr), arr, field1 AS tableid]",
+            "      └ Collect[doc.t1 | [arr, field1 AS tableid] | (field1 AS tableid = 1)]"
+        );
+    }
+
+    /**
+     * ORDER BY on a view column that only aliases an underlying column must not add an extra
+     * output to {@link io.crate.planner.operators.Order}.
+     * <p>
+     * Through a view, {@code ORDER BY bar} resolves to {@code AliasSymbol(foo, "bar")}, which
+     * is not {@code equals} to the plain {@code foo} a join already outputs. Appending it makes
+     * {@code Order.rewriteToFetch} treat it as a computed extra output and map it to a fetch stub.
+     */
+    @Test
+    public void test_order_by_aliased_view_column_does_not_add_extra_fetch_output() throws Exception {
+        var e = SQLExecutor.of(clusterService)
+            .addTable("CREATE TABLE doc.tbl1 (ts timestamp, id int, val double)")
+            .addTable("CREATE TABLE doc.tbl2 (id int, name string)")
+            .addView(new RelationName("doc", "v"),
+                """
+                SELECT y.name AS new_name, x.ts, x.val
+                FROM doc.tbl1 x
+                INNER JOIN doc.tbl2 y ON x.id = y.id
+                """);
+
+        var logicalPlan = e.logicalPlan("SELECT * FROM doc.v ORDER BY ts, new_name LIMIT 100");
+
+        assertThat(logicalPlan).hasOperators(
+            "Rename[new_name, ts, val] AS doc.v",
+            "  └ Eval[name AS new_name, ts, val]",
+            "    └ Fetch[ts, val, id, name, id]",
+            "      └ Limit[100;0]",
+            "        └ OrderBy[ts ASC name AS new_name ASC]",
+            "          └ HashJoin[INNER | (id = id)]",
+            "            ├ Rename[x._fetchid, ts, id] AS x",
+            "            │  └ Collect[doc.tbl1 | [_fetchid, ts, id] | true]",
+            "            └ Rename[name, id] AS y",
+            "              └ Collect[doc.tbl2 | [name, id] | true]"
+        );
+    }
+}

@@ -1,0 +1,130 @@
+.. _version_6.1.1:
+
+=============
+Version 6.1.1
+=============
+
+Released on 2025-11-19.
+
+.. WARNING::
+
+    Do not use this version when upgrading from any previous version
+    containing tables created before :ref:`version_5.5.0` as this may result
+    in data loss!
+
+    If the cluster contains tables created before :ref:`version_5.5.0`, after
+    upgrading to :ref:`version_6.1.1` certain actions on such tables like
+    deleting partitions, changing settings, rename, swap, etc. can lead to
+    corrupted table which causes all the data of the columns created
+    in versions before :ref:`version_5.5.0` to be shown as ``NULL``. The bug
+    has been fixed in :ref:`version_6.1.4`, so we highly recommend to avoid
+    upgrading to any earlier 6.1.x version.
+
+    Once already affected by the bug, existing data may be lost forever, while
+    new data (via ``INSERT`` or ``UPDATE``) can be retrieved normally.
+
+.. NOTE::
+
+    If you are upgrading a cluster, you must be running CrateDB 5.0.0 or higher
+    before you upgrade to 6.1.1.
+
+    We recommend that you upgrade to the latest 6.0 release before moving to
+    6.1.1.
+
+    A rolling upgrade from >= 6.0.2 to 6.1.1 is supported.
+    Before upgrading, you should `back up your data`_.
+
+.. WARNING::
+
+    Tables that were created before CrateDB 5.x will not function with 6.x
+    and must be recreated before moving to 6.x.x.
+
+    You can recreate tables using ``COPY TO`` and ``COPY FROM`` or by
+    `inserting the data into a new table`_.
+
+.. _back up your data: https://cratedb.com/docs/crate/reference/en/latest/admin/snapshots.html
+.. _inserting the data into a new table: https://cratedb.com/docs/crate/reference/en/latest/admin/system-information.html#tables-need-to-be-recreated
+
+.. rubric:: Table of contents
+
+.. contents::
+   :local:
+
+
+See the :ref:`version_6.1.0` release notes for a full list of changes in the 6.1
+series.
+
+Fixes
+=====
+
+- Fixed a memory leak that could happen if running a query with a large result
+  set via a PostgreSQL client and then interrupting the connection.
+
+- Fixed an issue that allowed inserting values into ``ARRAY`` columns that
+  violated the array's inner type constraints. For example it was possible to
+  insert ``['aa']`` into a column of type ``ARRAY(VARCHAR(1))``.
+
+- Fixed an issue that could lead to incorrect results for window functions when
+  the window function used a ``PARTITION BY`` clause on an object subscript
+  coming from a view or CTE and if running in a cluster with more than one node.
+
+- Fixed an issue that could cause a ``ALTER TABLE`` operation changing the
+  number of shards of a table to interrupt a concurrent ``ALTER TABLE``
+  operation also changing the number of shards.
+
+- Fixed an issue that could lead to a deadlock when executing a statement
+  containing a ``JOIN`` that got executed using a hash join algorithm on a
+  cluster with more than one node.
+
+- Fixed an issue that caused ``EXPLAIN ANALYZE`` on queries using a sub-query
+  returning multiple-rows (like with ``WHERE x IN (SELECT ...)``) to not release
+  the memory accounted within the query circuit breaker. This could later on
+  result in queries getting rejected with a circuit breaker exception, despite
+  having memory available.
+
+- Fixed an issue where generated and default sub-columns were missing from
+  results returned by the ``RETURNING`` clause.
+
+- Fixed an issue that led to deleting persisted
+  :ref:`pg_catalog.pg_stats <pg_stats>` during full cluster restart, thus making
+  it necessary to run again :ref:`analyze`.
+
+- Disallowed generated sub-columns within object arrays or referencing their
+  sub-columns, which is unsupported and leading to errors or wrong behavior.
+
+- Fixed an issue with ``atttypid`` column of the ``pg_attribute`` table not
+  being reset to ``0`` for dropped columns, which contradicts with the
+  PostgreSQL behavior.
+
+- Fixed an issue resulting in stuck :ref:`sys-jobs` entries when an
+  :ref:`sql-insert` statement using :ref:`ref-values` results in an execution
+  error, e.g. due to implicit cast or parsing issues.
+
+- Fixed an issue causing ``SELECT *`` or ``ANALYZE`` statements to fail with an
+  error ``unexpected docvalues type... Re-index with correct docvalues type.``
+  if a column was added into restored table.
+
+- Fixed an issue resulting in broken :ref:`administration-logical-replication`
+  when subscribing to clusters running versions < :ref:`version_6.1.0`.
+
+- Fixed a translog recovery issue, happening when a ``NULL`` value was stored
+  in an :ref:`type-object` with policy :ref:`type-object-columns-ignored` on
+  tables created before :ref:`version 5.5.0 <version_5.5.0>`.
+  To mitigate the issue, run CrateDB with a CLI option
+  ``-Des.xcontent.strict_duplicate_detection=false``. Please note, that this
+  flag has a global effect, and it's recommended to set it back to the default
+  value ``true`` once invalid records are processed. Issue can be considered
+  as mitigated when ``translog_stats['uncommitted_size']`` in the
+  :ref:`sys.shards <sys-shards>` table stops exceeding
+  :ref:`flush_threshold_size <sql-create-table-translog-flush-threshold-size>`.
+
+- Fixed an issue causing a ``GROUP BY ... LIMIT 0`` statement to not release
+  it's accounted memory on the ``QUERY`` circuit breaker.
+
+- Fixed an issue where certain join queries returned incorrect results when the
+  join condition referenced unknown object sub-columns coming from aliased CTEs
+  in nested joins.
+
+- Fixed an issue causing :ref:`sql-copy-from` statements to fail with an
+  ``CircuitBreakerException`` when no concrete ``bulk_size`` argument was
+  defined and the available memory is saturated on the first internal requests.

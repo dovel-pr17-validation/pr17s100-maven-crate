@@ -1,0 +1,172 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.execution.engine.indexing;
+
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.function.BiConsumer;
+import java.util.function.Supplier;
+
+import org.elasticsearch.client.Client;
+import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.breaker.CircuitBreaker;
+import org.elasticsearch.common.settings.Settings;
+import org.jspecify.annotations.Nullable;
+
+import io.crate.data.BatchIterator;
+import io.crate.data.CollectingBatchIterator;
+import io.crate.data.Input;
+import io.crate.data.Projector;
+import io.crate.data.Row;
+import io.crate.data.breaker.RamAccounting;
+import io.crate.execution.dml.IndexItem;
+import io.crate.execution.dml.upsert.ShardUpsertRequest;
+import io.crate.execution.dml.upsert.ShardUpsertRequest.DuplicateKeyAction;
+import io.crate.execution.engine.collect.CollectExpression;
+import io.crate.execution.engine.collect.RowShardResolver;
+import io.crate.execution.jobs.NodeLimits;
+import io.crate.expression.InputRow;
+import io.crate.expression.symbol.Assignments;
+import io.crate.expression.symbol.Symbol;
+import io.crate.metadata.ColumnIdent;
+import io.crate.metadata.NodeContext;
+import io.crate.metadata.PartitionName;
+import io.crate.metadata.Reference;
+import io.crate.metadata.TransactionContext;
+
+public class ColumnIndexWriterProjector implements Projector {
+
+    private final ShardingUpsertExecutor shardingUpsertExecutor;
+
+    public ColumnIndexWriterProjector(ClusterService clusterService,
+                                      BiConsumer<PartitionName, IndexItem> constraintsChecker,
+                                      NodeLimits nodeJobsCounter,
+                                      CircuitBreaker queryCircuitBreaker,
+                                      RamAccounting ramAccounting,
+                                      ScheduledExecutorService scheduler,
+                                      Executor executor,
+                                      TransactionContext txnCtx,
+                                      NodeContext nodeCtx,
+                                      Settings settings,
+                                      int targetTableNumShards,
+                                      int targetTableNumReplicas,
+                                      Supplier<PartitionName> partitionResolver,
+                                      Client elasticsearchClient,
+                                      List<ColumnIdent> primaryKeyIdents,
+                                      List<? extends Symbol> primaryKeySymbols,
+                                      @Nullable Symbol routingSymbol,
+                                      ColumnIdent clusteredByColumn,
+                                      List<Reference> columnReferences,
+                                      List<Input<?>> insertInputs,
+                                      List<? extends CollectExpression<Row, ?>> collectExpressions,
+                                      boolean ignoreDuplicateKeys,
+                                      @Nullable Map<Reference, Symbol> onConflictAssignmentsByRef,
+                                      int bulkActions,
+                                      boolean autoCreateIndices,
+                                      List<Symbol> returnValues,
+                                      UUID jobId,
+                                      long fullDocSizeEstimate,
+                                      int tableOID
+                                      ) {
+        RowShardResolver rowShardResolver = new RowShardResolver(
+            txnCtx, nodeCtx, primaryKeyIdents, primaryKeySymbols, clusteredByColumn, routingSymbol);
+        assert columnReferences.size() == insertInputs.size()
+            : "number of insert inputs must be equal to the number of columns";
+
+        String[] onConflictColumns;
+        Symbol[] onConflictAssignments;
+        if (onConflictAssignmentsByRef == null) {
+            onConflictColumns = null;
+            onConflictAssignments = null;
+        } else {
+            Assignments convert = Assignments.convert(onConflictAssignmentsByRef, nodeCtx);
+            onConflictColumns = convert.targetNames();
+            onConflictAssignments = convert.sources();
+        }
+
+        Reference[] insertColumns = columnReferences.toArray(new Reference[columnReferences.size()]);
+        boolean continueOnError = !txnCtx.sessionSettings().insertSelectFailFast();
+        ShardUpsertRequest.Builder builder = new ShardUpsertRequest.Builder(
+            txnCtx.sessionSettings(),
+            ShardingUpsertExecutor.BULK_REQUEST_TIMEOUT_SETTING.get(settings),
+            ignoreDuplicateKeys ? DuplicateKeyAction.IGNORE : DuplicateKeyAction.UPDATE_OR_FAIL,
+            continueOnError,
+            onConflictColumns,
+            insertColumns,
+            returnValues.isEmpty() ? null : returnValues.toArray(new Symbol[0]),
+            jobId
+        );
+
+        InputRow insertValues = new InputRow(insertInputs);
+        ItemFactory<ShardUpsertRequest.Item> itemFactory = (id, pkValues, autoGeneratedTimestamp) -> {
+            return ShardUpsertRequest.Item.forInsert(
+                id,
+                pkValues,
+                autoGeneratedTimestamp,
+                insertColumns,
+                insertValues.materialize(),
+                onConflictAssignments,
+                fullDocSizeEstimate
+            );
+        };
+
+        var upsertResultContext = returnValues.isEmpty() ? UpsertResultContext.forRowCount() : UpsertResultContext.forResultRows();
+
+        shardingUpsertExecutor = new ShardingUpsertExecutor(
+            clusterService,
+            constraintsChecker,
+            nodeJobsCounter,
+            queryCircuitBreaker,
+            ramAccounting,
+            scheduler,
+            executor,
+            bulkActions,
+            jobId,
+            rowShardResolver,
+            itemFactory,
+            builder::newRequest,
+            collectExpressions,
+            partitionResolver,
+            autoCreateIndices,
+            elasticsearchClient,
+            targetTableNumShards,
+            targetTableNumReplicas,
+            upsertResultContext,
+            _ -> false,
+            UpsertResults::resultsToFailure,
+            tableOID
+        );
+    }
+
+    @Override
+    public BatchIterator<Row> apply(BatchIterator<Row> batchIterator) {
+        return CollectingBatchIterator.newInstance(batchIterator, shardingUpsertExecutor, batchIterator.hasLazyResultSet());
+    }
+
+    @Override
+    public boolean providesIndependentScroll() {
+        return false;
+    }
+}

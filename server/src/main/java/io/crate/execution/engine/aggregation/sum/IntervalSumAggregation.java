@@ -1,0 +1,204 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.execution.engine.aggregation.sum;
+
+import org.elasticsearch.Version;
+import org.elasticsearch.common.breaker.CircuitBreakingException;
+import org.joda.time.Period;
+import org.jspecify.annotations.Nullable;
+
+import io.crate.data.Input;
+import io.crate.data.breaker.RamAccounting;
+import io.crate.execution.engine.aggregation.AggregationFunction;
+import io.crate.memory.MemoryManager;
+import io.crate.metadata.FunctionType;
+import io.crate.metadata.Functions;
+import io.crate.metadata.functions.BoundSignature;
+import io.crate.metadata.functions.Signature;
+import io.crate.metadata.functions.Signature.Feature;
+import io.crate.types.DataType;
+import io.crate.types.DataTypes;
+
+public class IntervalSumAggregation extends AggregationFunction<Period, Period> {
+
+    public static final String NAME = "sum";
+
+    public static void register(Functions.Builder builder) {
+        builder.add(
+                Signature.builder(NAME, FunctionType.AGGREGATE)
+                        .argumentTypes(DataTypes.INTERVAL.getTypeSignature())
+                        .returnType(DataTypes.INTERVAL.getTypeSignature())
+                        .features(Feature.DETERMINISTIC)
+                        .build(),
+                IntervalSumAggregation::new
+        );
+    }
+
+    private final Signature signature;
+    private final BoundSignature boundSignature;
+    private final int bytesSize;
+
+    private IntervalSumAggregation(Signature signature, BoundSignature boundSignature) {
+        this.signature = signature;
+        this.boundSignature = boundSignature;
+        this.bytesSize = DataTypes.INTERVAL.fixedSize();
+    }
+
+    @Nullable
+    @Override
+    public Period newState(RamAccounting ramAccounting,
+                      Version minNodeInCluster,
+                      MemoryManager memoryManager) {
+        ramAccounting.addBytes(bytesSize);
+        return null;
+    }
+
+    @Override
+    public Period iterate(RamAccounting ramAccounting,
+                          MemoryManager memoryManager,
+                          Period state,
+                          Input<?> ... args) throws CircuitBreakingException {
+        return reduce(ramAccounting, state, DataTypes.INTERVAL.sanitizeValue(args[0].value()));
+    }
+
+    @Override
+    public Period reduce(RamAccounting ramAccounting, Period state1, Period state2) {
+        if (state1 == null) {
+            return state2;
+        }
+        if (state2 == null) {
+            return state1;
+        }
+        return state1.plus(state2);
+    }
+
+    @Override
+    public Period terminatePartial(RamAccounting ramAccounting, Period state) {
+        return state;
+    }
+
+    @Override
+    public DataType<?> partialType() {
+        return boundSignature.returnType();
+    }
+
+    @Override
+    public Signature signature() {
+        return signature;
+    }
+
+    @Override
+    public BoundSignature boundSignature() {
+        return boundSignature;
+    }
+
+    @Override
+    public boolean isRemovableCumulative() {
+        return true;
+    }
+
+    @Override
+    public Period removeFromAggregatedState(RamAccounting ramAccounting,
+                                            Period previousAggState,
+                                            Input<?>[] stateToRemove) {
+        Object value = stateToRemove[0].value();
+        if (value == null) {
+            return previousAggState;
+        }
+        return previousAggState.minus(DataTypes.INTERVAL.sanitizeValue(value));
+    }
+
+    @Override
+    public AggregationFunction<?, Period> optimizeForExecutionAsWindowFunction(Version minNodeVersion) {
+        if (minNodeVersion.onOrBefore(Version.V_6_4_2)) {
+            return this;
+        }
+        return new RemovableCumulativeSum();
+    }
+
+    private final class RemovableCumulativeSum extends AggregationFunction<RemovableCumulativeState<Period>, Period> {
+
+        @Override
+        public RemovableCumulativeState<Period> newState(RamAccounting ramAccounting,
+                                                          Version minNodeInCluster,
+                                                          MemoryManager memoryManager) {
+            ramAccounting.addBytes(RemovableCumulativeState.SHALLOW_SIZE);
+            return new RemovableCumulativeState<>(null, DataTypes.INTERVAL, 0);
+        }
+
+        @Override
+        public RemovableCumulativeState<Period> iterate(RamAccounting ramAccounting,
+                                                         MemoryManager memoryManager,
+                                                         RemovableCumulativeState<Period> state,
+                                                         Input<?> ... args) throws CircuitBreakingException {
+            Period value = DataTypes.INTERVAL.sanitizeValue(args[0].value());
+            if (value != null) {
+                state.add(Period::plus, value);
+            }
+            return state;
+        }
+
+        @Override
+        public boolean isRemovableCumulative() {
+            return true;
+        }
+
+        @Override
+        public RemovableCumulativeState<Period> removeFromAggregatedState(RamAccounting ramAccounting,
+                                                                           RemovableCumulativeState<Period> previousAggState,
+                                                                           Input<?>[] stateToRemove) {
+            Period value = DataTypes.INTERVAL.sanitizeValue(stateToRemove[0].value());
+            if (value != null) {
+                previousAggState.remove(Period::minus, value);
+            }
+            return previousAggState;
+        }
+
+        @Override
+        public RemovableCumulativeState<Period> reduce(RamAccounting ramAccounting,
+                                                        RemovableCumulativeState<Period> state1,
+                                                        RemovableCumulativeState<Period> state2) {
+            state1.merge(Period::plus, state2);
+            return state1;
+        }
+
+        @Override
+        public Period terminatePartial(RamAccounting ramAccounting, RemovableCumulativeState<Period> state) {
+            return state.value();
+        }
+
+        @Override
+        public DataType<?> partialType() {
+            return RemovableCumulativeStateType.INSTANCE;
+        }
+
+        @Override
+        public Signature signature() {
+            return signature;
+        }
+
+        @Override
+        public BoundSignature boundSignature() {
+            return boundSignature;
+        }
+    }
+}

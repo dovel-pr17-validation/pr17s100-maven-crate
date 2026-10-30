@@ -1,0 +1,726 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.expression.scalar.formatting;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.time.format.TextStyle;
+import java.time.temporal.IsoFields;
+import java.time.temporal.JulianFields;
+import java.time.temporal.TemporalField;
+import java.time.temporal.WeekFields;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+
+import io.crate.common.StringUtils;
+
+/// For parsing and formatting of date time templates as documented in
+/// https://www.postgresql.org/docs/18/functions-formatting.html#FUNCTIONS-FORMATTING-DATETIME-TABLE
+public class PGDateTimeTemplates {
+
+    sealed interface Token permits TemplateLiteral, TemplatePattern {
+    }
+
+    public record TemplateLiteral(String value) implements Token {
+    }
+
+    // Indicates the previous token was a literal value
+    private static final long PREV_LITERAL = Long.MAX_VALUE;
+
+    /// Indicates the previous token was a non-numeric pattern
+    private static final long PREV_NON_NUMERIC = Long.MIN_VALUE;
+
+    public enum TemplatePattern implements Token {
+        HOUR_OF_DAY("HH"),
+        HOUR_OF_DAY_LOWER("hh"),
+        HOUR_OF_DAY12("HH12"),
+        HOUR_OF_DAY12_LOWER("hh12"),
+        HOUR_OF_DAY24("HH24"),
+        HOUR_OF_DAY24_LOWER("hh24"),
+        MINUTE("MI"),
+        MINUTE_LOWER("mi"),
+        SECOND("SS"),
+        SECOND_LOWER("ss"),
+        MILLISECOND("MS"),
+        MILLISECOND_LOWER("ms"),
+        MICROSECOND("US"),
+        MICROSECOND_LOWER("us"),
+        TENTH_OF_SECOND("FF1"),
+        TENTH_OF_SECOND_LOWER("ff1"),
+        HUNDREDTH_OF_SECOND("FF2"),
+        HUNDREDTH_OF_SECOND_LOWER("ff2"),
+        MILLISECOND_FF("FF3"),
+        MILLISECOND_FF_LOWER("ff3"),
+        TENTH_OF_MILLISECOND("FF4"),
+        TENTH_OF_MILLISECOND_LOWER("ff4"),
+        HUNDREDTH_OF_MILLISECOND("FF5"),
+        HUNDREDTH_OF_MILLISECOND_LOWER("ff5"),
+        MICROSECOND_FF("FF6"),
+        MICROSECOND_FF_LOWER("ff6"),
+        SECONDS_PAST_MIDNIGHT("SSSS"),
+        SECONDS_PAST_MIDNIGHT_LOWER("ssss"),
+        SECONDS_PAST_MIDNIGHT_S("SSSSS"),
+        SECONDS_PAST_MIDNIGHT_S_LOWER("sssss"),
+        AM_UPPER("AM"),
+        AM_LOWER("am"),
+        PM_UPPER("PM"),
+        PM_LOWER("pm"),
+        A_M_UPPER("A.M."),
+        A_M_LOWER("a.m."),
+        P_M_UPPER("P.M."),
+        P_M_LOWER("p.m."),
+        YEAR_WITH_COMMA("Y,YYY"),
+        YEAR_WITH_COMMA_LOWER("y,yyy"),
+        YEAR_YYYY("YYYY"),
+        YEAR_LOWER_YYYY("yyyy"),
+        YEAR_YYY("YYY"),
+        YEAR_YYY_LOWER("yyy"),
+        YEAR_YY("YY"),
+        YEAR_YY_LOWER("yy"),
+        YEAR_Y("Y"),
+        YEAR_Y_LOWER("y"),
+        ISO_YEAR_YYY("IYYY"),
+        ISO_YEAR_YYY_LOWER("iyyy"),
+        ISO_YEAR_YY("IYY"),
+        ISO_YEAR_YY_LOWER("iyy"),
+        ISO_YEAR_Y("IY"),
+        ISO_YEAR_Y_LOWER("iy"),
+        ISO_YEAR("I"),
+        ISO_YEAR_LOWER("i"),
+        BC_ERA_UPPER("BC"),
+        BC_ERA_LOWER("bc"),
+        AD_ERA_UPPER("AD"),
+        AD_ERA_LOWER("ad"),
+        B_C_ERA_UPPER("B.C"),
+        B_C_ERA_LOWER("b.c"),
+        A_D_ERA_UPPER("A.D"),
+        A_D_ERA_LOWER("a.d"),
+        MONTH_UPPER("MONTH"),
+        MONTH_CAPITALIZED("Month"),
+        MONTH_LOWER("month"),
+        ABBREVIATED_MONTH_UPPER("MON"),
+        ABBREVIATED_MONTH_CAPITALIZED("Mon"),
+        ABBREVIATED_MONTH_LOWER("mon"),
+        MONTH_NUMBER("MM"),
+        MONTH_NUMBER_LOWER("mm"),
+        DAY_UPPER("DAY"),
+        DAY_CAPITALIZED("Day"),
+        DAY_LOWER("day"),
+        ABBREVIATED_DAY_UPPER("DY"),
+        ABBREVIATED_DAY_CAPITALIZED("Dy"),
+        ABBREVIATED_DAY_LOWER("dy"),
+        DAY_OF_YEAR("DDD"),
+        DAY_OF_YEAR_LOWER("ddd"),
+        DAY_OF_ISO_WEEK_NUMBERING_YEAR("IDDD"),
+        DAY_OF_ISO_WEEK_NUMBERING_YEAR_LOWER("iddd"),
+        DAY_OF_MONTH("DD"),
+        DAY_OF_MONTH_LOWER("dd"),
+        DAY_OF_WEEK("D"),
+        DAY_OF_WEEK_LOWER("d"),
+        ISO_DAY_OF_WEEK("ID"),
+        ISO_DAY_OF_WEEK_LOWER("id"),
+        WEEK_OF_MONTH("W"),
+        WEEK_OF_MONTH_LOWER("w"),
+        WEEK_NUMBER_OF_YEAR("WW"),
+        WEEK_NUMBER_OF_YEAR_LOWER("ww"),
+        WEEK_NUMBER_OF_ISO_YEAR("IW"),
+        WEEK_NUMBER_OF_ISO_YEAR_LOWER("iw"),
+        CENTURY("CC"),
+        CENTURY_LOW("cc"),
+        JULIAN_DAY("J"),
+        JULIAN_DAY_LOWER("j"),
+        QUARTER("Q"),
+        QUARTER_LOWER("q"),
+        ROMAN_MONTH_UPPER("RM"),
+        ROMAN_MONTH_LOWER("rm"),
+        TIMEZONE_UPPER("TZ"),
+        TIMEZONE_LOWER("tz"),
+        TIMEZONE_HOURS("TZH"),
+        TIMEZONE_HOURS_LOWER("tzh"),
+        TIMEZONE_MINUTES("TZM"),
+        TIMEZONE_MINUTES_LOWER("tzm"),
+        TIMEZONE_OFFSET_FROM_UTC("OF"),
+        TIMEZONE_OFFSET_FROM_UTC_LOWER("of"),
+        TH_UPPER("TH"),
+        TH_LOWER("th");
+
+        private final String pattern;
+
+        TemplatePattern(final String pattern) {
+            this.pattern = pattern;
+        }
+
+        @Override
+        public String toString() {
+            return this.pattern;
+        }
+    }
+
+    static class TokenNode {
+        private final Map<Character, TokenNode> children = new HashMap<>();
+        private Token token;
+        public final TokenNode parent;
+
+        public TokenNode() {
+            this.token = null;
+            this.parent = null;
+        }
+
+        private TokenNode(String tokenString, Token token, TokenNode parent) {
+            this.parent = parent;
+            if (tokenString.length() == 1) {
+                // Last character of the token string, so a terminal leaf.
+                this.token = token;
+            } else {
+                this.token = null;
+                this.addChild(tokenString.substring(1), token);
+            }
+        }
+
+        public void addChild(Token token) {
+            this.addChild(token.toString(), token);
+        }
+
+        private void addChild(String tokenString, Token token) {
+            // If a child for the first character of the string exists, add the rest of the string to it as a child.
+            TokenNode child = this.children.get(tokenString.charAt(0));
+            if (child == null) {
+                this.children.put(tokenString.charAt(0), new TokenNode(tokenString, token, this));
+            } else {
+                // If the length of token string is 1, the child node is upgraded to a terminal token node.
+                if (tokenString.length() == 1) {
+                    child.token = token;
+                } else {
+                    child.addChild(tokenString.substring(1), token);
+                }
+            }
+        }
+
+        public boolean isTokenNode() {
+            return this.token != null;
+        }
+
+        public boolean isRootNode() {
+            return this.parent == null;
+        }
+
+    }
+
+    private static final TokenNode ROOT_TOKEN_NODE = new TokenNode();
+
+    static {
+        for (var pattern : TemplatePattern.values()) {
+            ROOT_TOKEN_NODE.addChild(pattern);
+        }
+    }
+
+    private final List<Token> tokens;
+
+    private static final TemporalField WEEK_OF_YEAR = WeekFields.of(Locale.ENGLISH).weekOfWeekBasedYear();
+
+    public PGDateTimeTemplates(String pattern) {
+        this.tokens = PGDateTimeTemplates.parse(pattern);
+    }
+
+    private static List<Token> parse(String pattern) {
+        ArrayList<Token> tokens = new ArrayList<>();
+        String pattern_to_consume = pattern;
+        int idx = 0;
+
+        TokenNode currentTokenNode = ROOT_TOKEN_NODE;
+        TokenNode nextTokenNode;
+
+        while (idx <= pattern_to_consume.length() && pattern_to_consume.length() > 0) {
+
+            if (idx == pattern_to_consume.length()) {
+                nextTokenNode = null;
+                // PostgreSQL-compatible double-quote handling.
+                // - Backslash escapes the next character (including " and \)
+                // - Unescaped " ends the quoted section
+                // - Unmatched " consumes the rest of the pattern as literal text
+            } else if (idx == 0 && pattern_to_consume.charAt(0) == '"') {
+                StringBuilder sb = new StringBuilder();
+                int pos = 1;
+                boolean foundClosingQuote = false;
+                while (pos < pattern_to_consume.length()) {
+                    char c = pattern_to_consume.charAt(pos);
+                    if (c == '\\' && pos + 1 < pattern_to_consume.length()) {
+                        sb.append(pattern_to_consume.charAt(pos + 1));
+                        pos += 2;
+                    } else if (c == '"') {
+                        foundClosingQuote = true;
+                        break;
+                    } else {
+                        sb.append(c);
+                        pos++;
+                    }
+                }
+                tokens.add(new TemplateLiteral(sb.toString()));
+                if (foundClosingQuote) {
+                    pattern_to_consume = pattern_to_consume.substring(pos + 1);
+                } else {
+                    pattern_to_consume = "";
+                }
+                currentTokenNode = ROOT_TOKEN_NODE;
+                idx = 0;
+                continue;
+            } else {
+                nextTokenNode = currentTokenNode.children.get(pattern_to_consume.charAt(idx));
+            }
+
+            if (nextTokenNode == null && idx > 0) {
+                // No next step along the tree, so the parser should terminate and reset.
+                if (currentTokenNode.isTokenNode()) {
+                    // If the current node is a token, then a valid token is found and added to the list.
+                    // The token will then be removed from the rest of the string to parse.
+                    tokens.add(currentTokenNode.token);
+                } else {
+                    // If the current node is not a token, the parser then traverses back up the tree until it either
+                    // finds a token node, or the root.
+                    int depth = idx;
+
+                    while (depth > 0) {
+                        depth -= 1;
+                        currentTokenNode = currentTokenNode.parent;
+
+                        if (currentTokenNode.isTokenNode()) {
+                            // We have found the valid token, it should be added to the stack and the remaining rest
+                            // of the parsed pattern should be added as a string.
+                            tokens.add(currentTokenNode.token);
+                            break;
+                        }
+                    }
+
+                    tokens.add(new TemplateLiteral(pattern_to_consume.substring(depth, idx)));
+                }
+
+                pattern_to_consume = pattern_to_consume.substring(idx);
+                currentTokenNode = ROOT_TOKEN_NODE;
+                idx = 0;
+            } else if (nextTokenNode == null) {
+                // If there is no path forward and index is 0, then we're at at the beginning, parsing a non-valid
+                // character. Add as a string.
+                tokens.add(new TemplateLiteral(pattern_to_consume.substring(0, idx + 1)));
+                pattern_to_consume = pattern_to_consume.substring(idx + 1);
+            } else {
+                idx += 1;
+                currentTokenNode = nextTokenNode;
+            }
+        }
+
+        return tokens;
+    }
+
+    public String format(LocalDateTime datetime) {
+        StringBuilder sb = new StringBuilder();
+        long prevNumber = PREV_LITERAL;
+        for (int i = 0; i < tokens.size(); i++) {
+            Token token = tokens.get(i);
+            switch (token) {
+                case TemplatePattern pattern -> {
+                    prevNumber = addElement(sb, pattern, datetime, prevNumber);
+                }
+                case TemplateLiteral literal -> {
+                    sb.append(literal.value());
+                    prevNumber = PREV_LITERAL;
+                }
+            }
+        }
+        return sb.toString();
+    }
+
+    /// Adds the formatted pattern to the StringBuilder.
+    /// If the template pattern is for a number it returns the number, [PREV_LITERAL] or [PREV_NON_NUMERIC]
+    ///
+    /// The long sentinel values are used to avoid boxing overhead/instance allocations
+    private static long addElement(StringBuilder sb, TemplatePattern pattern, LocalDateTime datetime, long prevNumber) {
+        return switch (pattern) {
+            case HOUR_OF_DAY, HOUR_OF_DAY12, HOUR_OF_DAY_LOWER, HOUR_OF_DAY12_LOWER -> {
+                int hour = datetime.getHour();
+                if (hour >= 12) {
+                    StringUtils.padStart(sb, String.valueOf(hour - 12), 2, '0');
+                    yield hour - 12;
+                } else {
+                    StringUtils.padStart(sb, String.valueOf(hour), 2, '0');
+                    yield hour;
+                }
+            }
+            case HOUR_OF_DAY24, HOUR_OF_DAY24_LOWER -> {
+                int hour = datetime.getHour();
+                StringUtils.padStart(sb, String.valueOf(hour), 2, '0');
+                yield hour;
+            }
+            case MINUTE, MINUTE_LOWER -> {
+                StringUtils.padStart(sb, String.valueOf(datetime.getMinute()), 2, '0');
+                yield datetime.getMinute();
+            }
+            case SECOND, SECOND_LOWER -> {
+                StringUtils.padStart(sb, String.valueOf(datetime.getSecond()), 2, '0');
+                yield datetime.getSecond();
+            }
+            case MILLISECOND, MILLISECOND_LOWER -> {
+                int ms = datetime.getNano() / 1000000;
+                StringUtils.padStart(sb, String.valueOf(ms), 3, '0');
+                yield ms;
+            }
+            case MICROSECOND, MICROSECOND_LOWER -> {
+                int micros = datetime.getNano() / 1000;
+                StringUtils.padStart(sb, String.valueOf(micros), 6, '0');
+                yield micros;
+            }
+            case TENTH_OF_SECOND, TENTH_OF_SECOND_LOWER -> {
+                int val = datetime.getNano() / 100000000;
+                sb.append(val);
+                yield val;
+            }
+            case HUNDREDTH_OF_SECOND, HUNDREDTH_OF_SECOND_LOWER -> {
+                int val = datetime.getNano() / 10000000;
+                sb.append(val);
+                yield val;
+            }
+            case MILLISECOND_FF, MILLISECOND_FF_LOWER -> {
+                int val = datetime.getNano() / 1000000;
+                sb.append(val);
+                yield val;
+            }
+            case TENTH_OF_MILLISECOND, TENTH_OF_MILLISECOND_LOWER -> {
+                int val = datetime.getNano() / 100000;
+                sb.append(val);
+                yield val;
+            }
+            case HUNDREDTH_OF_MILLISECOND, HUNDREDTH_OF_MILLISECOND_LOWER -> {
+                int val = datetime.getNano() / 10000;
+                sb.append(val);
+                yield val;
+            }
+            case MICROSECOND_FF, MICROSECOND_FF_LOWER -> {
+                int val = datetime.getNano() / 1000;
+                sb.append(val);
+                yield val;
+            }
+            case SECONDS_PAST_MIDNIGHT, SECONDS_PAST_MIDNIGHT_S, SECONDS_PAST_MIDNIGHT_LOWER, SECONDS_PAST_MIDNIGHT_S_LOWER -> {
+                Instant midnight = datetime.toLocalDate().atStartOfDay().toInstant(ZoneOffset.UTC);
+                long seconds = Duration.between(midnight, datetime.toInstant(ZoneOffset.UTC)).getSeconds();
+                sb.append(seconds);
+                yield seconds;
+            }
+            case AM_UPPER, PM_UPPER -> {
+                sb.append(datetime.getHour() >= 12 ? "PM" : "AM");
+                yield PREV_NON_NUMERIC;
+            }
+            case AM_LOWER, PM_LOWER -> {
+                sb.append(datetime.getHour() >= 12 ? "pm" : "am");
+                yield PREV_NON_NUMERIC;
+            }
+            case A_M_UPPER, P_M_UPPER -> {
+                sb.append(datetime.getHour() >= 12 ? "P.M." : "A.M.");
+                yield PREV_NON_NUMERIC;
+            }
+            case A_M_LOWER, P_M_LOWER -> {
+                sb.append(datetime.getHour() >= 12 ? "p.m." : "a.m.");
+                yield PREV_NON_NUMERIC;
+            }
+            case YEAR_WITH_COMMA, YEAR_WITH_COMMA_LOWER -> {
+                String s = String.valueOf(datetime.getYear());
+                sb.append(s.substring(0, 1));
+                sb.append(",");
+                sb.append(s.substring(1));
+                yield PREV_NON_NUMERIC;
+            }
+            case YEAR_YYYY, YEAR_LOWER_YYYY -> {
+                StringUtils.padStart(sb, String.valueOf(datetime.getYear()), 4, '0');
+                yield datetime.getYear();
+            }
+            case YEAR_YYY, YEAR_YYY_LOWER -> {
+                String s = StringUtils.padStart(String.valueOf(datetime.getYear()), 4, '0');
+                sb.append(s.substring(s.length() - 3));
+                yield datetime.getYear();
+            }
+            case YEAR_YY, YEAR_YY_LOWER -> {
+                String s = StringUtils.padStart(String.valueOf(datetime.getYear()), 4, '0');
+                sb.append(s.substring(s.length() - 2));
+                yield datetime.getYear();
+            }
+            case YEAR_Y, YEAR_Y_LOWER -> {
+                String s = StringUtils.padStart(String.valueOf(datetime.getYear()), 4, '0');
+                sb.append(s.substring(s.length() - 1));
+                yield datetime.getYear();
+            }
+            case ISO_YEAR_YYY, ISO_YEAR_YYY_LOWER -> {
+                int isoYear = datetime.get(IsoFields.WEEK_BASED_YEAR);
+                sb.append(isoYear);
+                yield isoYear;
+            }
+            case ISO_YEAR_YY, ISO_YEAR_YY_LOWER -> {
+                int isoYear = datetime.get(IsoFields.WEEK_BASED_YEAR);
+                String s = String.valueOf(isoYear);
+                sb.append(s.substring(s.length() - 3));
+                yield isoYear;
+            }
+            case ISO_YEAR_Y, ISO_YEAR_Y_LOWER -> {
+                int isoYear = datetime.get(IsoFields.WEEK_BASED_YEAR);
+                String s = String.valueOf(isoYear);
+                sb.append(s.substring(s.length() - 2));
+                yield isoYear;
+            }
+            case ISO_YEAR, ISO_YEAR_LOWER -> {
+                int isoYear = datetime.get(IsoFields.WEEK_BASED_YEAR);
+                String s = String.valueOf(isoYear);
+                sb.append(s.substring(s.length() - 1));
+                yield isoYear;
+            }
+            case BC_ERA_UPPER, AD_ERA_UPPER -> {
+                sb.append(datetime.getYear() >= 1 ? "AD" : "BC");
+                yield PREV_NON_NUMERIC;
+            }
+            case BC_ERA_LOWER, AD_ERA_LOWER -> {
+                sb.append(datetime.getYear() >= 1 ? "ad" : "bc");
+                yield PREV_NON_NUMERIC;
+            }
+            case B_C_ERA_UPPER, A_D_ERA_UPPER -> {
+                sb.append(datetime.getYear() >= 1 ? "A.D" : "B.C");
+                yield PREV_NON_NUMERIC;
+            }
+            case B_C_ERA_LOWER, A_D_ERA_LOWER -> {
+                sb.append(datetime.getYear() >= 1 ? "a.d" : "b.c");
+                yield PREV_NON_NUMERIC;
+            }
+            case MONTH_UPPER -> {
+                StringUtils.padEnd(
+                    sb,
+                    datetime.getMonth().getDisplayName(TextStyle.FULL, Locale.ENGLISH).toUpperCase(Locale.ENGLISH),
+                    7,
+                    ' '
+                );
+                yield PREV_NON_NUMERIC;
+            }
+            case MONTH_CAPITALIZED -> {
+                StringUtils.padEnd(
+                    sb,
+                    StringUtils.capitalize(datetime.getMonth().getDisplayName(TextStyle.FULL, Locale.ENGLISH)),
+                    7,
+                    ' '
+                );
+                yield PREV_NON_NUMERIC;
+            }
+            case MONTH_LOWER -> {
+                StringUtils.padEnd(
+                    sb,
+                    datetime.getMonth().getDisplayName(TextStyle.FULL, Locale.ENGLISH).toLowerCase(Locale.ENGLISH),
+                    7,
+                    ' '
+                );
+                yield PREV_NON_NUMERIC;
+            }
+            case ABBREVIATED_MONTH_UPPER -> {
+                sb.append(datetime.getMonth().getDisplayName(TextStyle.SHORT, Locale.ENGLISH).toUpperCase(Locale.ENGLISH));
+                yield PREV_NON_NUMERIC;
+            }
+            case ABBREVIATED_MONTH_CAPITALIZED -> {
+                sb.append(StringUtils.capitalize(
+                    datetime.getMonth().getDisplayName(TextStyle.SHORT, Locale.ENGLISH)
+                ));
+                yield PREV_NON_NUMERIC;
+            }
+            case ABBREVIATED_MONTH_LOWER -> {
+                sb.append(datetime.getMonth().getDisplayName(TextStyle.SHORT, Locale.ENGLISH).toLowerCase(Locale.ENGLISH));
+                yield PREV_NON_NUMERIC;
+            }
+            case MONTH_NUMBER, MONTH_NUMBER_LOWER -> {
+                int month = datetime.getMonth().getValue();
+                StringUtils.padStart(sb, String.valueOf(month), 2, '0');
+                yield month;
+            }
+            case DAY_UPPER -> {
+                StringUtils.padEnd(
+                    sb,
+                    datetime.getDayOfWeek().getDisplayName(TextStyle.FULL, Locale.ENGLISH).toUpperCase(Locale.ENGLISH),
+                    8,
+                    ' '
+                );
+                yield PREV_NON_NUMERIC;
+            }
+            case DAY_CAPITALIZED -> {
+                StringUtils.padEnd(
+                    sb,
+                    StringUtils.capitalize(
+                        datetime.getDayOfWeek().getDisplayName(TextStyle.FULL, Locale.ENGLISH)
+                    ),
+                    8,
+                    ' '
+                );
+                yield PREV_NON_NUMERIC;
+            }
+            case DAY_LOWER -> {
+                StringUtils.padEnd(
+                    sb,
+                    datetime.getDayOfWeek().getDisplayName(TextStyle.FULL, Locale.ENGLISH).toLowerCase(Locale.ENGLISH),
+                    8,
+                    ' '
+                );
+                yield PREV_NON_NUMERIC;
+            }
+            case ABBREVIATED_DAY_UPPER -> {
+                sb.append(datetime.getDayOfWeek().getDisplayName(TextStyle.SHORT, Locale.ENGLISH).toUpperCase(Locale.ENGLISH));
+                yield PREV_NON_NUMERIC;
+            }
+            case ABBREVIATED_DAY_CAPITALIZED -> {
+                sb.append(StringUtils.capitalize(
+                    datetime.getDayOfWeek().getDisplayName(TextStyle.SHORT, Locale.ENGLISH)
+                ));
+                yield PREV_NON_NUMERIC;
+            }
+            case ABBREVIATED_DAY_LOWER -> {
+                sb.append(datetime.getDayOfWeek().getDisplayName(TextStyle.SHORT, Locale.ENGLISH).toLowerCase(Locale.ENGLISH));
+                yield PREV_NON_NUMERIC;
+            }
+            case DAY_OF_YEAR, DAY_OF_YEAR_LOWER -> {
+                int dayOfYear = datetime.getDayOfYear();
+                StringUtils.padStart(sb, String.valueOf(dayOfYear), 3, '0');
+                yield dayOfYear;
+            }
+            case DAY_OF_ISO_WEEK_NUMBERING_YEAR, DAY_OF_ISO_WEEK_NUMBERING_YEAR_LOWER -> {
+                int dayOfIsoWeek = ((datetime.get(IsoFields.WEEK_OF_WEEK_BASED_YEAR) - 1) * 7) + datetime.getDayOfWeek().getValue();
+                StringUtils.padStart(sb, String.valueOf(dayOfIsoWeek), 3, '0');
+                yield dayOfIsoWeek;
+            }
+            case DAY_OF_MONTH, DAY_OF_MONTH_LOWER -> {
+                int dayOfMonth = datetime.getDayOfMonth();
+                StringUtils.padStart(sb, String.valueOf(dayOfMonth), 2, '0');
+                yield dayOfMonth;
+            }
+            case DAY_OF_WEEK, DAY_OF_WEEK_LOWER -> {
+                int dayOfWeek = (datetime.getDayOfWeek().getValue() % 7) + 1;
+                sb.append(dayOfWeek);
+                yield dayOfWeek;
+            }
+            case ISO_DAY_OF_WEEK, ISO_DAY_OF_WEEK_LOWER -> {
+                int isoDayOfWeek = datetime.getDayOfWeek().getValue();
+                sb.append(isoDayOfWeek);
+                yield isoDayOfWeek;
+            }
+            case WEEK_OF_MONTH, WEEK_OF_MONTH_LOWER -> {
+                int weekOfMonth = (datetime.getDayOfMonth() / 7) + 1;
+                sb.append(weekOfMonth);
+                yield weekOfMonth;
+            }
+            case WEEK_NUMBER_OF_YEAR, WEEK_NUMBER_OF_YEAR_LOWER -> {
+                int weekOfYear = datetime.get(WEEK_OF_YEAR);
+                StringUtils.padStart(sb, String.valueOf(weekOfYear), 2, '0');
+                yield weekOfYear;
+            }
+            case WEEK_NUMBER_OF_ISO_YEAR, WEEK_NUMBER_OF_ISO_YEAR_LOWER -> {
+                int isoWeekOfYear = datetime.get(IsoFields.WEEK_OF_WEEK_BASED_YEAR);
+                StringUtils.padStart(sb, String.valueOf(isoWeekOfYear), 2, '0');
+                yield isoWeekOfYear;
+            }
+            case CENTURY, CENTURY_LOW -> {
+                int century = ((datetime.getYear() - 1) / 100) + 1;
+                sb.append(century);
+                yield century;
+            }
+            case JULIAN_DAY, JULIAN_DAY_LOWER -> {
+                long julianDay = datetime.getLong(JulianFields.JULIAN_DAY);
+                sb.append(julianDay);
+                yield julianDay;
+            }
+            case QUARTER, QUARTER_LOWER -> {
+                int quarter = (datetime.getMonthValue() + 2) / 3;
+                sb.append(quarter);
+                yield quarter;
+            }
+            case ROMAN_MONTH_UPPER -> {
+                StringUtils.padEnd(
+                    sb,
+                    toRoman(datetime.getMonthValue()).toUpperCase(Locale.ENGLISH),
+                    4,
+                    ' '
+                );
+                yield PREV_NON_NUMERIC;
+            }
+            case ROMAN_MONTH_LOWER -> {
+                StringUtils.padEnd(
+                    sb,
+                    toRoman(datetime.getMonthValue()).toLowerCase(Locale.ENGLISH),
+                    4,
+                    ' '
+                );
+                yield PREV_NON_NUMERIC;
+            }
+            case TIMEZONE_UPPER,
+                 TIMEZONE_LOWER,
+                 TIMEZONE_HOURS,
+                 TIMEZONE_HOURS_LOWER,
+                 TIMEZONE_MINUTES,
+                 TIMEZONE_MINUTES_LOWER,
+                 TIMEZONE_OFFSET_FROM_UTC,
+                 TIMEZONE_OFFSET_FROM_UTC_LOWER -> Long.MIN_VALUE;
+            case TH_LOWER -> {
+                sb.append(ordNumberSuffix(prevNumber));
+                yield PREV_LITERAL;
+            }
+            case TH_UPPER -> {
+                sb.append(ordNumberSuffix(prevNumber).toUpperCase(Locale.ENGLISH));
+                yield PREV_LITERAL;
+            }
+            default -> throw new IllegalArgumentException("Unexpected pattern: " + pattern);
+        };
+    }
+
+    private static String ordNumberSuffix(long number) {
+        if (number == PREV_LITERAL) {
+            return "th";
+        }
+        if (number == PREV_NON_NUMERIC) {
+            return "";
+        }
+        long num = Math.abs(number);
+        long mod100 = num % 100;
+        if (mod100 >= 11 && mod100 <= 13) {
+            return "th";
+        }
+        return switch ((int) num % 10) {
+            case 1 -> "st";
+            case 2 -> "nd";
+            case 3 -> "rd";
+            default -> "th";
+        };
+    }
+
+    private static String toRoman(int number) {
+        int[] romanN = {10, 9, 5, 4, 1};
+        String[] romanS = {"X", "IX", "V", "IV", "I"};
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < romanN.length; i++) {
+            while (number >= romanN[i]) {
+                sb.append(romanS[i]);
+                number -= romanN[i];
+            }
+        }
+        return sb.toString();
+    }
+}

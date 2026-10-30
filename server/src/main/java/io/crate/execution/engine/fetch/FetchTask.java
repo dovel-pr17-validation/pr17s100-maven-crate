@@ -1,0 +1,349 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.execution.engine.fetch;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
+
+import org.apache.lucene.search.IndexSearcher;
+import org.elasticsearch.cluster.metadata.IndexMetadata;
+import org.elasticsearch.cluster.metadata.Metadata;
+import org.elasticsearch.index.Index;
+import org.elasticsearch.index.IndexNotFoundException;
+import org.elasticsearch.index.IndexService;
+import org.elasticsearch.index.shard.IllegalIndexShardStateException;
+import org.elasticsearch.index.shard.IndexShard;
+import org.elasticsearch.index.shard.ShardId;
+
+import com.carrotsearch.hppc.IntIndexedContainer;
+import com.carrotsearch.hppc.IntObjectHashMap;
+import com.carrotsearch.hppc.cursors.IntCursor;
+
+import io.crate.common.annotations.GuardedBy;
+import io.crate.common.collections.BorrowedItem;
+import io.crate.common.collections.RefCountedItem;
+import io.crate.common.exceptions.Exceptions;
+import io.crate.execution.dsl.phases.FetchPhase;
+import io.crate.execution.jobs.SharedShardContext;
+import io.crate.execution.jobs.SharedShardContexts;
+import io.crate.execution.jobs.Task;
+import io.crate.metadata.DocTableInfo;
+import io.crate.metadata.PartitionName;
+import io.crate.metadata.Reference;
+import io.crate.metadata.RelationMetadata;
+import io.crate.metadata.RelationName;
+import io.crate.metadata.Routing;
+
+public class FetchTask implements Task {
+
+    private final IntObjectHashMap<RefCountedItem<? extends IndexSearcher>> searchers = new IntObjectHashMap<>();
+    private final IntObjectHashMap<SharedShardContext> shardContexts = new IntObjectHashMap<>();
+    private final FetchPhase phase;
+    private final int memoryLimitInBytes;
+    private final String localNodeId;
+    private final SharedShardContexts sharedShardContexts;
+    private final TreeMap<Integer, PartitionName> tableIdents = new TreeMap<>();
+    private final Metadata metadata;
+    private final List<? extends Routing> routings;
+    private final Map<RelationName, Collection<Reference>> toFetch;
+    private final UUID jobId;
+    private final Function<Index, DocTableInfo> getTableInfo;
+    private final CompletableFuture<Void> result = new CompletableFuture<>();
+
+
+    @GuardedBy("jobId")
+    private int borrowed = 0;
+
+    @GuardedBy("jobId")
+    private Throwable killed;
+
+    public FetchTask(UUID jobId,
+                     FetchPhase phase,
+                     int memoryLimitInBytes,
+                     String localNodeId,
+                     SharedShardContexts sharedShardContexts,
+                     Metadata metadata,
+                     Function<Index, DocTableInfo> getTableInfo,
+                     List<? extends Routing> routings) {
+        this.jobId = jobId;
+        this.phase = phase;
+        this.memoryLimitInBytes = memoryLimitInBytes;
+        this.localNodeId = localNodeId;
+        this.sharedShardContexts = sharedShardContexts;
+        this.metadata = metadata;
+        this.routings = routings;
+        this.toFetch = HashMap.newHashMap(phase.tableIndices().size());
+        this.getTableInfo = getTableInfo;
+        this.result.whenComplete((_, _) -> {
+            synchronized (jobId) {
+                for (var cursor : searchers) {
+                    cursor.value.close();
+                }
+                searchers.clear();
+            }
+        });
+    }
+
+    /**
+     * From the memory.operation_limit session setting.
+     */
+    public int memoryLimitInBytes() {
+        return memoryLimitInBytes;
+    }
+
+    public Map<RelationName, Collection<Reference>> toFetch() {
+        return toFetch;
+    }
+
+    @Override
+    public String name() {
+        return phase.name();
+    }
+
+    @Override
+    public long bytesUsed() {
+        return -1;
+    }
+
+    public PartitionName tableIdent(int readerId) {
+        var entry = tableIdents.floorEntry(readerId);
+        if (entry == null) {
+            throw new IllegalArgumentException("No table has been registered for readerId=" + readerId);
+        }
+        return entry.getValue();
+    }
+
+    public DocTableInfo table(int readerId) {
+        SharedShardContext sharedShardContext = shardContexts.get(readerId);
+        if (sharedShardContext == null) {
+            throw new IllegalArgumentException(String.format(Locale.ENGLISH, "Reader with id %d not found", readerId));
+        }
+        var table = getTableInfo.apply(sharedShardContext.indexShard().shardId().getIndex());
+        if (table == null) {
+            throw new IllegalStateException("TableInfo missing for readerId=" + readerId);
+        }
+        return table;
+    }
+
+    public BorrowedItem<IndexSearcher> searcher(int readerId) {
+        synchronized (jobId) {
+            if (killed != null) {
+                throw Exceptions.toRuntimeException(killed);
+            }
+            final var searcher = searchers.get(readerId);
+            if (searcher == null) {
+                throw new IllegalArgumentException(String.format(Locale.ENGLISH, "Searcher for reader with id %d not found", readerId));
+            }
+            borrowed++;
+            return new BorrowedItem<>(searcher.item(), () -> {
+                synchronized (jobId) {
+                    borrowed--;
+                    if (borrowed == 0 && killed != null) {
+                        result.completeExceptionally(killed);
+                    }
+                }
+            });
+        }
+    }
+
+    public IndexService indexService(int readerId) {
+        SharedShardContext sharedShardContext = shardContexts.get(readerId);
+        if (sharedShardContext == null) {
+            throw new IllegalArgumentException(String.format(Locale.ENGLISH, "Reader with id %d not found", readerId));
+        }
+        return sharedShardContext.indexService();
+    }
+
+    public IndexShard indexShard(int readerId) {
+        SharedShardContext sharedShardContext = shardContexts.get(readerId);
+        if (sharedShardContext == null) {
+            throw new IllegalArgumentException(String.format(Locale.ENGLISH, "Reader with id %d not found", readerId));
+        }
+        return sharedShardContext.indexShard();
+    }
+
+    @Override
+    public String toString() {
+        return "FetchTask{" +
+               "phase=" + phase.phaseId() +
+               ", borrowed=" + borrowed +
+               ", done=" + result.isDone() +
+               ", killed=" + killed +
+               ", searchers=" + searchers.keys() +
+               '}';
+    }
+
+    @Override
+    public CompletableFuture<Void> completionFuture() {
+        return result;
+    }
+
+    @Override
+    public void kill(Throwable throwable) {
+        synchronized (jobId) {
+            killed = throwable;
+            if (borrowed == 0) {
+                result.completeExceptionally(throwable);
+            }
+        }
+    }
+
+    public void close() {
+        synchronized (jobId) {
+            assert borrowed == 0 : "Close shouldn't be called while searchers are in use";
+            if (killed == null) {
+                result.complete(null);
+            } else {
+                result.completeExceptionally(killed);
+            }
+        }
+    }
+
+    @Override
+    public CompletableFuture<Void> start() {
+        synchronized (jobId) {
+            if (killed != null) {
+                result.completeExceptionally(killed);
+                return null;
+            }
+
+            var index2TableIdent = new HashMap<String, RelationName>();
+            for (var entry : phase.tableIndices().entrySet()) {
+                for (String indexUUID : entry.getValue()) {
+                    index2TableIdent.put(indexUUID, entry.getKey());
+                }
+            }
+
+            ArrayList<CompletableFuture<Void>> refreshActions = new ArrayList<>(routings.size());
+            for (Routing routing : routings) {
+                Map<String, Map<String, IntIndexedContainer>> locations = routing.locations();
+                Map<String, IntIndexedContainer> indexShards = locations.get(localNodeId);
+                try {
+                    refreshActions.add(sharedShardContexts.maybeRefreshReaders(
+                        metadata,
+                        indexShards,
+                        phase.bases(),
+                        index2TableIdent
+                    ));
+                } catch (Throwable t) {
+                    result.completeExceptionally(t);
+                    throw t;
+                }
+            }
+            CompletableFuture<Void> allRefreshed = CompletableFuture.allOf(refreshActions.toArray(CompletableFuture[]::new));
+            return allRefreshed.thenApply(_ -> {
+                synchronized (jobId) {
+                    if (killed == null) {
+                        setupSearchers(index2TableIdent);
+                    }
+                }
+                return null;
+            });
+        }
+    }
+
+    private void setupSearchers(Map<String, RelationName> index2TableIdent) {
+        Set<RelationName> tablesWithFetchRefs = new HashSet<>();
+        for (Reference reference : phase.fetchRefs()) {
+            tablesWithFetchRefs.add(reference.relation());
+        }
+        String source = "fetch-task: " + jobId.toString() + '-' + phase.phaseId() + '-' + phase.name();
+        for (Routing routing : routings) {
+            Map<String, Map<String, IntIndexedContainer>> locations = routing.locations();
+            Map<String, IntIndexedContainer> indexShards = locations.get(localNodeId);
+
+            for (Map.Entry<String, IntIndexedContainer> indexShardsEntry : indexShards.entrySet()) {
+                String indexUUID = indexShardsEntry.getKey();
+                Integer base = phase.bases().get(indexUUID);
+                if (base == null) {
+                    continue;
+                }
+
+                RelationName ident = index2TableIdent.get(indexUUID);
+                assert ident != null : "no relationName found for index " + indexUUID;
+
+                IndexMetadata indexMetadata = metadata.index(indexUUID);
+                if (indexMetadata == null) {
+                    RelationMetadata.Table tableMetadata = metadata.getRelation(ident);
+                    if (tableMetadata != null && tableMetadata.partitionedBy().isEmpty() == false) {
+                        continue;
+                    }
+                    throw new IndexNotFoundException(indexUUID);
+                }
+                Index index = indexMetadata.getIndex();
+                PartitionName partitionName = new PartitionName(ident, indexMetadata.partitionValues());
+                boolean isPartitioned = partitionName.values().isEmpty() == false;
+                tableIdents.put(base, partitionName);
+                toFetch.put(ident, new ArrayList<>());
+                for (IntCursor shard : indexShardsEntry.getValue()) {
+                    ShardId shardId = new ShardId(index, shard.value);
+                    int readerId = base + shardId.id();
+                    SharedShardContext shardContext = shardContexts.get(readerId);
+                    if (shardContext == null) {
+                        try {
+                            shardContext = sharedShardContexts.prepareContext(shardId, readerId);
+                            shardContexts.put(readerId, shardContext);
+                            if (tablesWithFetchRefs.contains(ident)) {
+                                searchers.put(readerId, shardContext.acquireSearcher(source));
+                            }
+                        } catch (IllegalIndexShardStateException | IndexNotFoundException e) {
+                            if (!isPartitioned) {
+                                throw e;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (Reference reference : phase.fetchRefs()) {
+            Collection<Reference> references = toFetch.get(reference.relation());
+            if (references != null) {
+                references.add(reference);
+            }
+        }
+        if (searchers.isEmpty() || phase.fetchRefs().isEmpty()) {
+            // no fetch references means there will be no fetch requests
+            // this context is only here to allow the collectors to generate docids with the right bases
+            // the bases are fetched in the prepare phase therefore this context can be closed
+            close();
+        }
+    }
+
+    @Override
+    public int id() {
+        return phase.phaseId();
+    }
+
+    public UUID jobId() {
+        return jobId;
+    }
+}

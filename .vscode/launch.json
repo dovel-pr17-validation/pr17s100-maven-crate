@@ -1,0 +1,62 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "java",
+            "request": "launch",
+            "name": "Debug CrateDB",
+            "args": "-Cpath.home=${workspaceFolder}/sandbox/crate",
+            "cwd": "${workspaceFolder}/app",
+            "vmArgs": "-Xms2G -Xmx2G --enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector -XX:+HeapDumpOnOutOfMemoryError",
+            "mainClass": "io.crate.bootstrap.CrateDB",
+            "console": "integratedTerminal"
+        },
+        {
+            "type": "java",
+            "request": "launch",
+            "name": "Debug CrateDB Node 2",
+            "args": "-Cpath.home=${workspaceFolder}/sandbox/crate2",
+            "cwd": "${workspaceFolder}/app",
+            "vmArgs": "-Xms2G -Xmx2G --enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector -XX:+HeapDumpOnOutOfMemoryError",
+            "mainClass": "io.crate.bootstrap.CrateDB",
+            "console": "integratedTerminal"
+        },
+        {
+            "type": "java",
+            "request": "launch",
+            "name": "Run CrateDB",
+            "args": "-Cpath.home=${workspaceFolder}/sandbox/crate",
+            "cwd": "${workspaceFolder}/app",
+            "vmArgs": "-Xms2G -Xmx2G --enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector -XX:+HeapDumpOnOutOfMemoryError",
+            "mainClass": "io.crate.bootstrap.CrateDB",
+            "console": "integratedTerminal",
+            "noDebug": true
+        },
+        {
+            "type": "java",
+            "request": "attach",
+            "name": "attach:5005",
+            "projectName": "crate-app",
+            "hostName": "127.0.0.1",
+            "port": 5005,
+            "cwd": "${workspaceFolder}/app"
+        },
+        {
+            "type": "java",
+            "request": "attach",
+            "name": "attach:prompt",
+            "projectName": "crate-app",
+            "hostName": "127.0.0.1",
+            "port": "${input:port}",
+            "cwd": "${workspaceFolder}/app"
+        }
+    ],
+    "inputs": [
+      {
+        "id": "port",
+        "type": "promptString",
+        "description": "Port to connect to",
+        "default": "5005"
+      }
+    ]
+}

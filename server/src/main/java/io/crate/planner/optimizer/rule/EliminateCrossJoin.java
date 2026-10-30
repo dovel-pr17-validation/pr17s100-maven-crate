@@ -1,0 +1,227 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.planner.optimizer.rule;
+
+import static io.crate.planner.optimizer.matcher.Pattern.typeOf;
+import static java.util.Comparator.comparing;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.PriorityQueue;
+import java.util.Set;
+
+import org.jspecify.annotations.Nullable;
+
+import io.crate.analyze.RelationNames;
+import io.crate.exceptions.InvalidArgumentException;
+import io.crate.expression.operator.AndOperator;
+import io.crate.expression.operator.EqOperator;
+import io.crate.expression.symbol.Symbol;
+import io.crate.metadata.RelationName;
+import io.crate.planner.operators.AbstractJoinPlan;
+import io.crate.planner.operators.Eval;
+import io.crate.planner.operators.Filter;
+import io.crate.planner.operators.JoinPlan;
+import io.crate.planner.operators.LogicalPlan;
+import io.crate.planner.optimizer.Rule;
+import io.crate.planner.optimizer.joinorder.JoinGraph;
+import io.crate.planner.optimizer.matcher.Captures;
+import io.crate.planner.optimizer.matcher.Pattern;
+import io.crate.sql.tree.JoinType;
+
+public class EliminateCrossJoin implements Rule<JoinPlan> {
+
+    private final Pattern<JoinPlan> pattern = typeOf(JoinPlan.class)
+        .with(j -> j.eliminateCrossJoinRuleIsApplied() == false);
+
+    @Override
+    public Pattern<JoinPlan> pattern() {
+        return pattern;
+    }
+
+    @Override
+    public LogicalPlan apply(JoinPlan join,
+                             Captures captures,
+                             Rule.Context context) {
+        if (join.relationNames().size() < 3) {
+            return null;
+        }
+        var joinGraph = JoinGraph.create(join, context.resolvePlan());
+        if (!joinGraph.hasCrossJoin()) {
+            return null;
+        }
+        List<LogicalPlan> newOrder = orderNodes(joinGraph);
+        if (newOrder == null) {
+            return null;
+        }
+        LogicalPlan newJoinPlan = rebuild(joinGraph, newOrder);
+        if (newJoinPlan == null) {
+            return null;
+        }
+        return Eval.create(newJoinPlan, join.outputs());
+    }
+
+    /**
+     * Cross-joins are eliminated by traversing the graph over the edges
+     * which are based on inner-joins. Any graph traversal algorithm could be used,
+     * but we want to preserve to the original order as much as possible.
+     * Therefore, we use a PriorityQueue where the priority of the node is the position of
+     * the original join order.
+     **/
+    @Nullable
+    static List<LogicalPlan> orderNodes(JoinGraph joinGraph) {
+        if (joinGraph.edges().isEmpty()) {
+            return null;
+        }
+        // This is the minimum number of edges which we need to have to be able to visit each node in the graph
+        if (joinGraph.nodes().size() >= (joinGraph.edges().size() / 2) - 1 == false) {
+            return null;
+        }
+
+        ArrayList<LogicalPlan> newJoinOrder = new ArrayList<>();
+        HashMap<LogicalPlan, Integer> priorities = new HashMap<>();
+        for (int i = 0; i < joinGraph.size(); i++) {
+            priorities.put(joinGraph.nodes().get(i), i);
+        }
+
+        PriorityQueue<LogicalPlan> nodesToVisit = new PriorityQueue<>(
+            joinGraph.size(),
+            comparing(priorities::get)
+        );
+        HashSet<LogicalPlan> visited = HashSet.newHashSet(joinGraph.size());
+        nodesToVisit.add(joinGraph.nodes().get(0));
+
+        while (!nodesToVisit.isEmpty()) {
+            var node = nodesToVisit.poll();
+            if (!visited.contains(node)) {
+                visited.add(node);
+                newJoinOrder.add(node);
+                for (var edge : joinGraph.edges(node)) {
+                    nodesToVisit.add(edge.to());
+                }
+            }
+            if (nodesToVisit.isEmpty() && visited.size() < joinGraph.size()) {
+                // disconnected graph, find new starting point
+                for (var graphNode : joinGraph.nodes()) {
+                    if (visited.contains(graphNode) == false) {
+                        nodesToVisit.add(graphNode);
+                        // add only one node as a new starting point
+                        // the edges will give the rest (which results in fewer cross joins)
+                        break;
+                    }
+                }
+            }
+        }
+        assert visited.size() == joinGraph.size() : "Invalid state, each node needs to be visited";
+        return newJoinOrder;
+    }
+
+    /// Builds a plan from `graph` by visiting it in the provided `order`.
+    /// The plan is built in the following way:
+    /// Every plan from `order` is "joined" with the next one in `order`,
+    /// if there are edges between them (join conditions or filters from the original plan).
+    /// Filters are added to a plan, if the filter references only the relation names from that plan.
+    /// [JoinGraph#topLevelCondition()] is added into the join condition of the last (top-level) plan.
+    static LogicalPlan rebuild(JoinGraph graph, List<LogicalPlan> order) {
+        assert graph.nodes().size() == order.size() : "Size must be equal";
+
+        if (graph.edges().isEmpty()) {
+            throw new InvalidArgumentException("JoinPlan cannot be built with the provided order.");
+        }
+        // Holds filters that haven't been put on a plan
+        List<Symbol> unplacedFilters = new ArrayList<>(graph.filters());
+
+        LogicalPlan firstNode = order.get(0);
+        // Holds the final result, gradually built by adding the next plan from `order` and matching filters.
+        LogicalPlan result = withFilters(firstNode, unplacedFilters);
+
+        HashSet<LogicalPlan> alreadyJoinedNodes = HashSet.newHashSet(graph.size());
+        alreadyJoinedNodes.add(firstNode);
+
+        for (int i = 1; i < order.size(); i++) {
+            // the original node is the key for graph.edges() and alreadyJoinedNodes
+            LogicalPlan rightNode = order.get(i);
+            alreadyJoinedNodes.add(rightNode);
+
+            ArrayList<Symbol> criteria = new ArrayList<>();
+            for (var edge : graph.edges(rightNode)) {
+                LogicalPlan toNode = edge.to();
+                if (alreadyJoinedNodes.contains(toNode)) {
+                    criteria.add(EqOperator.of(edge.left(), edge.right()));
+                }
+            }
+
+            if (i == order.size() - 1 && graph.topLevelCondition() != null) {
+                criteria.add(graph.topLevelCondition());
+            }
+
+            final JoinType joinType;
+            final Symbol joinCondition;
+
+            if (criteria.isEmpty()) {
+                joinType = JoinType.CROSS;
+                joinCondition = null;
+            } else {
+                joinType = JoinType.INNER;
+                joinCondition = AndOperator.join(criteria);
+            }
+
+            result = new JoinPlan(
+                result,
+                withFilters(rightNode, unplacedFilters),
+                joinType,
+                joinCondition,
+                false,
+                false,
+                false,
+                false,
+                true,
+                AbstractJoinPlan.LookUpJoin.NONE
+            );
+            result = withFilters(result, unplacedFilters);
+        }
+
+        assert unplacedFilters.isEmpty() : "All filters must be placed, remaining: " + unplacedFilters;
+
+        return result;
+    }
+
+    /// Wraps `plan` in a [Filter] with all `filters` that only reference relations of `plan`.
+    /// The used filters are removed from `filters`.
+    private static LogicalPlan withFilters(LogicalPlan plan, List<Symbol> filters) {
+        Set<RelationName> relations = new HashSet<>(plan.relationNames());
+        List<Symbol> covered = new ArrayList<>();
+
+        var iterator = filters.iterator();
+        while (iterator.hasNext()) {
+            Symbol f = iterator.next();
+            if (relations.containsAll(RelationNames.getShallow(f))) {
+                covered.add(f);
+                iterator.remove();
+            }
+        }
+
+        return covered.isEmpty() ? plan : new Filter(plan, AndOperator.join(covered));
+    }
+}

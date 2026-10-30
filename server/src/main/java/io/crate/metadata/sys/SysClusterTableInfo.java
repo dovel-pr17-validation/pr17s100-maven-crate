@@ -1,0 +1,213 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.metadata.sys;
+
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.List;
+import java.util.Locale;
+import java.util.function.Function;
+
+import org.elasticsearch.cluster.ClusterName;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.bytes.BytesReference;
+import org.elasticsearch.common.io.stream.BytesStreamOutput;
+import org.elasticsearch.common.settings.ClusterSettings;
+import org.elasticsearch.common.settings.Setting;
+import org.elasticsearch.common.settings.Settings;
+
+import io.crate.metadata.RelationName;
+import io.crate.metadata.SystemTable;
+import io.crate.metadata.SystemTable.Builder;
+import io.crate.metadata.SystemTable.ObjectBuilder;
+import io.crate.metadata.settings.CrateSettings;
+import io.crate.role.Role;
+import io.crate.role.Roles;
+import io.crate.types.DataType;
+import io.crate.types.DataTypes;
+import io.crate.types.ObjectType;
+
+public class SysClusterTableInfo {
+
+    private SysClusterTableInfo() {}
+
+    public static final RelationName IDENT = new RelationName(SysSchemaInfo.NAME, "cluster");
+
+    public record LoggerEntry(String loggerName, String level) {}
+
+    public static SystemTable<Role> of(ClusterService clusterService, Roles roles) {
+        Settings settings = clusterService.getSettings();
+        ClusterSettings clusterSettings = clusterService.getClusterSettings();
+        var relBuilder = SystemTable.<Role>builder(IDENT)
+            .add("id", DataTypes.STRING, _ -> clusterService.state().metadata().clusterUUID())
+            .add("name", DataTypes.STRING, _ -> ClusterName.CLUSTER_NAME_SETTING.get(settings).value())
+            .add("master_node", DataTypes.STRING, _ -> clusterService.state().nodes().getMasterNodeId())
+            .add("state", DataTypes.STRING, user -> encodeState(roles, user, clusterService.state()))
+            .startObject("license", _ -> true)
+                .add("expiry_date", DataTypes.TIMESTAMPZ, _ -> null)
+                .add("issued_to", DataTypes.STRING, _ -> null)
+                .add("max_nodes", DataTypes.INTEGER, _ -> null)
+            .endObject();
+
+        var settingsBuilder = relBuilder.startObject("settings")
+            .startObjectArray("logger", extractLoggers(clusterSettings))
+                .add("name", DataTypes.STRING, LoggerEntry::loggerName)
+                .add("level", DataTypes.STRING, LoggerEntry::level)
+            .endObjectArray();
+
+        // turns the settings:
+        //
+        // [
+        //  [stats, enabled],
+        //  [stats, jobs_log_size],
+        //  ...
+        // ]
+        //
+        // into tree form:
+        //
+        //   Node
+        //    name: stats
+        //    children: [
+        //      Leaf:
+        //        name: enabled
+        //        value: CrateSetting{stats.enabled}
+        //      Leaf:
+        //        name: jobs_log_size
+        //        value: CrateSetting{stats.jobs_log_size}
+        //
+        //
+        // To make it easier to build the objects
+        var rootNode = toTree();
+
+        for (var child : rootNode.children) {
+            addSetting(clusterSettings, settingsBuilder, child);
+        }
+        return settingsBuilder
+            .endObject()
+            .build();
+    }
+
+    private static String encodeState(Roles roles, Role user, ClusterState state) {
+        if (!roles.hasALPrivileges(user)) {
+            return "***";
+        }
+        try (var out = new BytesStreamOutput()) {
+            state.writeTo(out);
+            byte[] bytes = BytesReference.toBytes(out.bytes());
+            return Base64.getEncoder().encodeToString(bytes);
+        } catch (IOException ex) {
+            throw new UncheckedIOException(ex);
+        }
+    }
+
+    private static void addSetting(ClusterSettings clusterSettings,
+                                   ObjectBuilder<Role, ? extends Builder<Role>> settingsBuilder,
+                                   Node element) {
+        if (element instanceof Leaf leaf) {
+            var setting = leaf.value;
+            var valueType = (DataType<Object>) leaf.value.dataType();
+            Object settingValue = clusterSettings.get(setting);
+            if (settingValue instanceof Settings groupSetting && valueType.id() == ObjectType.ID) {
+                settingsBuilder.addDynamicObject(leaf.name, DataTypes.STRING, _ -> groupSetting.getAsStructuredMap());
+            } else {
+                settingsBuilder.add(
+                    leaf.name,
+                    valueType,
+                    _ -> valueType.implicitCast(clusterSettings.get(setting)));
+            }
+        } else {
+            var objectSetting = settingsBuilder.startObject(element.name);
+            for (var c : element.children) {
+                addSetting(clusterSettings, objectSetting, c);
+            }
+            objectSetting.endObject();
+        }
+    }
+
+    private static Function<Role, List<LoggerEntry>> extractLoggers(ClusterSettings clusterSettings) {
+        return _ -> {
+            Settings loggerSettings = clusterSettings.getLoggerSettings();
+            ArrayList<LoggerEntry> loggers = new ArrayList<>(loggerSettings.size());
+            for (var settingName : loggerSettings.keySet()) {
+                String level = loggerSettings.get(settingName).toUpperCase(Locale.ENGLISH);
+                loggers.add(new LoggerEntry(settingName, level));
+            }
+            return loggers;
+        };
+    }
+
+
+    private static Node toTree() {
+        Node rootNode = new Node("root");
+        for (var setting : CrateSettings.EXPOSED_SETTINGS) {
+            rootNode.add(setting.path(), setting);
+        }
+        return rootNode;
+    }
+
+    private static sealed class Node permits Leaf {
+
+        final String name;
+        private final ArrayList<Node> children = new ArrayList<>();
+
+        private Node(String name) {
+            this.name = name;
+        }
+
+        private void add(List<String> path, Setting<?> value) {
+            switch (path.size()) {
+                case 0:
+                    throw new IllegalArgumentException("Path must not be empty");
+
+                case 1:
+                    children.add(new Leaf(path.get(0), value));
+                    break;
+
+                default:
+                    var valueName = path.get(0);
+                    for (var child : children) {
+                        if (child.name.equals(valueName)) {
+                            child.add(path.subList(1, path.size()), value);
+                            return;
+                        }
+                    }
+                    Node newChild = new Node(valueName);
+                    children.add(newChild);
+                    newChild.add(path.subList(1, path.size()), value);
+                    break;
+            }
+        }
+    }
+
+    private static final class Leaf extends Node {
+
+        private final Setting<?> value;
+
+        private Leaf(String name, Setting<?> value) {
+            super(name);
+            this.value = value;
+        }
+    }
+}

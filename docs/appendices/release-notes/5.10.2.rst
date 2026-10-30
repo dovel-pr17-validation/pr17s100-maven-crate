@@ -1,0 +1,79 @@
+.. _version_5.10.2:
+
+==============
+Version 5.10.2
+==============
+
+Released on 2025-02-28.
+
+.. NOTE::
+
+    If you are upgrading a cluster, you must be running CrateDB 4.0.2 or higher
+    before you upgrade to 5.10.2.
+
+    We recommend that you upgrade to the latest 5.9 release before moving to
+    5.10.2.
+
+    A rolling upgrade from 5.9.x to 5.10.2 is supported.
+    Before upgrading, you should `back up your data`_.
+
+.. WARNING::
+
+    Tables that were created before CrateDB 4.x will not function with 5.x
+    and must be recreated before moving to 5.x.x.
+
+    You can recreate tables using ``COPY TO`` and ``COPY FROM`` or by
+    `inserting the data into a new table`_.
+
+.. _back up your data: https://cratedb.com/docs/crate/reference/en/latest/admin/snapshots.html
+.. _inserting the data into a new table: https://cratedb.com/docs/crate/reference/en/latest/admin/system-information.html#tables-need-to-be-recreated
+
+.. rubric:: Table of contents
+
+.. contents::
+   :local:
+
+See the :ref:`version_5.10.0` release notes for a full list of changes in the
+5.10 series.
+
+Fixes
+=====
+
+- The ``status`` field within the JSON payload returned from the HTTP root
+  endpoint ``(/)`` now shows 503 instead of 200 if the cluster state is
+  considered unavailable to match how the ``ok`` field behaves.
+
+- Fixed an issue where a filter was not pushed down to the source when the
+  filtered column was aliased as part of a view. This could lead to an
+  unnecessary full table scan.
+
+- Fixed a regression introduced in ``5.6.5`` that caused empty partitions to be
+  left behind when ``DELETE`` condition contained a non-deterministic function
+  such as ``NOW()``, e.g.::
+
+    DELETE FROM t WHERE day < now() - INTERVAL '3 days';
+
+  where 'day' is ``TIMESTAMP`` type that is also the ``PARTITIONED BY`` column.
+
+- Fixed an issue that caused a ``NullPointerException`` when binding to a
+  non-existing prepared statement via PostgreSQL wire protocol.
+
+- Fixed an issue that caused a ``SELECT`` query to fail if a ``WHERE`` clause
+  had a comparison of a non-boolean column with a boolean literal, e.g.::
+
+    SELECT int_col FROM t where int_col = true;
+
+- Fixed an issue that caused a ``SELECT`` query with a ``WHERE`` clause to
+  return incorrect result if a table had a ``PRIMARY KEY`` on a boolean column
+  and the column was referenced as a standalone operand in a logical expression.
+  E.g.::
+
+    SELECT * FROM tbl WHERE boolean_pk_col OR boolean_pk_col = false
+
+- Fixed a performance regression introduced in :ref:`version_5.10.0` that
+  caused ``CREATE SNAPSHOT`` to use more memory. That could cause the
+  statement to fail with ``OutOfMemoryError`` under memory pressure.
+
+- Fixed an issue that prevented nodes from starting when upgrading to >= 5.8
+  with tables containing a :ref:`generated column <ddl-generated-columns>`
+  using a :ref:`user defined function <user-defined-functions>`.

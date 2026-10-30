@@ -1,0 +1,148 @@
+/*
+ * Licensed to Elasticsearch under one or more contributor
+ * license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright
+ * ownership. Elasticsearch licenses this file to you under
+ * the Apache License, Version 2.0 (the "License"); you may
+ * not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.elasticsearch.cluster.block;
+
+import static java.util.EnumSet.copyOf;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.elasticsearch.test.VersionUtils.randomVersion;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+
+import org.elasticsearch.Version;
+import org.elasticsearch.common.UUIDs;
+import org.elasticsearch.common.io.stream.BytesStreamOutput;
+import org.elasticsearch.common.io.stream.StreamInput;
+import org.elasticsearch.test.ESTestCase;
+import org.junit.Test;
+
+import io.crate.rest.action.HttpErrorStatus;
+
+public class ClusterBlockTests extends ESTestCase {
+
+    public void testSerialization() throws Exception {
+        int iterations = randomIntBetween(5, 20);
+        for (int i = 0; i < iterations; i++) {
+            Version version = randomVersion(random());
+            ClusterBlock clusterBlock = randomClusterBlock();
+
+            BytesStreamOutput out = new BytesStreamOutput();
+            out.setVersion(version);
+            clusterBlock.writeTo(out);
+
+            StreamInput in = out.bytes().streamInput();
+            in.setVersion(version);
+            ClusterBlock result = new ClusterBlock(in);
+
+            assertThat(result).isEqualTo(clusterBlock);
+            assertThat(result.id()).isEqualTo(clusterBlock.id());
+            assertThat(result.uuid()).isEqualTo(clusterBlock.uuid());
+            assertThat(result.description()).isEqualTo(clusterBlock.description());
+            assertThat(result.retryable()).isEqualTo(clusterBlock.retryable());
+            assertThat(result.disableStatePersistence()).isEqualTo(clusterBlock.disableStatePersistence());
+            assertThat(result.levels().toArray()).isEqualTo(clusterBlock.levels().toArray());
+
+            if (version.before(Version.V_6_2_0)) {
+                // http status is serialized as rest status string before 6.2.0, this may lose concrete status code information
+                // so we only compare the real HTTP status code here as the concrete CrateDB specific error code may not be preserved
+                assertThat(result.status().httpResponseStatus().code()).isEqualTo(clusterBlock.status().httpResponseStatus().code());
+            } else {
+                assertThat(result.status()).isEqualTo(clusterBlock.status());
+            }
+        }
+    }
+
+    public void testToStringDanglingComma() {
+        final ClusterBlock clusterBlock = randomClusterBlock();
+        assertThat(clusterBlock.toString()).doesNotEndWith(",");
+    }
+
+    public void testGlobalBlocksCheckedIfNoIndicesSpecified() {
+        ClusterBlock globalBlock = randomClusterBlock();
+        ClusterBlocks clusterBlocks = new ClusterBlocks(Collections.singleton(globalBlock), Map.of());
+        ClusterBlockException exception = clusterBlocks.indicesBlockedException(randomFrom(globalBlock.levels()), new String[0]);
+        assertThat(exception).isNotNull();
+        assertThat(Collections.singleton(globalBlock)).isEqualTo(exception.blocks());
+    }
+
+    public void testRemoveIndexBlockWithId() {
+        final ClusterBlocks.Builder builder = ClusterBlocks.builder();
+        builder.addIndexBlock("index-1",
+                              new ClusterBlock(1, "uuid", "", true, true, true, HttpErrorStatus.OK, copyOf(ClusterBlockLevel.ALL)));
+        builder.addIndexBlock("index-1",
+                              new ClusterBlock(2, "uuid", "", true, true, true, HttpErrorStatus.OK, copyOf(ClusterBlockLevel.ALL)));
+        builder.addIndexBlock("index-1",
+                              new ClusterBlock(3, "uuid", "", true, true, true, HttpErrorStatus.OK, copyOf(ClusterBlockLevel.ALL)));
+        builder.addIndexBlock("index-1",
+                              new ClusterBlock(3, "other uuid", "", true, true, true, HttpErrorStatus.OK, copyOf(ClusterBlockLevel.ALL)));
+
+        builder.addIndexBlock("index-2",
+                              new ClusterBlock(3, "uuid3", "", true, true, true, HttpErrorStatus.OK, copyOf(ClusterBlockLevel.ALL)));
+
+        ClusterBlocks clusterBlocks = builder.build();
+        assertThat(clusterBlocks.indices().get("index-1")).hasSize(4);
+        assertThat(clusterBlocks.indices().get("index-2")).hasSize(1);
+
+        builder.removeIndexBlockWithId("index-1", 3);
+        clusterBlocks = builder.build();
+
+        assertThat(clusterBlocks.indices().get("index-1")).hasSize(2);
+        assertThat(clusterBlocks.hasIndexBlockWithId("index-1", 1)).isTrue();
+        assertThat(clusterBlocks.hasIndexBlockWithId("index-1", 2)).isTrue();
+        assertThat(clusterBlocks.indices().get("index-2")).hasSize(1);
+        assertThat(clusterBlocks.hasIndexBlockWithId("index-2", 3)).isTrue();
+
+        builder.removeIndexBlockWithId("index-2", 3);
+        clusterBlocks = builder.build();
+
+        assertThat(clusterBlocks.indices().get("index-1")).hasSize(2);
+        assertThat(clusterBlocks.hasIndexBlockWithId("index-1", 1)).isTrue();
+        assertThat(clusterBlocks.hasIndexBlockWithId("index-1", 2)).isTrue();
+        assertThat(clusterBlocks.indices().get("index-2")).isNull();
+        assertThat(clusterBlocks.hasIndexBlockWithId("index-2", 3)).isFalse();
+    }
+
+    @Test
+    public void testGetIndexBlockWithId() {
+        final int blockId = randomInt();
+        final int noClusterBlocks = randomIntBetween(1, 5);
+        final List<ClusterBlock> clusterBlocks = new ArrayList<>(noClusterBlocks);
+
+        final ClusterBlocks.Builder builder = ClusterBlocks.builder();
+        for (int i = 0; i < noClusterBlocks; i++) {
+            clusterBlocks.add(new ClusterBlock(blockId, "uuid" + i, "", true, true, true, HttpErrorStatus.OK, copyOf(ClusterBlockLevel.ALL)));
+            builder.addIndexBlock("index", clusterBlocks.get(i));
+        }
+
+        assertThat(builder.build().indices().get("index")).hasSize(noClusterBlocks);
+        assertThat(builder.build().getIndexBlockWithId("index", blockId)).isIn(clusterBlocks);
+        assertThat(builder.build().getIndexBlockWithId("index", randomValueOtherThan(blockId, ESTestCase::randomInt))).isNull();
+    }
+
+    private ClusterBlock randomClusterBlock() {
+        final String uuid = randomBoolean() ? UUIDs.randomBase64UUID() : null;
+        final List<ClusterBlockLevel> levels = Arrays.asList(ClusterBlockLevel.values());
+        return new ClusterBlock(randomInt(), uuid, "cluster block #" + randomInt(), randomBoolean(), randomBoolean(), randomBoolean(),
+                                randomFrom(HttpErrorStatus.values()), copyOf(randomSubsetOf(randomIntBetween(1, levels.size()), levels)));
+    }
+}

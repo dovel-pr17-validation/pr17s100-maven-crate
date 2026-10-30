@@ -1,0 +1,75 @@
+.. _version_5.10.7:
+
+==============
+Version 5.10.7
+==============
+
+Released on 2025-05-26.
+
+.. NOTE::
+
+    If you are upgrading a cluster, you must be running CrateDB 4.0.2 or higher
+    before you upgrade to 5.10.7.
+
+    We recommend that you upgrade to the latest 5.9 release before moving to
+    5.10.7.
+
+    A rolling upgrade from 5.9.x to 5.10.7 is supported.
+    Before upgrading, you should `back up your data`_.
+
+.. WARNING::
+
+    Tables that were created before CrateDB 4.x will not function with 5.x
+    and must be recreated before moving to 5.x.x.
+
+    You can recreate tables using ``COPY TO`` and ``COPY FROM`` or by
+    `inserting the data into a new table`_.
+
+.. _back up your data: https://cratedb.com/docs/crate/reference/en/latest/admin/snapshots.html
+.. _inserting the data into a new table: https://cratedb.com/docs/crate/reference/en/latest/admin/system-information.html#tables-need-to-be-recreated
+
+.. rubric:: Table of contents
+
+.. contents::
+   :local:
+
+
+See the :ref:`version_5.10.0` release notes for a full list of changes in the
+5.10 series.
+
+Fixes
+=====
+
+- Improved memory accounting for the
+  :ref:`population standard deviation<aggregation-stddev-pop>` aggregation
+  function.
+
+- Improved error message thrown when using a ``SELECT *``` on
+  :ref:`system tables <system-information>`, during a rolling upgrade, when
+  columns on the ``sys`` table queried differ between the old and the new
+  cluster nodes.
+
+- Fixed an issue that would cause wrong column data type to be used when adding
+  parent and child object sub-columns in one
+  :ref:`ALTER TABLE <alter-table-add-column>` statement, e.g.::
+
+    ALTER TABLE tbl
+      ADD COLUMN obj['arr'] array(object(dynamic)),
+      ADD COLUMN obj['arr']['id'] integer;
+
+- Fixed an issue that would cause :ref:`window functions <window-functions>` to
+  use inefficient execution plans, resulting in poor performance, when the
+  :ref:`window definition <window-definition>` is using query parameters. e.g::
+
+    SELECT min(x) OVER (w), max(x) OVER(w), avg(x) OVER (w)
+    FROM tbl
+    WINDOW w AS (PARTITION BY (x / ?))
+
+- Fixed a bug where the session setting
+  :ref:`conf-session-error_on_unknown_object_key` was not persisted into a view,
+  and such not taken into account when executing the view. Previously created
+  views need to be recreated to apply the setting successfully.
+
+- Fixed an issue that caused ``DELETE`` statements to not be retried on
+  temporal errors (for instance, a shard being unavailable) and instead
+  being retried on permanent errors. Now it's an other way around.

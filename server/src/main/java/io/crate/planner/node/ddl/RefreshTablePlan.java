@@ -1,0 +1,107 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.planner.node.ddl;
+
+import static io.crate.data.SentinelRow.SENTINEL;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.function.Function;
+
+import org.elasticsearch.action.admin.indices.refresh.RefreshRequest;
+import org.elasticsearch.action.admin.indices.refresh.TransportRefresh;
+
+import io.crate.analyze.AnalyzedRefreshTable;
+import io.crate.analyze.SymbolEvaluator;
+import io.crate.common.collections.Lists;
+import io.crate.data.InMemoryBatchIterator;
+import io.crate.data.Row;
+import io.crate.data.Row1;
+import io.crate.data.RowConsumer;
+import io.crate.execution.support.OneRowActionListener;
+import io.crate.expression.symbol.Symbol;
+import io.crate.metadata.DocTableInfo;
+import io.crate.metadata.PartitionName;
+import io.crate.planner.DependencyCarrier;
+import io.crate.planner.Plan;
+import io.crate.planner.PlannerContext;
+import io.crate.planner.operators.SubQueryResults;
+import io.crate.sql.tree.Table;
+
+public class RefreshTablePlan implements Plan {
+
+    private final AnalyzedRefreshTable analysis;
+
+    public RefreshTablePlan(AnalyzedRefreshTable analysis) {
+        this.analysis = analysis;
+    }
+
+    @Override
+    public void executeOrFail(DependencyCarrier dependencies,
+                              PlannerContext plannerContext,
+                              RowConsumer consumer,
+                              Row parameters,
+                              SubQueryResults subQueryResults) {
+        if (analysis.tables().isEmpty()) {
+            consumer.accept(InMemoryBatchIterator.empty(SENTINEL), null);
+            return;
+        }
+
+        Function<? super Symbol, Object> eval = x -> SymbolEvaluator.evaluate(
+            plannerContext.transactionContext(),
+            plannerContext.nodeContext(),
+            x,
+            parameters,
+            subQueryResults
+        );
+
+        ArrayList<PartitionName> toRefresh = new ArrayList<>();
+        for (Map.Entry<Table<Symbol>, DocTableInfo> table : analysis.tables().entrySet()) {
+            var tableInfo = table.getValue();
+            var tableSymbol = table.getKey();
+            if (tableSymbol.partitionProperties().isEmpty()) {
+                toRefresh.add(new PartitionName(tableInfo.ident(), List.of()));
+            } else {
+                var partitionName = PartitionName.ofAssignments(
+                    tableInfo,
+                    Lists.map(tableSymbol.partitionProperties(), x -> x.map(eval)),
+                    plannerContext.clusterState().metadata());
+                toRefresh.add(partitionName);
+            }
+        }
+
+        RefreshRequest request = new RefreshRequest(toRefresh);
+
+        dependencies.client().execute(TransportRefresh.ACTION, request)
+            .whenComplete(
+                new OneRowActionListener<>(
+                    consumer,
+                    ignoredResponse -> new Row1(toRefresh.isEmpty() ? -1L : (long) toRefresh.size())
+                ));
+    }
+
+    @Override
+    public StatementType type() {
+        return StatementType.DDL;
+    }
+}

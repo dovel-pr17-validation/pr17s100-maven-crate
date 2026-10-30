@@ -1,0 +1,377 @@
+.. _concept-storage-consistency:
+
+=======================
+Storage and consistency
+=======================
+
+This document provides an overview on how CrateDB stores and distributes state
+across the cluster and what consistency and durability guarantees are provided.
+
+.. NOTE::
+
+  Since CrateDB heavily relies on Elasticsearch_ and Lucene_ for storage and
+  cluster consensus, concepts shown here might look familiar to Elasticsearch_
+  users, since the implementation is actually reused from the Elasticsearch_
+  code.
+
+
+.. _concept-data-storage:
+
+Data storage
+============
+
+Every table in CrateDB is sharded, which means that tables are divided and
+distributed across the nodes of a cluster. Each shard in CrateDB is a Lucene_
+index broken down into segments getting stored on the filesystem. Physically
+the files reside under one of the configured data directories of a node.
+
+Lucene only appends data to segment files, which means that data written to the
+disc will never be mutated. This makes it easy for replication and
+:ref:`recovery <gloss-shard-recovery>`, since syncing a shard is simply a
+matter of fetching data from a specific marker.
+
+An arbitrary number of replica shards can be configured per table. Every
+operational replica holds a full synchronized copy of the primary shard.
+
+With read operations, there is no difference between executing the
+operation on the primary shard or on any of the replicas. CrateDB
+randomly assigns a shard when routing an operation. It is possible to
+configure this behavior if required, see our best practice guide on
+:ref:`multi zone setups <multi-zone-setup>`
+for more details.
+
+Write operations are handled differently than reads. Such operations are
+synchronous over all active replicas with the following flow:
+
+1. The primary shard and the active replicas are looked up in the cluster state
+   for the given operation. The primary shard and a quorum of the configured
+   replicas need to be available for this step to succeed.
+
+2. The operation is routed to the according primary shard for execution.
+
+3. The operation gets executed on the primary shard
+
+4. If the operation succeeds on the primary, the operation gets executed on all
+   replicas in parallel.
+
+5. After all replica operations finish the operation result gets returned to
+   the caller.
+
+Should any replica shard fail to write the data or times out in step 5, it's
+immediately considered as unavailable.
+
+
+.. _concept-compression:
+
+Compression
+===========
+
+The data of a shard is stored in Lucene_ segments, which compresses the data
+in those segments upon write. Two parts of a segment dominate the size on disk:
+
+- The *doc values*, which hold the data in a columnar structure. They are used
+  for aggregations, grouping and sorting, but also to read the values of a row.
+
+- The *stored fields*, which hold the values of columns that cannot be
+  reconstructed from the doc values. They are compressed in blocks, so that the
+  compression works across several documents at once.
+
+.. NOTE::
+    Until a row has been replicated, a complete representation of it is also
+    kept as part of the :ref:`translog <concept-durability>`. Background merges,
+    or an explicit :ref:`OPTIMIZE TABLE <sql-optimize>`, remove it afterwards.
+
+For doc values, Lucene relies on internal lightweight integer encodings —
+bit-packed deltas, GCD factoring, table lookups and monotonic offsets, plus
+``LZ4`` for sorted terms dictionaries — rather than general-purpose compression.
+These keep values randomly accessible and cheap to decode, trading some space
+optimization for CPU cost.
+
+On the other hand, ``stored fields`` compression can be controlled with the
+:ref:`codec <sql-create-table-codec>` table setting. ``default`` uses ``LZ4``,
+which is fast to compress and to decompress. ``best_compression`` uses
+``DEFLATE``, which produces smaller segments at the cost of slower inserts and
+lookups. ``codec`` cannot be changed while a table is open, so changing it for
+an existing table requires closing the table first:
+
+.. code-block:: sql
+
+   ALTER TABLE my_table CLOSE;
+   ALTER TABLE my_table SET (codec = 'best_compression');
+   ALTER TABLE my_table OPEN;
+
+A new codec only applies to segments that are written after the change.
+Existing segments keep their compression until they are merged, which can be
+triggered explicitly with :ref:`OPTIMIZE TABLE <sql-optimize>`.
+
+
+.. _concept-query-cache:
+
+Query cache
+===========
+
+CrateDB caches the result of the parts of a query that can be evaluated
+directly on the Lucene_ index. If the same query part is needed again, the
+cached result is reused instead of being computed a second time. The cache is
+per node and shared by all shards on that node, and only query parts that are
+used repeatedly, on segments above a certain size, are added to it.
+
+.. NOTE::
+
+   Apart from the query cache, read performance depends on the file system cache
+   of the operating system, which keeps frequently accessed parts of the Lucene_
+   segments in memory. Leaving a good portion of the available memory to the
+   operating system is therefore important.
+
+.. SEEALSO::
+
+   :ref:`CRATE_HEAP_SIZE <conf-env-heap-size>`
+
+.. _concept-atomicity:
+
+Atomicity at document level
+===========================
+
+Each row of a table in CrateDB is a semi structured document which can be
+nested arbitrarily deep through the use of object and array types.
+
+Operations on documents are atomic. Meaning that a write operation on a
+document either succeeds as a whole or has no effect at all. This is always the
+case, regardless of the nesting depth or size of the document.
+
+CrateDB does not provide transactions. Since every document in CrateDB has a
+version number assigned, which gets increased every time a change occurs,
+patterns like :ref:`sql_occ` can help to work around that
+limitation.
+
+
+.. _concept-durability:
+
+Durability
+==========
+
+Each shard has a WAL_ also known as translog. It guarantees that operations on
+documents are persisted to disk without having to issue a Lucene-Commit for
+every write operation. When the translog gets flushed all data is written to
+the persistent index storage of Lucene and the translog gets cleared.
+
+In case of an unclean shutdown of a shard, the transactions in the translog are
+getting replayed upon startup to ensure that all executed operations are
+permanent.
+
+The translog is also directly transferred when a newly allocated replica
+initializes itself from the primary shard. There is no need to flush segments
+to disc just for replica :ref:`recovery <gloss-shard-recovery>` purposes.
+
+
+.. _concept-addressing-documents:
+
+Addressing documents
+====================
+
+Every document has an :ref:`internal identifier
+<sql_administration_system_column_id>`. By default this identifier is derived
+from the primary key. Documents living in tables without a primary key are
+assigned a unique auto-generated ID automatically when created.
+
+Each document is :ref:`routed <sharding-routing>` to one specific shard
+according to the :ref:`routing column <gloss-routing-column>`. All rows that
+have the same routing column row value are stored in the same shard. The
+routing column can be specified with the :ref:`CLUSTERED
+<sql-create-table-clustered>` clause when creating the table. If a
+:ref:`primary key <primary_key_constraint>` has been defined, it will be used
+as the default routing column, otherwise the :ref:`internal document ID
+<sql_administration_system_column_id>` is used.
+
+While transparent to the user, internally there are two ways how CrateDB
+accesses documents:
+
+:get:
+  Direct access by identifier. Only applicable if the routing key and the
+  identifier can be computed from the given query specification. (e.g: the full
+  primary key is defined in the where clause).
+
+  This is the most efficient way to access a document, since only a single shard
+  gets accessed and only a simple index lookup on the ``_id`` field has to be
+  done.
+
+:search:
+  Query by matching against fields of documents across all candidate shards of
+  the table.
+
+
+.. _concept-consistency:
+
+Consistency
+===========
+
+CrateDB is eventual consistent for search operations. Search operations are
+performed on shared ``IndexReaders`` which besides other functionality, provide
+caching and reverse lookup capabilities for shards. An ``IndexReader`` is
+always bound to the Lucene_ segment it was started from, which means it has to
+be refreshed in order to see new changes, this is done on a time based manner,
+but can also be done manually (see :ref:`sql-refresh`). Therefore a search only sees a
+change if the according ``IndexReader`` was refreshed after that change
+occurred.
+
+If a query specification results in a ``get`` operation, changes are visible
+immediately. This is achieved by looking up the document in the translog first,
+which will always have the most recent version of the document. The common
+update and fetch use-case is therefore possible. If a client updates a row and
+that row is looked up by its primary key after that update the changes will
+always be visible, since the information will be retrieved directly from the
+translog. There is an exception to that, when the ``WHERE`` clause contains
+complex filtering and/or lots of Primary Key values. You can find more details
+:ref:`here <sql-refresh-description_collect_exception>`.
+
+.. NOTE::
+
+  ``Dirty reads`` can occur if the primary shard becomes isolated. The primary
+  will only realize it is isolated once it tries to communicate with its
+  replicas or the master. At that point, a write operation is already committed
+  into the primary and can be read by a concurrent read operation. In order to
+  minimise the window of opportunity for this phenomena, the CrateDB nodes
+  communicate with the master every second (by default) and once they realise
+  no master is known, they will start rejecting write operations.
+
+  Every replica shard is updated synchronously with its primary and always
+  carries the same information. Therefore it does not matter if the primary or
+  a replica shard is accessed in terms of consistency. Only the refresh of the
+  ``IndexReader`` affects consistency.
+
+.. NOTE::
+
+    Due to internal constraints, when the ``WHERE`` clause filters on multiple
+    columns of a ``PRIMARY KEY``, but one or more of those columns is tested
+    against lots of values, the query might be executed using a ``Collect``
+    operator instead of a ``Get``, thus records might be unavailable until a
+    ``REFRESH`` is run. The same situation could occur when the ``WHERE`` clause
+    contains long complex expressions, e.g.::
+
+        SELECT * FROM t
+        WHERE pk1 IN (<long_list_of_values>) AND pk2 = 3 AND pk3 = 'foo'
+
+        SELECT * FROM t
+        WHERE pk1 = ?
+            AND pk2 = ?
+            AND pk3 = ?
+            OR pk1 = ?
+            AND pk2 = ?
+            AND pk3 = ?
+            OR pk1 = ?
+            ...
+
+.. CAUTION::
+
+   Some outage conditions can affect these consistency claims. See the
+   :ref:`resiliency documentation <concept-resiliency>` for details.
+
+
+.. _concept-cluster-metadata:
+
+Cluster meta data
+=================
+
+Cluster meta data is held in the so called "Cluster State", which contains the
+following information:
+
+- Tables schemas.
+
+- Primary and replica shard locations. Basically just a mapping from shard
+  number to the storage node.
+
+- Status of each shard, which tells if a shard is currently ready for use or
+  has any other state like "initializing", "recovering" or cannot be assigned
+  at all.
+
+- Information about discovered nodes and their status.
+
+- Configuration information.
+
+Every node has its own copy of the cluster state. However there is only one
+node allowed to change the cluster state at runtime. This node is called the
+"master" node and gets auto-elected. The "master" node has no special
+configuration at all, all nodes are master-eligible by default, and any
+master-eligible node can be elected as the master. There
+is also an automatic re-election if the current master node goes down for some
+reason.
+
+.. NOTE::
+
+  To avoid a scenario where two masters could be elected due to network
+  partitioning, CrateDB automatically defines a quorum of nodes with
+  which it is possible to elect a master. For details on how this works
+  and further information see :ref:`concept-master-election`.
+
+To explain the flow of events for any cluster state change, here is an example
+flow for an ``ALTER TABLE`` statement which changes the schema of a table:
+
+#. A node in the cluster receives the ``ALTER TABLE`` request.
+
+#. The node sends out a request to the current master node to change the table
+   definition.
+
+#. The master node applies the changes locally to the cluster state and sends
+   out a notification to all affected nodes about the change.
+
+#. The nodes apply the change, so that they are now in sync with the master.
+
+#. Every node might take some local action depending on the type of cluster
+   state change.
+
+.. _concept-filesystem-assumptions:
+
+Filesystem and storage assumptions
+==================================
+
+The durability and consistency guarantees described above depend on a
+few assumptions about the underlying storage:
+
+- **Local-filesystem semantics.** CrateDB expects the filesystem under
+  :ref:`path.data` to behave like a local filesystem, including correct file
+  locking and atomic file creation/rename. A correctly configured network
+  filesystem *can* provide these guarantees, but this isn't automatic —
+  see the locking note below — and CrateDB does not test or certify any
+  network-filesystem configuration.
+- **Native filesystem locking.** Each shard's Lucene index is protected by
+  an exclusive write lock so that only one process ever writes to it at a
+  time. By default Lucene acquires this using the JVM's native
+  ``java.nio.channels.FileLock`` APIs (``NativeFSLockFactory``), which ask
+  the operating system itself to hold the lock — the OS then also
+  guarantees the lock is released if CrateDB exits abnormally, so a
+  crashed node doesn't leave a shard permanently locked. Lucene's own
+  documentation for this lock factory warns that "on certain NFS
+  environments the java.nio.* locks will fail (the lock can incorrectly
+  be double acquired)." In practice this is not a property of NFS as a
+  protocol so much as of specific configurations: NFSv3's separate NLM
+  locking protocol (and any NFS mount using a ``nolock``-style option
+  that disables locking outright) is the documented failure mode —
+  this can be solved by switching a mount from ``vers=3`` to ``vers=4``,
+  since NFSv4 has locking built into the protocol itself. So: a
+  *correctly configured* NFSv4 mount, with locking enabled, is not known
+  to have this problem; an NFSv3 mount, or any mount with locking
+  disabled, is. Either way, CrateDB has not run its own verification of this —
+  Lucene ships a ``VerifyingLockFactory``/``LockStressTest`` specifically for
+  operators who want to check their own storage before trusting it.
+- **Durable fsync.** The translog's crash-recovery guarantee (see
+  "Durability Guarantees" above) assumes that a completed fsync means the
+  data is actually durable on stable storage. Storage that acknowledges
+  writes before they are durable (some write-back caching layers) weakens
+  this guarantee.
+- **Low, consistent write latency.** Because a write is only acknowledged
+  after the primary shard and a quorum of replicas persist it, storage latency
+  is additive to write latency cluster-wide, and *variance* in storage latency
+  (common on some network-attached and multi-tenant storage) shows up directly
+  as write-latency variance.
+
+These are architectural assumptions rather than enforced checks — CrateDB
+does not currently validate them at startup — so violating them tends to
+surface as hard-to-diagnose corruption or latency issues rather than a
+clear error. See `Going into production`_ for concrete hardware recommendations
+that follow from these assumptions.
+
+.. _Elasticsearch: https://www.elastic.co
+.. _Lucene: https://lucene.apache.org/core/
+.. _WAL: https://en.wikipedia.org/wiki/Write-ahead_logging
+.. _Going into production: https://cratedb.com/docs/guide/admin/going-into-production.html
+.. _NativeFSLockFactory.java: https://github.com/apache/lucene/blob/main/lucene/core/src/java/org/apache/lucene/store/NativeFSLockFactory.java

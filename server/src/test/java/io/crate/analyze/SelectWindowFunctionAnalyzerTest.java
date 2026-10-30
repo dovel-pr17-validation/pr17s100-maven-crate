@@ -1,0 +1,250 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.analyze;
+
+import static io.crate.testing.Asserts.isReference;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+import java.util.List;
+
+import org.junit.Before;
+import org.junit.Test;
+
+import io.crate.analyze.relations.AnalyzedRelation;
+import io.crate.exceptions.ColumnUnknownException;
+import io.crate.expression.symbol.Symbol;
+import io.crate.expression.symbol.WindowFunction;
+import io.crate.sql.tree.FrameBound;
+import io.crate.sql.tree.WindowFrame;
+import io.crate.test.integration.CrateDummyClusterServiceUnitTest;
+import io.crate.testing.Asserts;
+import io.crate.testing.SQLExecutor;
+
+public class SelectWindowFunctionAnalyzerTest extends CrateDummyClusterServiceUnitTest {
+
+    private SQLExecutor e;
+
+    @Before
+    public void setUpExecutor() throws Exception {
+        e = SQLExecutor.of(clusterService)
+            .addTable("create table t (x int)");
+    }
+
+    @Test
+    public void testEmptyOverClause() {
+        QueriedSelectRelation analysis = e.analyze("select avg(x) OVER () from t");
+
+        List<Symbol> outputSymbols = analysis.outputs();
+        assertThat(outputSymbols).hasSize(1);
+        assertThat(outputSymbols.get(0)).isExactlyInstanceOf(WindowFunction.class);
+        WindowFunction windowFunction = (WindowFunction) outputSymbols.get(0);
+        assertThat(windowFunction.arguments()).hasSize(1);
+        WindowDefinition windowDefinition = windowFunction.windowDefinition();
+        assertThat(windowDefinition.partitions()).isEmpty();
+        assertThat(windowDefinition.orderBy()).isNull();
+        assertThat(windowDefinition.windowFrameDefinition()).isEqualTo(WindowDefinition.RANGE_UNBOUNDED_PRECEDING_CURRENT_ROW);
+    }
+
+    @Test
+    public void testOverWithPartitionByClause() {
+        QueriedSelectRelation analysis = e.analyze("select avg(x) OVER (PARTITION BY x) from t");
+
+        List<Symbol> outputSymbols = analysis.outputs();
+        assertThat(outputSymbols).hasSize(1);
+        assertThat(outputSymbols.get(0)).isExactlyInstanceOf(WindowFunction.class);
+        WindowFunction windowFunction = (WindowFunction) outputSymbols.get(0);
+        assertThat(windowFunction.arguments()).hasSize(1);
+        WindowDefinition windowDefinition = windowFunction.windowDefinition();
+        assertThat(windowDefinition.partitions()).hasSize(1);
+    }
+
+    @Test
+    public void testInvalidPartitionByField() {
+        assertThatThrownBy(() -> e.analyze("select avg(x) OVER (PARTITION BY zzz) from t"))
+            .isExactlyInstanceOf(ColumnUnknownException.class)
+            .hasMessage("Column zzz unknown");
+    }
+
+    @Test
+    public void testInvalidOrderByField() {
+        assertThatThrownBy(() -> e.analyze("select avg(x) OVER (ORDER BY zzz) from t"))
+            .isExactlyInstanceOf(ColumnUnknownException.class)
+            .hasMessage("Column zzz unknown");
+    }
+
+    @Test
+    public void test_distinct_is_not_supported_with_over() {
+        assertThatThrownBy(() -> e.analyze("select count(distinct x) OVER() from t"))
+            .isExactlyInstanceOf(UnsupportedOperationException.class)
+            .hasMessage("DISTINCT is not implemented for window functions");
+    }
+
+    @Test
+    public void testOnlyAggregatesAndWindowFunctionsAreAllowedWithOver() {
+        assertThatThrownBy(() -> e.analyze("select abs(x) OVER() from t"))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessage("OVER clause was specified, but abs is neither a window nor an aggregate function.");
+    }
+
+    @Test
+    public void testAggregatesCannotAcceptIgnoreOrRespectNullsFlag() {
+        assertThatThrownBy(() -> e.analyze("select avg(x) ignore nulls OVER() from t"))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessage("avg cannot accept RESPECT or IGNORE NULLS flag.");
+        //without over clause
+        assertThatThrownBy(() -> e.analyze("select avg(x) ignore nulls from t"))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessage("avg cannot accept RESPECT or IGNORE NULLS flag.");
+    }
+
+    @Test
+    public void testNonAggregateAndNonWindowFunctionCannotAcceptIgnoreOrRespectNullsFlag() {
+        //without over clause
+        assertThatThrownBy(() -> e.analyze("select abs(x) ignore nulls from t"))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessage("abs cannot accept RESPECT or IGNORE NULLS flag.");
+    }
+
+    @Test
+    public void testOverWithOrderByClause() {
+        QueriedSelectRelation analysis = e.analyze("select avg(x) OVER (ORDER BY x) from t");
+
+        List<Symbol> outputSymbols = analysis.outputs();
+        assertThat(outputSymbols).hasSize(1);
+        assertThat(outputSymbols.get(0)).isExactlyInstanceOf(WindowFunction.class);
+        WindowFunction windowFunction = (WindowFunction) outputSymbols.get(0);
+        assertThat(windowFunction.arguments()).hasSize(1);
+        WindowDefinition windowDefinition = windowFunction.windowDefinition();
+        assertThat(windowDefinition.orderBy().orderBySymbols()).hasSize(1);
+    }
+
+    @Test
+    public void testOverWithPartitionAndOrderByClauses() {
+        QueriedSelectRelation analysis = e.analyze("select avg(x) OVER (PARTITION BY x ORDER BY x) from t");
+
+        List<Symbol> outputSymbols = analysis.outputs();
+        assertThat(outputSymbols).hasSize(1);
+        assertThat(outputSymbols.get(0)).isExactlyInstanceOf(WindowFunction.class);
+        WindowFunction windowFunction = (WindowFunction) outputSymbols.get(0);
+        assertThat(windowFunction.arguments()).hasSize(1);
+        WindowDefinition windowDefinition = windowFunction.windowDefinition();
+        assertThat(windowDefinition.partitions()).hasSize(1);
+        assertThat(windowDefinition.orderBy().orderBySymbols()).hasSize(1);
+    }
+
+    @Test
+    public void testOverWithFrameDefinition() {
+        QueriedSelectRelation analysis = e.analyze("select avg(x) OVER (PARTITION BY x ORDER BY x " +
+                                                   "RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) from t");
+
+        List<Symbol> outputSymbols = analysis.outputs();
+        assertThat(outputSymbols).hasSize(1);
+        assertThat(outputSymbols.get(0)).isExactlyInstanceOf(WindowFunction.class);
+        WindowFunction windowFunction = (WindowFunction) outputSymbols.get(0);
+        assertThat(windowFunction.arguments()).hasSize(1);
+        WindowFrameDefinition frameDefinition = windowFunction.windowDefinition().windowFrameDefinition();
+        assertThat(frameDefinition.mode()).isEqualTo(WindowFrame.Mode.RANGE);
+        assertThat(frameDefinition.start().type()).isEqualTo(FrameBound.Type.UNBOUNDED_PRECEDING);
+        assertThat(frameDefinition.end().type()).isEqualTo(FrameBound.Type.UNBOUNDED_FOLLOWING);
+    }
+
+    @Test
+    public void test_over_with_order_by_references_window_with_partition_by() {
+        AnalyzedRelation relation = e.analyze(
+            "SELECT AVG(x) OVER (w ORDER BY x) " +
+            "FROM t " +
+            "WINDOW w AS (PARTITION BY x)");
+        WindowFunction windowFunction = (WindowFunction) relation.outputs().get(0);
+        WindowDefinition windowDefinition = windowFunction.windowDefinition();
+
+        Asserts.assertThat(windowDefinition.partitions()).satisfiesExactly(isReference("x"));
+
+        OrderBy orderBy = windowDefinition.orderBy();
+        assertThat(orderBy).isNotNull();
+        assertThat(orderBy.orderBySymbols()).hasSize(1);
+    }
+
+    @Test
+    public void test_over_references_window_that_references_subsequent_window() {
+        AnalyzedRelation relation = e.analyze(
+            "SELECT AVG(x) OVER w2 " +
+            "FROM t WINDOW w AS (PARTITION BY x)," +
+            "             w2 AS (w ORDER BY x)");
+        WindowFunction windowFunction = (WindowFunction) relation.outputs().get(0);
+        WindowDefinition windowDefinition = windowFunction.windowDefinition();
+
+        Asserts.assertThat(windowDefinition.partitions()).satisfiesExactly(isReference("x"));
+
+        OrderBy orderBy = windowDefinition.orderBy();
+        assertThat(orderBy).isNotNull();
+        assertThat(orderBy.orderBySymbols()).hasSize(1);
+    }
+
+    @Test
+    public void test_over_references_not_defined_window() {
+        assertThatThrownBy(() -> e.analyze("SELECT AVG(x) OVER w FROM t WINDOW ww AS ()"))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessage("Window w does not exist");
+    }
+
+    @Test
+    public void test_window_function_symbols_not_in_grouping_raises_an_error() {
+        assertThatThrownBy(() -> e.analyze(
+                "select y, sum(x) over(partition by x) " +
+                "FROM unnest([1], [6]) as t (x, y) " +
+                "group by 1"))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessageStartingWith("'x' must appear in the GROUP BY clause or be used in an aggregation function.");
+    }
+
+    @Test
+    public void test_window_function_partition_symbols_not_in_grouping_raises_an_error() {
+        assertThatThrownBy(() -> e.analyze(
+            "select sum(x) over(partition by x, y) " +
+                "FROM unnest([1], [6]) as t (x, y) " +
+                "group by x"))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessageStartingWith("'y' must appear in the GROUP BY clause or be used in an aggregation function.");
+    }
+
+    @Test
+    public void test_window_frame_offset_must_not_be_null() {
+        assertThatThrownBy(() -> e.analyze(
+            "SELECT avg(x) OVER (ORDER BY x RANGE BETWEEN NULL PRECEDING AND CURRENT ROW) FROM t"))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessage("The offset of a `<offset> PRECEDING/FOLLOWING` frame bound must not be null");
+        assertThatThrownBy(() -> e.analyze(
+            "SELECT avg(x) OVER (ORDER BY x RANGE BETWEEN CURRENT ROW AND NULL FOLLOWING) FROM t"))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessage("The offset of a `<offset> PRECEDING/FOLLOWING` frame bound must not be null");
+    }
+
+    @Test
+    public void test_rows_window_frame_offset_must_be_numeric() {
+        assertThatThrownBy(() -> e.analyze(
+            "SELECT avg(x) OVER (ORDER BY x ROWS BETWEEN '1' PRECEDING AND CURRENT ROW) FROM t"))
+            .isExactlyInstanceOf(IllegalArgumentException.class)
+            .hasMessage(
+                "The offset of a `ROWS <offset> PRECEDING/FOLLOWING` frame bound must be of type bigint, not text");
+    }
+}

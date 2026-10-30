@@ -1,0 +1,126 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package org.elasticsearch.cluster.metadata;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+
+import org.elasticsearch.Version;
+import org.elasticsearch.cluster.Diff;
+import org.elasticsearch.cluster.metadata.IndexMetadata.State;
+import org.elasticsearch.common.UUIDs;
+import org.elasticsearch.common.io.stream.BytesStreamOutput;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.test.ESTestCase;
+import org.junit.Test;
+
+import io.crate.metadata.RelationMetadata;
+import io.crate.metadata.RelationName;
+
+public class SchemaMetadataTest extends ESTestCase {
+
+    RelationName t1 = new RelationName("blob", "t1");
+    RelationMetadata.BlobTable relT1 = new RelationMetadata.BlobTable(
+            Metadata.OID_UNASSIGNED,
+            t1,
+            UUIDs.randomBase64UUID(),
+            Settings.EMPTY,
+            State.OPEN);
+    RelationName t2 = new RelationName("blob", "t2");
+    RelationMetadata.BlobTable relT2 = new RelationMetadata.BlobTable(
+            Metadata.OID_UNASSIGNED,
+            t2,
+            UUIDs.randomBase64UUID(),
+            Settings.EMPTY,
+            State.OPEN);
+    RelationName t3 = new RelationName("blob", "t3");
+    RelationMetadata.BlobTable relT3 = new RelationMetadata.BlobTable(
+            Metadata.OID_UNASSIGNED,
+            t3,
+            UUIDs.randomBase64UUID(),
+            Settings.EMPTY,
+            State.OPEN);
+
+    private void assertRelations(int expected, SchemaMetadata schemaMetadata) {
+        ArrayList<RelationMetadata> actualRelations = new ArrayList<>();
+        schemaMetadata.relations().values().forEach(actualRelations::add);
+        if (expected == 3) {
+            assertThat(actualRelations).containsExactlyInAnyOrder(relT1, relT2, relT3);
+        } else {
+            assertThat(actualRelations).containsExactlyInAnyOrder(relT1, relT2);
+        }
+    }
+
+    @Test
+    public void test_diff_streaming() throws Exception {
+        HashMap<String, RelationMetadata> relationsV1 = new HashMap<>();
+        relationsV1.put("t1", relT1);
+        relationsV1.put("t2", relT2);
+        SchemaMetadata schemaV1 = new SchemaMetadata(relationsV1, List.of(), true);
+
+        HashMap<String, RelationMetadata> relationsV2 = new HashMap<>();
+        relationsV2.put("t1", relT1);
+        relationsV2.put("t2", relT2);
+        relationsV2.put("t3", relT3);
+        SchemaMetadata schemaV2 = new SchemaMetadata(relationsV2, List.of(), true);
+
+        SchemaMetadata before;
+        SchemaMetadata after;
+        int expectedRelations;
+        if (randomBoolean()) {
+            before = schemaV1;
+            after = schemaV2;
+            expectedRelations = 3;
+        } else {
+            before = schemaV2;
+            after = schemaV1;
+            expectedRelations = 2;
+        }
+
+        Diff<SchemaMetadata> diff = after.diff(Version.CURRENT, before);
+        try (var out = new BytesStreamOutput()) {
+            diff.writeTo(out);
+            try (var in = out.bytes().streamInput()) {
+                Diff<SchemaMetadata> diffFrom = SchemaMetadata.readDiffFrom(in);
+                SchemaMetadata schemaIn = diffFrom.apply(after);
+                assertRelations(expectedRelations, schemaIn);
+            }
+        }
+
+        try (var out = new BytesStreamOutput()) {
+            out.setVersion(Version.V_6_1_0);
+            diff = after.diff(Version.V_6_1_0, before);
+            diff.writeTo(out);
+
+            try (var in = out.bytes().streamInput()) {
+                in.setVersion(Version.V_6_1_0);
+                Diff<SchemaMetadata> diffFrom = SchemaMetadata.readDiffFrom(in);
+                SchemaMetadata schemaIn = diffFrom.apply(after);
+                assertRelations(expectedRelations, schemaIn);
+            }
+        }
+    }
+}
+

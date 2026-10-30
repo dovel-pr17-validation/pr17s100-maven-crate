@@ -1,0 +1,206 @@
+.. _version_6.4.0:
+
+=============
+Version 6.4.0
+=============
+
+Released on 2026-07-06.
+
+.. NOTE::
+
+    If you are upgrading a cluster, you must be running CrateDB 5.0.0 or higher
+    before you upgrade to 6.4.0.
+
+    We recommend that you upgrade to the latest 6.3 release before moving to
+    6.4.0.
+
+    A rolling upgrade from >= 6.3.0 to 6.4.0 is supported.
+    Before upgrading, you should `back up your data`_.
+
+.. WARNING::
+
+    Tables that were created before CrateDB 5.x will not function with 6.x
+    and must be recreated before moving to 6.x.x.
+
+    You can recreate tables using ``COPY TO`` and ``COPY FROM`` or by
+    `inserting the data into a new table`_.
+
+.. _back up your data: https://cratedb.com/docs/crate/reference/en/latest/admin/snapshots.html
+.. _inserting the data into a new table: https://cratedb.com/docs/crate/reference/en/latest/admin/system-information.html#tables-need-to-be-recreated
+
+.. rubric:: Table of contents
+
+.. contents::
+   :local:
+
+.. _version_6.4.0_breaking_changes:
+
+Breaking Changes
+================
+
+- Removed an undocumented ``gateway.auto_import_dangling_indices`` setting. If
+  the setting is present in the ``crate.yml`` CrateDB will refuse to start.
+  Please remove it before updating.
+
+- Changed type validation for ``INSERT INTO`` statements to be consistent
+  regardless of the number of ``VALUES`` rows provided. Previously, implicit
+  casts were permitted for single-row inserts but rejected for multi-row
+  inserts. For example, an object array could be cast to a string array when
+  only one row was given, but not when multiple rows were given.
+
+  Example: given a table with a ``text[]`` column ``xs`` and a parameter
+  ``$1`` bound to an object array ``[{"x": 10}]``:
+
+  ::
+
+     INSERT INTO tbl (xs) VALUES ($1);         -- previously succeeded, now fails
+     INSERT INTO tbl (xs) VALUES ($1), ($1);   -- previously failed, still fails
+
+
+Deprecations
+============
+
+None
+
+
+Changes
+=======
+
+SQL Statements
+--------------
+
+- Added support for :ref:`ALTER REPOSITORY <sql-alter-repository>`.
+
+SQL Standard and PostgreSQL Compatibility
+-----------------------------------------
+
+- Added a :ref:`information_schema.collations <collations>` table.
+
+- `HyeonSeon Won <https://github.com/won-seoop>`_ Added the ``catalog_name``
+  column to :ref:`information_schema.schemata <schemata>`.
+
+- `Dhruv Patel <https://github.com/DHRUV6029>`_ added the ``pg_catalog.pg_user``
+  table for PostgreSQL compatibility, resolving issues with tools like
+  DbVisualizer that query this table during schema introspection.
+
+Data Types
+----------
+
+- `Yogesh kumar pandey <https://github.com/reachyogeshp-afk>`_ added support
+  for ``geo_point`` values in JSON array string format, for example
+  ``"[14.988999953493476, 51.10299998894334]"``. This allows CSV files
+  containing ``geo_point`` values in this format to be imported without
+  transforming the source data first.
+
+- Added the :ref:`regtype <type-regtype>` data type
+
+
+Scalar and Aggregation Functions
+--------------------------------
+
+- `Varun Kulkarni <https://github.com/vvkulkarni360>`_ added support for adding
+  or subtracting intervals to values of type :ref:`date <type-date>`.
+
+- Added support for ``TH`` and ``th`` template patterns to the :ref:`to_char
+  <scalar-to_char>` scalar function which can be used to add a ordinal suffix
+  for numbers.
+
+- `Varun Kulkarni <https://github.com/vvkulkarni360>`_  added
+  support for marking literal characters with double quotes in the
+  :ref:`to_char <scalar-to_char>` template pattern. Characters enclosed in
+  ``"..."`` are treated as literal text and not interpreted as formatting
+  tokens. Backslash escaping within double-quoted sections is also supported
+  (e.g., ``\"`` for a literal ``"``, ``\\`` for a literal ``\``).
+
+- `Robert Palmer <https://github.com/robd003>`_ added the
+  :ref:`blake3 <scalar-blake3>` scalar function for computing BLAKE3 checksums
+  of strings.
+
+- `Bing O'Dowd <https://github.com/bodowd>`_ added the :ref:`largest triangle
+  three buckets <aggregation-largest-triangle-three-buckets>` aggregation
+  function for downsampling data using the Largest Triangle Three Buckets
+  algorithm
+
+- Added the :ref:`pg_get_constraintdef() <scalar-pg_get_constraintdef>` scalar
+  function to improve PostgreSQL compatibility for ORM schema introspection
+  (e.g. Prisma, TypeORM).
+
+Performance and Resilience Improvements
+---------------------------------------
+
+- Improved the performance of queries with aggregations on columns of type
+  ``varchar(n)`` - to match the performance of columns of type ``text``.
+
+- Improved the performance of ``SELECT strKeyColumn, count(*) FROM <tbl> GROUP
+  BY 1`` queries if they don't contain any ``WHERE`` clause. In some of our
+  benchmarks by up to 140%.
+
+- Improved the performance of queries on the ``sys.shards`` table. In some of
+  our benchmarks by up to ~20% if the sequence number of translog stats were
+  selected.
+
+- Added column pruning for scalar subqueries. This can help improve performance
+  for sub-queries which intermediately selected columns not used in the results.
+
+- Improved the performance of the :ref:`to_char <scalar-to_char>` scalar. In
+  some of our benchmarks by up to ~25%.
+
+- Improved the performance of bulk insert operations against tables that use
+  user defined functions in a generated column which also has check constraints.
+
+- Increased the default queue size of the ``write`` thread pool but lowered the
+  amount of internal retries for ``INSERT INTO <table> VALUES`` statements in
+  exchange. This should lower the load for bulk inserts into tables with many
+  shards at the expensive of potentially higher memory load before requests get
+  rejected if clients make single inserts with high concurrency/many
+  connections.
+
+- Improved the performance of the :ref:`min() <aggregation-min>` and
+  :ref:`max() <aggregation-max>` aggregations for columns of type :ref:`NUMERIC
+  <data-types-numeric>`.
+
+- Improved query planning for lookup joins under ``LIMIT`` by deferring
+  collection of columns that are not needed during join execution until the
+  final fetch phase.
+
+
+Administration and Operations
+-----------------------------
+
+- Removed the ``fix-metadata`` sub-command from the ``crate-node`` tool. It
+  should no longer be needed. The sub-command could be used to repair metadata
+  issues that could occur in 5.1. Users upgrading to 6.4 should already have
+  used the command while on 5.x if they experienced the issues from 5.1
+
+
+- Added ``session_id`` column to the :ref:`sys.jobs <sys-jobs>` and
+  :ref:`sys.jobs_log <sys-logs>` tables.
+
+- Added a ``state`` column to the :ref:`sys.cluster <sys-cluster>` table.
+
+- Added a ``remove-corrupted-data`` command to the :ref:`cli-crate-node` CLI
+  tool for disaster recovery of a corrupted shard which cannot be automatically
+  recovered from a good copy (replica) or restored from a backup.
+
+Client interfaces
+-----------------
+
+- Changed the HTTP interface to set parameter type hints which are guessed based
+  on the ``args`` payload. This can help avoid having to add explicit casts
+  within a SQL statement for parameter placeholders.
+
+  For example, instead of ``SELECT percentile(height, ?::double precision) ...``
+  it is possible to use ``SELECT percentile(height, ?)`` if ``args`` contains a
+  numeric value.
+
+  A side effect of this change is that cast semantics can become stricter. This
+  could surface latent issues if the context where the parameter is used
+  requires a cast to a different type. Consider for example an ``INSERT INTO tbl
+  (xs) VALUES (?), (?)`` where ``xs`` is of type ``text[]`` but the payload for
+  ``xs`` is an object array.
+
+  Previously this used a cast from ``undefined`` to ``text[]`` and succeeded,
+  now it can lead to errors like::
+
+      The types of the columns within VALUES lists must match.
+      Found `text_array` and `object_array` at position: 1

@@ -1,0 +1,90 @@
+/*
+ * Licensed to Crate.io GmbH ("Crate") under one or more contributor
+ * license agreements.  See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership.  Crate licenses
+ * this file to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.  You may
+ * obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * However, if you have executed another commercial license agreement
+ * with Crate these terms will supersede the license and you may use the
+ * software solely pursuant to the terms of the relevant commercial agreement.
+ */
+
+package io.crate.expression.scalar;
+
+import java.util.ArrayList;
+import java.util.List;
+
+import io.crate.data.Input;
+import io.crate.metadata.FunctionType;
+import io.crate.metadata.Functions;
+import io.crate.metadata.NodeContext;
+import io.crate.metadata.Scalar;
+import io.crate.metadata.TransactionContext;
+import io.crate.metadata.functions.BoundSignature;
+import io.crate.metadata.functions.Signature;
+import io.crate.metadata.functions.Signature.Feature;
+import io.crate.metadata.functions.TypeVariableConstraint;
+import io.crate.types.ArrayType;
+import io.crate.types.DataType;
+import io.crate.types.TypeSignature;
+
+public class ArrayAppendFunction extends Scalar<List<Object>, Object> {
+
+    public static final String NAME = "array_append";
+
+    public static void register(Functions.Builder builder) {
+        builder.add(
+                Signature.builder(NAME, FunctionType.SCALAR)
+                        .argumentTypes(TypeSignature.ARRAY_E,
+                                TypeSignature.E)
+                        .returnType(TypeSignature.ARRAY_E)
+                        .typeVariableConstraints(TypeVariableConstraint.E)
+                        .features(Feature.DETERMINISTIC, Feature.NOTNULL)
+                        .build(),
+                ArrayAppendFunction::new
+        );
+    }
+
+    private final DataType<?> innerType;
+    private final boolean calledByOperator;
+
+    ArrayAppendFunction(Signature signature, BoundSignature boundSignature) {
+        this(signature, boundSignature, false);
+    }
+
+    ArrayAppendFunction(Signature signature, BoundSignature boundSignature, boolean calledByOperator) {
+        super(signature, boundSignature);
+        this.innerType = ((ArrayType<?>) boundSignature.returnType()).innerType();
+        this.calledByOperator = calledByOperator;
+    }
+
+    @Override
+    public final List<Object> evaluate(TransactionContext txnCtx, NodeContext nodeCtx, Input[] args) {
+        ArrayList<Object> resultList = new ArrayList<>();
+        @SuppressWarnings("unchecked")
+        List<Object> values = (List<Object>) args[0].value();
+        Object valueToAdd = args[1].value();
+        if (values != null) {
+            for (Object value : values) {
+                resultList.add(innerType.sanitizeValue(value));
+            }
+        }
+        if (valueToAdd == null && calledByOperator) {
+            // array || null -> array (null is ignored)
+            return resultList;
+        }
+
+        resultList.add(innerType.sanitizeValue(valueToAdd));
+        return resultList;
+    }
+}

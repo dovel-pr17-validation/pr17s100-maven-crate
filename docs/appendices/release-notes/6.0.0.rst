@@ -1,0 +1,400 @@
+.. _version_6.0.0:
+
+=============
+Version 6.0.0
+=============
+
+Released on 2025-07-17.
+
+.. WARNING::
+
+    Do not use this version when upgrading from any previous version
+    containing tables created before :ref:`version_5.5.0` as this may result
+    in data loss!
+
+    If the cluster contains tables created before :ref:`version_5.5.0`, after
+    upgrading to :ref:`version_6.0.0` certain actions on such tables like
+    deleting partitions, changing settings, rename, swap, etc. can lead to
+    corrupted table which causes all the data of the columns created
+    in versions before :ref:`version_5.5.0` to be shown as ``NULL``. The bug
+    has been fixed in :ref:`version_6.0.6`, so we highly recommend to avoid
+    upgrading to any earlier 6.0.x version.
+
+    Once already affected by the bug, existing data may be lost forever, while
+    new data (via ``INSERT`` or ``UPDATE``) can be retrieved normally.
+
+.. NOTE::
+
+    If you are upgrading a cluster, you must be running CrateDB 5.0.0 or higher
+    before you upgrade to 6.0.0.
+
+    We recommend that you upgrade to the latest 5.10 release before moving to
+    6.0.0.
+
+    A rolling upgrade from >= 5.10.1 to 6.0.0 is supported.
+    Before upgrading, you should `back up your data`_.
+
+.. IMPORTANT::
+
+    It's highly advisable, once the cluster is fully upgraded to
+    :ref:`version_6.0.0`, to :ref:`create a new repository
+    <sql-create-repository>`, on a different path than the repository used when
+    the cluster was in 5.x version, and :ref:`create a full backup of your data
+    <sql-create-snapshot>`.
+
+.. WARNING::
+
+    Tables that were created before CrateDB 5.x will not function with 6.x
+    and must be recreated before moving to 6.x.x.
+
+    You can recreate tables using ``COPY TO`` and ``COPY FROM`` or by
+    `inserting the data into a new table`_.
+
+.. _back up your data: https://cratedb.com/docs/crate/reference/en/latest/admin/snapshots.html
+.. _inserting the data into a new table: https://cratedb.com/docs/crate/reference/en/latest/admin/system-information.html#tables-need-to-be-recreated
+
+.. rubric:: Table of contents
+
+.. contents::
+   :local:
+
+.. _version_6.0.0_breaking_changes:
+
+Breaking Changes
+================
+
+- Updated Lucene from 9.12 to 10.2 which brings the following user facing
+  changes:
+
+  - Tables created in 4.x can't be read anymore. If you're running CrateDB 5.x
+    and have any tables created in 4.x they need to be re-indexed before moving
+    to CrateDB 6.0. Make sure there are no warnings in the admin console and see
+    :ref:`table_version_compatibility` for more information.
+
+  - The ``dutch_kp`` and ``lovins`` token filters are no longer available. If
+    users have tables which use these token filters for analysis, they will need
+    to re-index with either plain ``dutch`` or ``english`` stemmers before
+    upgrading.
+
+  - The ``german2`` and ``german`` token filters now use the same underlying
+    stemmer, which always expands ``ä``, ``ö`` and ``ü`` to ``ae``, ``oe`` and
+    ``ue`` respectively. If users have tables which were using the ``german``
+    stemmer without a character filter that already did this, they will need to
+    re-index after upgrading.
+
+  - Lucene 10.2 opens files with the ``MADV_RANDOM`` advice by default on Linux
+    and Mac OS. If you experience an increase in IOPS and degraded performance,
+    especially slow recovery times on node restarts,
+    set ``CRATE_JAVA_OPTS=-Dorg.apache.lucene.store.defaultReadAdvice=NORMAL``
+    to restore previous behavior.
+
+- Removed the deprecated ``soft_deletes.enabled`` setting for ``CREATE TABLE``.
+  The setting defaulted to ``true`` since 4.3.0, was deprecated in 4.5.0 and
+  soft deletes became mandatory in 5.0.0.
+
+- When casting an expression of type :ref:`OBJECT <type-object>` to an
+  :ref:`OBJECT <type-object>`, the inner types are merged instead of being
+  replaced by the target type and the target
+  :ref:`column policy <type-object-column-policy>` is used. The only exception
+  is when the target column policy is set to
+  :ref:`STRICT <type-object-columns-strict>`. In this case, only the target
+  inner type definition is used. See also the related
+  :ref:`documentation <cast_to_object>`
+
+- Removed support for patterns on the left side argument of
+  :ref:`LIKE/ILIKE <sql_dql_like>` operators because it led to ambiguities when
+  both sides contained possible pattern like strings e.g.::
+
+    SELECT 'a%' LIKE ANY(['a__']);
+
+- Updated the default ``compression`` of
+  :ref:`percentile aggregation <aggregation-percentile>` from ``100.0`` to
+  ``200.0`` which increases the accuracy of the approximations but with the
+  cost of slightly more memory consumption and increased execution time,
+  depending on the used data set.
+  To regain existing behaviour, adjust the ``compression`` argument of the
+  :ref:`percentile aggregation <aggregation-percentile>` accordingly.
+
+- Made the behavior of the ``DENY`` and ``GRANT`` statements stricter. They now
+  fail if there is a mismatch between the ``securable`` (``VIEW`` or ``TABLE``)
+  and the actual relation type of the relation addressed by ``<ident>``. Before
+  a statement like ``GRANT DQL ON TABLE actually_a_view`` would succeed but not
+  do anything.
+
+- Applied normalization for :ref:`IP <data-types-ip-addresses>` values so that
+  for example ``'::ffff:192.168.0.1'::IP``, becomes ``'192.168.0.1'``.
+  Previously, this normalization was already applied for all the values inserted
+  into a column of :ref:`IP <data-types-ip-addresses>`, but was not applied for
+  literal values in an SQL query, and was also **not** applied to the values
+  inserted into a column of ``IP`` data type, when this column was part of the
+  ``PRIMARY KEY`` of the table. This resulted in wrong behavior when trying to
+  filter on the table by it's ``IP`` (``PRIMARY KEY``), as the value stored
+  for the ``_id`` would have been the un-normalized one, whereas the value
+  for the table column would have been the normalized one. e.g.::
+
+    CREATE  TABLE  tbl(a IP , PRIMARY KEY(a));
+    INSERT INTO tbl(a) VALUES ('::ffff:192.168.0.1');
+    REFRESH TABLE tbl;
+    SELECT _id, a FROM tbl;
+
+  Would yield::
+
+    +--------------------+-------------+
+    | _id                | a           |
+    +--------------------+-------------+
+    | ::ffff:192.168.0.1 | 192.168.0.1 |
+    +--------------------+-------------+
+
+  So the query::
+
+    SELECT * FROM tbl WHERE a = '192.168.0.1'
+
+  would not return any results, as it will use the ``_id`` to try and match the
+  ``IP`` value in the ``WHERE`` clause. You can find more details about this
+  mechanism :ref:`here <concept-addressing-documents>`.
+
+  .. WARNING::
+
+      Because of this change, users are advised to re-create tables which have
+      an ``IP`` column as ``PRIMARY KEY`` or as part of the ``PRIMARY KEY``.
+      Since the string ``IP`` values will be automatically normalized before
+      stored as ``_id``, if for example a value: ``::ffff:192.168.0.1``
+      is already stored on the table, after upgrading to :ref:`version_6.0.0`,
+      it will be possible to re-insert the value on the table, without any
+      complaint from the ``PRIMARY KEY`` constraint check, as the value will be
+      stored, normalized, as ``192.168.0.1``.
+
+- Fixed an issue that caused queries filtering on partition(s) of a table for
+  which the ``PARTITION BY`` clause, contains a column of ``BOOLEAN`` type to
+  return no results, e.g. for a table::
+
+    CREATE TABLE tbl(id BOOLEAN, PRIMARY KEY(id)) PARTITIONED BY (id);
+    INSERT INTO tbl(id) VALUES (FALSE);
+    REFRESH TABLE tbl;
+
+  The query::
+
+    SELECT * FROM tbl WHERE id = FALSE;
+
+  would return ``0`` rows;
+
+  .. WARNING::
+
+      Because of this fix, users should re-create tables which have a
+      ``BOOLEAN`` column in their ``PARTITIONED BY`` clause.
+
+- Added a :ref:`statement_max_length` setting to limit the length of allowed SQL
+  statements. It defaults to ``262144``. Statements exceeding this limit are
+  rejected because large statements consume a high amount of memory. Large
+  statements are typically caused by inline values or using a large number of
+  ``VALUES`` clauses.
+  Instead, statements should be written using parameter symbols (``?``) and
+  inserting lots of values should be done using either bulk operations or a
+  ``INSERT INTO`` in combination with a ``SELECT FROM`` and ``UNNEST``.
+
+- Changed the output column names of a query result, which correspond to
+  function calls to return the function name. Previously, for a function call
+  that can be pre-evaluated, without using any data from the underlying tables,
+  the column name would be the evaluated value, e.g.::
+
+    cr> SELECT ((1+2)*3);
+    +---+
+    | 9 |
+    +---+
+    | 9 |
+    +---+
+
+  With this change::
+
+    cr> SELECT ((1+2)*3);
+    +---------------+
+    | ((1 + 2) * 3) |
+    +---------------+
+    |             9 |
+    +---------------+
+
+  Additionally, previously, function calls which are using table columns as
+  arguments, would be returned as column names, using the complete function
+  call, but with this change only the function name is used, so that it matches
+  the behavior of PostgreSQL. e.g. Previously::
+
+    cr> SELECT avg(a) FROM tbl;
+    +--------+
+    | avg(a) |
+    +--------+
+    |    3.0 |
+    +--------+
+
+  With this change::
+
+    cr> SELECT avg(a) FROM tbl;
+    +-----+
+    | avg |
+    +-----+
+    | 3.0 |
+    +-----+
+
+  .. NOTE::
+
+      When a function call which uses table columns as arguments is nested
+      in an comparison or arithmetic expression, the output name of the column
+      continues to expose the complete function call. e.g.::
+
+        cr> SELECT sqrt(a) > 1 FROM tbl;
+        +---------------+
+        | (sqrt(a) > 1) |
+        +---------------+
+        | TRUE          |
+        +---------------+
+
+- :ref:`aggregation-stddev` changed and is now an alias for
+  :ref:`aggregation-stddev-samp`, to match PostgreSQL behavior. In order to
+  calculate the population standard deviation, :ref:`aggregation-stddev-pop`
+  must be used.
+
+- ``current_catalog`` has been added to the list of reserved keywords, because
+  of the addition of :ref:`scalar-current_catalog` function which is called as a
+  keyword without the ``()``. The whole list of keywords can be found
+  :ref:`here <sql_lexical_keywords_identifiers>`.
+
+Deprecations
+============
+
+- Usage of :ref:`_version<sql_administration_system_column_version>` has been
+  deprecated completely. Please note that its usage for :ref:`sql_occ` has
+  already been deprecated since :ref:`version_4.0.0`.
+
+
+Changes
+=======
+
+SQL Statements
+--------------
+
+- ``COPY FROM`` now assumes that the input files are ``gzip`` compressed if all
+  of the specified files end in ``.gz``.
+
+SQL Standard and PostgreSQL Compatibility
+-----------------------------------------
+
+- Added the :ref:`starts_with <scalar-starts_with>` scalar function, which
+  returns true if a string starts with a given prefix.
+
+- Added support for lower case format patterns to the
+  :ref:`to_char <scalar-to_char>` scalar function.
+
+- Added the :ref:`information_schema.applicable_roles <applicable_roles>`,
+  :ref:`information_schema.enabled_roles <enabled_roles>`,
+  :ref:`information_schema.administrable_role_authorizations <administrable_role_authorizations>`
+  and :ref:`information_schema.role_table_grants <role_table_grants>` tables.
+
+- Populated the ``pg_index.indnkeyatts`` column with the number of key
+  attributes in the primary key.
+
+Data Types
+----------
+
+- Added support for dynamic mapping of nested arrays.
+
+- Improved error handling of missing keys when accessing elements of (nested)
+  :ref:`object type<type-object>` expressions to be consistent according to the
+  defined :ref:`type-object-column-policy` and the related
+  :ref:`conf-session-error_on_unknown_object_key` session setting.
+
+Scalar and Aggregation Functions
+--------------------------------
+
+- Added :ref:`scalar-current_catalog` function which for CrateDB always returns
+  ``crate``, to enhance compatibility with PostgreSQL JDBC driver.
+
+- Improved performance of :ref:`aggregation-avg` function when operating on
+  columns of :ref:`NUMERIC type<type-numeric>` with enabled
+  :ref:`ddl-storage-columnstore`.
+
+- Added support for :ref:`NUMERIC type<type-numeric>` to the
+  :ref:`aggregation-avg-distinct` function.
+
+- Added support for :ref:`NUMERIC type<type-numeric>` to the following
+  arithmetic scalar functions: :ref:`POWER<scalar-power>`,
+  :ref:`DEGREES<scalar-degrees>` and :ref:`RADIANS<scalar-radians>`.
+
+- Added support for the :ref:`array_overlap<scalar-array_overlap>` scalar
+  function and the associated :ref:`&&<array_overlap_operator>` operator.
+
+- Added support for the :ref:`aggregation-stddev-pop` function to compute
+  the population standard deviation.
+
+- Added support for :ref:`NUMERIC type<type-numeric>` to the
+  :ref:`aggregation-stddev-pop` function.
+
+- Added support for the :ref:`aggregation-stddev-samp` function to compute
+  the sample standard deviation.
+
+- Replaced `t-digest <https://github.com/tdunning/t-digest>`_ algorithm used by
+  :ref:`percentile aggregation <aggregation-percentile>` from ``AVLTreeDigest``
+  to ``MergingDigest`` to improve the consistency and accuracy of the result.
+
+Performance and Resilience Improvements
+---------------------------------------
+
+- Changed how scheduling and prioritization for read queries, in particular
+  queries against :ref:`sys.shards <sys-shards>` and :ref:`sys.nodes<sys-nodes>`
+  work. This should help continue monitoring a cluster that is overloaded with
+  too many concurrent queries.
+
+- Improved the logic to push down expressions within the ``WHERE`` clause to the
+  table to use index lookups instead of resulting in post-filtering when using
+  virtual tables involving table functions and object columns. For example, the
+  following case now gets optimized::
+
+    SELECT *
+    FROM (
+      SELECT *, unnest(document['arr'])
+      FROM tbl
+    ) t
+    WHERE document['field1'] >=1;
+
+- Improved the performance for ``SELECT COUNT(not_null_column) FROM tbl``. It is
+  now executed the same way as ``SELECT COUNT(*) FROM tbl``.
+
+- Improved the handling of temporary unavailable shards during read-only
+  queries. There's now a higher chance that the system can deal with the
+  temporary failure without surfacing the error to the client.
+
+- Improved execution for queries with mixed implicit and explicit joins.
+  Joins are now always executed in the original order of the query.
+
+- Improved the performance of the queries involving ``= ALL`` array operator.
+
+- Improved the performance of :ref:`shard recovery<gloss-shard-recovery>` in
+  certain cases, where a shard has become idle after 5 minutes of no write
+  activity.
+
+- Increased the frequency of retention lease synchronization, which will make
+  merges more likely to be able to remove recovery source.
+
+Administration and Operations
+-----------------------------
+
+- Added ``merge_id`` and ``fully_merged_docs`` columns to the
+  :ref:`sys.segments <sys-segments>` table to give more information on ongoing
+  merges and whether the recovery source is still present in merged segments.
+
+- Added the :ref:`sys.cluster_health <sys-cluster_health>` table to provide
+  information about the health of the whole cluster in comparison to
+  the :ref:`sys.health <sys-health>` table which exposes health about each
+  table only.
+
+- Added a :ref:`insert_select_fail_fast <conf-session-insert-select-fail-fast>`
+  session setting that allows partial failures of ``INSERT FROM SELECT``
+  statements.
+
+- Added ``last_write_before`` column to the :ref:`sys.shards <sys-shards>`
+  table, reporting a timestamp before which the last write operation to the
+  shard has taken place.
+
+- Re-enabled :ref:`mapping.depth.limit <sql-create-table-mapping-depth-limit>`
+  setting to enforce a maximum nesting depth for object columns when adding new
+  columns to a table. The default value is ``100``. The limit can be increased
+  if necessary, but use with caution as deeply nested structures may lead to
+  long execution times or stack overflow errors.

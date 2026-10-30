@@ -1,0 +1,127 @@
+.. _version_6.2.1:
+
+=============
+Version 6.2.1
+=============
+
+Released on 2026-02-03.
+
+.. WARNING::
+
+    Do not use this version when upgrading from any previous version
+    containing tables created before :ref:`version_5.5.0` as this may result
+    in data loss!
+
+    If the cluster contains tables created before :ref:`version_5.5.0`, after
+    upgrading to :ref:`version_6.2.1` certain actions on such tables like
+    deleting partitions, changing settings, rename, swap, etc. can lead to
+    corrupted table which causes all the data of the columns created
+    in versions before :ref:`version_5.5.0` to be shown as ``NULL``. The bug
+    has been fixed in :ref:`version_6.2.6`, so we highly recommend to avoid
+    upgrading to any earlier 6.2.x version.
+
+    Once already affected by the bug, existing data may be lost forever, while
+    new data (via ``INSERT`` or ``UPDATE``) can be retrieved normally.
+
+.. NOTE::
+
+    If you are upgrading a cluster, you must be running CrateDB 5.0.0 or higher
+    before you upgrade to 6.2.1.
+
+    We recommend that you upgrade to the latest 6.1 release before moving to
+    6.2.1.
+
+    A rolling upgrade from >= 6.1.2 to 6.2.1 is supported. Doing a rolling
+    upgrade from an earlier version than 6.1.2 can cause runtime errors when
+    executing statements relying on implicit casts.
+
+    Before upgrading, you should `back up your data`_.
+
+.. WARNING::
+
+    Tables that were created before CrateDB 5.x will not function with 6.x
+    and must be recreated before moving to 6.x.x.
+
+    You can recreate tables using ``COPY TO`` and ``COPY FROM`` or by
+    `inserting the data into a new table`_.
+
+.. _back up your data: https://cratedb.com/docs/crate/reference/en/latest/admin/snapshots.html
+.. _inserting the data into a new table: https://cratedb.com/docs/crate/reference/en/latest/admin/system-information.html#tables-need-to-be-recreated
+
+.. rubric:: Table of contents
+
+.. contents::
+   :local:
+
+
+See the :ref:`version_6.2.0` release notes for a full list of changes in the 6.2
+series.
+
+Fixes
+=====
+
+- Fixed an issue that caused ``INSERT INTO`` statements into columns of type
+  ``ARRAY(OBJECT(DYNAMIC))`` to fail with an
+  ``UnsupportedFeatureException[null]`` if it resulted in the addition of new
+  columns to the table schema and if the objects within the array contained
+  mixed types like in ``[{"x": 1}, {"x": null}]``.
+
+- Fixed an issue that allowed inserting ``NULL`` values into child columns of
+  ``ARRAY(OBJECT)`` columns despite ``NOT NULL`` constraint on those child
+  columns if a sibling column had a value.
+
+- Fixed an issue with users being able to execute
+  :ref:`user defined functions <user-defined-functions>`, even if they lacked
+  privileges on the schema under which a ``UDF`` is defined. Now ``DQL``
+  :ref:`privilege <administration-privileges>` on the schema is required.
+
+- Fixed an issue that caused under-accounting of memory usage of some queries
+  stored in cache. It affected cache eviction that is depending on query memory
+  usage, potentially leading to an ``OutOfMemoryError``.
+
+- Fixed a regression introduced in :ref:`version_6.0.0` that caused statements
+  ``SELECT unnest(obj['arr'])['subcol']`` to fail with a ``ClassCastException``
+  if ``obj`` column had a type :ref:`IGNORED <type-object-columns-ignored>`
+  and ``subcol`` was missing in the record. Error was thrown regardless of the
+  value specified in :ref:`conf-session-error_on_unknown_object_key`.
+  Now it returns ``NULL`` if :ref:`conf-session-error_on_unknown_object_key` is
+  set to ``false`` and throws ``ColumnUnknownException`` if it has default
+  value ``true``.
+
+- Improved error message thrown when providing empty value for configuration
+  settings, e.g.::
+
+      $> bin/crate -Cauth.host_based.enabled
+      $> bin/crate -Cauth.host_based.enabled=
+
+- Fixed an issue that caused incorrect results when using an ``Anti-Join``
+  (``WHERE NOT EXISTS``) with a ``WHERE`` clause containing ``BOOLEAN`` typed
+  columns combined by an ``OR`` operator. Example::
+
+    SELECT * FROM t1 WHERE NOT EXISTS
+      (SELECT 1 FROM (SELECT c2 FROM t1 WHERE bool_col) AS sub0
+       WHERE t1.bool_col OR t1.bool_col);
+
+- Fixed an issue that allowed :ref:`ref-create-schema` and :ref:`ref-drop-schema`
+  on reserved schemas (e.g., ``sys``, ``doc``). This was harmless; for example,
+  no tables could be created in the ``sys`` schema regardless, but the
+  operations are now blocked.
+
+
+- Fixed a regression introduced in :ref:`version_6.0.0` that caused nested path
+  accesses on ``ARRAY(OBJECT)`` columns returned by a sub-select using a
+  ``UNNEST`` function to either fail with a ``ColumnUnknownException`` or
+  return incorrect results as wrong child-columns are used. Example::
+
+    SELECT obj_arr['child_obj']['id'] AS id
+    FROM (
+      SELECT unnest(
+        [ {child_obj = { id = 'correct_id'}, id='wrong_id'} ]
+      ) AS obj_arr
+    ) AS sub1
+    --> now returns 'correct_id' instead of returning 'wrong_id'
+
+- Fixed a regression introduced in :ref:`version_6.2.0` that caused inserts to
+  fail with a ``UnsupportedFeatureException`` error if a sub-column of a
+  ``OBJECT`` typed column, previously created with a ``NULL`` value, is then
+  inserted using a non-NULL value and such using a concrete data type.

@@ -1,0 +1,63 @@
+.. _version_5.9.9:
+
+=============
+Version 5.9.9
+=============
+
+Released on 2025-01-30.
+
+.. NOTE::
+    If you are upgrading a cluster, you must be running CrateDB 4.0.2 or higher
+    before you upgrade to 5.9.9.
+
+    We recommend that you upgrade to the latest 5.8 release before moving to
+    5.9.9.
+
+    A rolling upgrade from 5.8.x to 5.9.9 is supported.
+
+    Before upgrading, you should `back up your data`_.
+
+.. WARNING::
+
+    Tables that were created before CrateDB 4.x will not function with 5.x
+    and must be recreated before moving to 5.x.x.
+
+    You can recreate tables using ``COPY TO`` and ``COPY FROM`` or by
+    `inserting the data into a new table`_.
+
+.. _back up your data: https://cratedb.com/docs/crate/reference/en/latest/admin/snapshots.html
+
+.. _inserting the data into a new table: https://cratedb.com/docs/crate/reference/en/latest/admin/system-information.html#tables-need-to-be-recreated
+
+.. rubric:: Table of contents
+
+.. contents::
+   :local:
+
+See the :ref:`version_5.9.0` release notes for a full list of changes in the
+5.9 series.
+
+Fixes
+=====
+
+- Fixed an issue that could lead to a ``Scale of numeric must be less than the
+  precision`` error when using the ``AVG`` aggregation in a way that involved
+  values of type ``NUMERIC``.
+
+- Fixed an issue that could cause data loss if increasing the number of shards
+  using ``ALTER TABLE ... SET (number_of_shards = ?)`` while having other
+  allocation settings in place that prevent the shard allocation.
+
+- Fixed an issue that could cause duplicate records to be returned when
+  filtering on a table by PRIMARY KEY, using query parameters, and binding the
+  same value to them, e.g.::
+
+    SELECT * FROM tbl WHERE pk_col = ? OR pk_col = ?
+    -- Bind the same value to both query parameters
+
+- Fixed an issue that caused an error when using a PreparedStatement and
+  selecting an expression, involving a parameter and a column used in
+  ``ORDER BY`` and query had a ``LIMIT`` clause. Example.::
+
+    SELECT a, b + ? as sum FROM tbl ORDER BY sum LIMIT 10
+
